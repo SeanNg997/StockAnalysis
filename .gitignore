@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# 大数据文件（通过 GitHub Actions cache 持久化）
+data/a_stock_daily_k_10y.csv
+data/*.pkl
+data/.download_status.txt
+
+# 保留追踪
+!data/.gitkeep
+!data/.last_date.txt
+!output/history/.gitkeep
+
+# Claude Code 本地环境
+.claude/
+skills/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~

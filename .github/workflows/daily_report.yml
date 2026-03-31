@@ -1,0 +1,110 @@
+name: Daily Stock Strategy Report
+
+on:
+  schedule:
+    # 每个交易日北京时间 6:00 (UTC 22:00 前一天) 运行
+    # baostock 数据T+1延迟，6点已可获取前一交易日数据
+    - cron: '0 22 * * 0-4'  # UTC 周日-周四 22:00 = 北京时间 周一-周五 6:00
+  workflow_dispatch:  # 支持手动触发
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 缓存数据文件（CSV/pkl），避免每次重新下载全量数据
+      - name: Restore data cache
+        uses: actions/cache@v4
+        id: data-cache
+        with:
+          path: |
+            data/a_stock_daily_k_10y.csv
+            data/.download_status.txt
+            data/.last_date.txt
+            data/mainboard_clean.pkl
+            data/features.pkl
+            data/predictions.pkl
+          key: stock-data-${{ github.run_number }}
+          restore-keys: stock-data-
+
+      - name: Check if trading day
+        id: check-trading-day
+        run: |
+          python -c "
+          from datetime import datetime
+          today = datetime.now()
+          # 简单判断：周末不是交易日
+          if today.weekday() >= 5:
+              print('is_trading_day=false')
+          else:
+              print('is_trading_day=true')
+          " >> "$GITHUB_OUTPUT"
+
+      - name: Run daily pipeline
+        if: steps.check-trading-day.outputs.is_trading_day == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          echo "===== Step 1: Update data ====="
+          python src/py00_fetch_stock_data.py --update
+
+          echo "===== Step 2: Clean data ====="
+          python src/py01_data_loader.py
+
+          echo "===== Step 3: Feature engineering ====="
+          python src/py02_features.py
+
+          echo "===== Step 4: Quick predict ====="
+          python src/py07_quick_predict.py
+
+          echo "===== Step 5: Generate strategy ====="
+          python src/py05_today.py
+
+      - name: Commit and push report
+        if: steps.check-trading-day.outputs.is_trading_day == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 归档策略报告（按日期命名）
+          DATE=$(date +%Y-%m-%d)
+          mkdir -p output/history
+          cp output/today_strategy.txt "output/history/strategy_${DATE}.txt"
+          git add output/today_strategy.txt "output/history/strategy_${DATE}.txt"
+          git diff --cached --quiet || git commit -m "daily report: ${DATE}"
+          git push
+
+      # 可选：通过企业微信/钉钉/邮件推送报告
+      - name: Send notification (optional)
+        if: (steps.check-trading-day.outputs.is_trading_day == 'true' || github.event_name == 'workflow_dispatch') && env.WEBHOOK_URL != ''
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          REPORT=$(cat output/today_strategy.txt)
+          # 企业微信机器人示例
+          curl -s -X POST "$WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{\"msgtype\": \"text\", \"text\": {\"content\": \"${REPORT}\"}}"
