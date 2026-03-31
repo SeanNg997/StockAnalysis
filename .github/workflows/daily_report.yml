@@ -97,7 +97,7 @@ jobs:
 
       # 邮件推送报告
       - name: Send email notification
-        if: (steps.check-trading-day.outputs.is_trading_day == 'true' || github.event_name == 'workflow_dispatch') && secrets.EMAIL_RECIPIENT != ''
+        if: (steps.check-trading-day.outputs.is_trading_day == 'true' || github.event_name == 'workflow_dispatch') && ${{ secrets.EMAIL_RECIPIENT != '' }}
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ secrets.EMAIL_SERVER }}
