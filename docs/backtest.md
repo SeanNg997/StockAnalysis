@@ -18,39 +18,43 @@
    - 手续费：在买入和卖出时均收取成交金额的0.0085%。
    - 计算净收益时必须精确扣除所有成本。
 6. 如果所有股票潜力都不理想，可选择空仓。
-</TRADING_REQUIREMENTS>
+   </TRADING_REQUIREMENTS>
 
 <DESIGN_IDEAS>
+
 1. **价值潜力评估模型**（核心）：
+
    - 构建一个机器学习或深度学习模型（PyTorch优先，也可使用XGBoost/LightGBM作为baseline），对每只股票**今日收盘后的明日价值潜力**进行评估。
    - 必须输出：(a) 潜力分数/预期收益率；(b) 置信度/不确定性指标（例如ensemble variance、dropout Monte-Carlo、quantile regression等）。
    - 特征工程必须丰富：技术指标（MA、EMA、RSI、MACD、Bollinger Bands、ATR、OBV、成交量异常等）、价格形态、波动率、动量、行业/板块相对强度等（你可自行设计最佳特征组合）。
-
 2. **交易策略模型**：
+
    - 根据模型输出的潜力分数+置信度，结合历史表现、仓位控制、风险规则，决定今日操作（买入/卖出/持仓/空仓）。
    - 持仓上限严格5只，可采用等权或基于潜力和置信度的动态仓位分配。
    - 设有明确买入/卖出/空仓阈值，避免过度交易。
-
 3. **回测与今日决策**：
+
    - 在2023-01-01至数据最新日期（2026年）的完整区间进行滚动回测（walk-forward或全样本+样本外验证均可，你决定最佳方式）。
    - 回测必须真实模拟集合竞价（用open价）、T+1、成本扣除、持仓限制。
    - 今日策略：使用最新可用数据，输出当前持仓明细 + 今日盘前集合竞价的交易决策（买入/卖出/持仓/空仓）。
-   </DESIGN_IDEAS>
+     </DESIGN_IDEAS>
 
 <FOLDER_STRUCTURE>
+
 - data/a_stock_daily_k_10y.csv （已提供，不要修改）
-- code/ 文件夹下所有Python代码必须以 **pyNUM_** 开头命名，其中NUM是编号（例如 py01_data_loader.py、py02_model.py、py03_strategy.py、py04_backtest.py、py05_today.py 等）
+- src/ 文件夹下所有Python代码必须以 **pyNUM_** 开头命名，其中NUM是编号（例如 py01_data_loader.py、py02_model.py、py03_strategy.py、py04_backtest.py、py05_today.py 等）
 - output/ 文件夹下保存所有回测结果、图表、今日策略报告、日志等
-</FOLDER_STRUCTURE>
+  </FOLDER_STRUCTURE>
 
 <BEST_PRACTICES>
+
 - 代码必须模块化、可复现（设置随机种子）、有详细中文注释、遵循PEP8。
 - 优先使用pandas向量化操作加速回测。
 - 回测指标至少包含：总回报率、年化收益率、夏普比率、最大回撤、胜率、年化波动率、持仓天数统计等。
 - 必须绘制：累计收益率曲线、回撤曲线、每日持仓数量曲线、每日交易次数等。
 - 所有输出文件保存在output/，文件名清晰（如 backtest_report_2022_2026.csv、equity_curve.png、today_strategy.txt）。
 - 如果数据列名未知，先探索CSV（打印shape、columns、date范围、主板股票数量等）。
-</BEST_PRACTICES>
+  </BEST_PRACTICES>
 
 <STEP_BY_STEP_INSTRUCTIONS>
 请严格按照以下流程执行：
