@@ -2,9 +2,9 @@ name: Daily Stock Strategy Report
 
 on:
   schedule:
-    # 每个交易日北京时间 6:00 (UTC 22:00 前一天) 运行
-    # baostock 数据T+1延迟，6点已可获取前一交易日数据
-    - cron: '0 22 * * 0-4'  # UTC 周日-周四 22:00 = 北京时间 周一-周五 6:00
+    # 每个交易日北京时间 8:00 (UTC 00:00) 运行
+    # baostock 数据T+1延迟，8点已可获取前一交易日数据
+    - cron: '0 0 * * 1-5'  # UTC 每个工作日 00:00 = 北京时间 每个工作日 8:00
   workflow_dispatch:  # 支持手动触发
 
 env:
@@ -78,8 +78,8 @@ jobs:
           echo "===== Step 3: Feature engineering ====="
           python src/py02_features.py
 
-          echo "===== Step 4: Quick predict ====="
-          python src/py07_quick_predict.py
+          echo "===== Step 4: Full model training and prediction ====="
+          python src/py03_model.py
 
           echo "===== Step 5: Generate strategy ====="
           python src/py05_today.py
