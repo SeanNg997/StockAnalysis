@@ -38,18 +38,16 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 缓存数据文件（CSV/pkl），避免每次重新下载全量数据
+      # 缓存数据文件（pkl），避免每次重新下载全量数据
       - name: Restore data cache
         uses: actions/cache@v4
         id: data-cache
         with:
           path: |
-            data/a_stock_daily_k_10y.csv
-            data/.download_status.txt
-            data/.last_date.txt
             data/mainboard_clean.pkl
             data/features.pkl
             data/predictions.pkl
+            data/.last_date.txt
           key: stock-data-${{ github.run_number }}
           restore-keys: stock-data-
 
@@ -97,14 +95,24 @@ jobs:
           git diff --cached --quiet || git commit -m "daily report: ${DATE}"
           git push
 
-      # 可选：通过企业微信/钉钉/邮件推送报告
-      - name: Send notification (optional)
-        if: (steps.check-trading-day.outputs.is_trading_day == 'true' || github.event_name == 'workflow_dispatch') && env.WEBHOOK_URL != ''
-        env:
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-        run: |
-          REPORT=$(cat output/today_strategy.txt)
-          # 企业微信机器人示例
-          curl -s -X POST "$WEBHOOK_URL" \
-            -H 'Content-Type: application/json' \
-            -d "{\"msgtype\": \"text\", \"text\": {\"content\": \"${REPORT}\"}}"
+      # 邮件推送报告
+      - name: Send email notification
+        if: (steps.check-trading-day.outputs.is_trading_day == 'true' || github.event_name == 'workflow_dispatch') && secrets.EMAIL_RECIPIENT != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.EMAIL_SERVER }}
+          server_port: ${{ secrets.EMAIL_PORT }}
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: '股票策略日报 - ${{ github.run_id }}'
+          to: ${{ secrets.EMAIL_RECIPIENT }}
+          from: ${{ secrets.EMAIL_USERNAME }}
+          body: |
+            A股量化交易策略日报
+            ======================
+
+            执行时间: $(date '+%Y-%m-%d %H:%M:%S')
+
+            策略报告详情:
+            ${{ env.REPORT_CONTENT }}
+          html_body: file://output/today_strategy.txt
