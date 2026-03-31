@@ -5,7 +5,7 @@
 功能:
   - 全量下载 / 断点续传 / 增量更新
   - 数据按月拆分存储，文件名格式: Stock_dailyK_YYYYMM.csv
-  - 每50只股票自动保存，防止中断丢失
+  - 每200只股票自动保存，防止中断丢失
 """
 
 import baostock as bs
@@ -23,7 +23,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 START_DATE = (datetime.now() - timedelta(days=365 * 10)).strftime("%Y-%m-%d")
 END_DATE = datetime.now().strftime("%Y-%m-%d")
 
-SAVE_EVERY = 50  # 每下载50只股票保存一次
+SAVE_EVERY = 200  # 每下载50只股票保存一次
 
 # 测试用的10只股票
 TEST_STOCKS = [
@@ -125,15 +125,19 @@ def save_incremental_months(new_df: pd.DataFrame):
 # ── 数据源 ──────────────────────────────────────────────
 
 def get_stock_list():
-    """获取全部A股股票列表"""
-    print("正在获取A股股票列表...")
+    """获取沪深主板A股股票列表（sh.60开头或sz.00开头）"""
+    print("正在获取沪深主板股票列表...")
     rs = bs.query_stock_basic()
     stock_list = []
     while rs.next():
         row = rs.get_row_data()
+        # row[0] 是股票代码，row[4] 和 row[5] 是上市状态
+        # 筛选条件：上市状态=1 且 仅保留主板（sh.60* 或 sz.00*）
         if row[4] == "1" and row[5] == "1":
-            stock_list.append((row[0], row[1]))
-    print(f"共获取 {len(stock_list)} 只上市股票")
+            code = row[0]
+            if code.startswith('sh.60') or code.startswith('sz.00'):
+                stock_list.append((code, row[1]))
+    print(f"共获取 {len(stock_list)} 只主板上市股票")
     return stock_list
 
 
@@ -230,19 +234,22 @@ def main(limit: int = 0, update: bool = False):
             # 预先计算每只股票的最后日期
             print("正在分析已有数据...")
             last_date_map = {}
+            actual_latest_date = None  # 从实际数据中获取最新的交易日期
             if not existing_df.empty:
                 last_date_map = existing_df.groupby("代码")["date"].max().to_dict()
+                # 获取所有数据中的最新日期，作为"理想的最新日期"
+                actual_latest_date = existing_df["date"].max()
             existing_df = None  # 释放内存，增量模式不再需要全量数据
 
-            # 增量模式：只处理已完成且最后日期不是最新的股票
+            # 增量模式：处理所有已有数据但最后日期不是最新的股票
+            # 注意：不依赖 completed 集合，直接检查 last_date_map，避免遗漏不完整的股票
             codes_to_update = []
             for code, name in stock_list:
-                if code not in completed:
-                    continue
                 last_date = last_date_map.get(code)
                 if last_date is None:
-                    continue
-                if last_date < END_DATE:
+                    continue  # 该股票在CSV中无数据，跳过（增量模式只更新已有数据的股票）
+                # 用实际的最新日期来判断，而不是用 END_DATE（今天可能是非交易日）
+                if actual_latest_date and last_date < actual_latest_date:
                     codes_to_update.append((code, name, last_date))
 
             if not codes_to_update:
