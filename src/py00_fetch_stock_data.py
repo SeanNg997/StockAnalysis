@@ -4,6 +4,7 @@
 
 功能:
   - 全量下载 / 断点续传 / 增量更新
+  - 数据按月拆分存储，文件名格式: Stock_dailyK_YYYYMM.csv
   - 每50只股票自动保存，防止中断丢失
 """
 
@@ -18,8 +19,6 @@ import glob
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
-
-OUTPUT_FILE = os.path.join(DATA_DIR, "a_stock_daily_k_10y.csv")
 
 START_DATE = (datetime.now() - timedelta(days=365 * 10)).strftime("%Y-%m-%d")
 END_DATE = datetime.now().strftime("%Y-%m-%d")
@@ -39,6 +38,18 @@ TEST_STOCKS = [
     ("sz.000333", "美的集团"),
     ("sh.601398", "工商银行"),
 ]
+
+
+# ── 月度文件管理 ──────────────────────────────────────────────
+
+def get_monthly_file(yyyymm: str) -> str:
+    """返回指定年月的CSV文件路径，yyyymm 格式如 '202004'"""
+    return os.path.join(DATA_DIR, f"Stock_dailyK_{yyyymm}.csv")
+
+
+def list_monthly_files() -> list:
+    """返回所有月度CSV文件路径（按时间排序）"""
+    return sorted(glob.glob(os.path.join(DATA_DIR, "Stock_dailyK_*.csv")))
 
 
 # ── 数据库文件 ──────────────────────────────────────────────
@@ -67,15 +78,48 @@ def save_completed(completed: set):
 # ── CSV 读写 ──────────────────────────────────────────────
 
 def load_existing_csv() -> pd.DataFrame:
-    """加载已有CSV数据，不存在则返回空DataFrame"""
-    if os.path.exists(OUTPUT_FILE):
-        return pd.read_csv(OUTPUT_FILE, encoding="utf-8-sig")
-    return pd.DataFrame()
+    """加载所有月度CSV数据合并返回，无文件则返回空DataFrame"""
+    files = list_monthly_files()
+    if not files:
+        return pd.DataFrame()
+    dfs = [pd.read_csv(f, encoding="utf-8-sig") for f in files]
+    return pd.concat(dfs, ignore_index=True)
 
 
 def save_to_csv(df: pd.DataFrame):
-    """保存DataFrame到CSV"""
-    df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
+    """按月拆分DataFrame，写入各月度CSV文件（全量覆盖）"""
+    if df.empty:
+        return
+    df = df.copy()
+    df["_month"] = pd.to_datetime(df["date"]).dt.strftime("%Y%m")
+    for month, group in df.groupby("_month"):
+        monthly_file = get_monthly_file(month)
+        group.drop(columns=["_month"]).to_csv(monthly_file, index=False, encoding="utf-8-sig")
+
+
+def save_incremental_months(new_df: pd.DataFrame):
+    """
+    增量更新专用：仅重写 new_df 中涉及的月度文件。
+    对每个月：先剔除该月文件中相同股票的旧行，再追加新行。
+    """
+    if new_df.empty:
+        return
+    new_df = new_df.copy()
+    new_df["_month"] = pd.to_datetime(new_df["date"]).dt.strftime("%Y%m")
+    for month, group in new_df.groupby("_month"):
+        group = group.drop(columns=["_month"])
+        monthly_file = get_monthly_file(month)
+        if os.path.exists(monthly_file):
+            existing_month = pd.read_csv(monthly_file, encoding="utf-8-sig")
+            codes_in_update = group["代码"].unique()
+            existing_month = existing_month[~existing_month["代码"].isin(codes_in_update)]
+            combined = pd.concat([existing_month, group], ignore_index=True)
+            combined = combined.sort_values(["代码", "date"]).reset_index(drop=True)
+            combined.to_csv(monthly_file, index=False, encoding="utf-8-sig")
+        else:
+            group.sort_values(["代码", "date"]).reset_index(drop=True).to_csv(
+                monthly_file, index=False, encoding="utf-8-sig"
+            )
 
 
 # ── 数据源 ──────────────────────────────────────────────
@@ -183,15 +227,21 @@ def main(limit: int = 0, update: bool = False):
             print("=" * 50)
             print("  增量更新模式")
             print("=" * 50)
+            # 预先计算每只股票的最后日期
+            print("正在分析已有数据...")
+            last_date_map = {}
+            if not existing_df.empty:
+                last_date_map = existing_df.groupby("代码")["date"].max().to_dict()
+            existing_df = None  # 释放内存，增量模式不再需要全量数据
+
             # 增量模式：只处理已完成且最后日期不是最新的股票
             codes_to_update = []
             for code, name in stock_list:
                 if code not in completed:
                     continue
-                stock_data = existing_df[existing_df["代码"] == code]
-                if stock_data.empty:
+                last_date = last_date_map.get(code)
+                if last_date is None:
                     continue
-                last_date = stock_data["date"].max()
                 if last_date < END_DATE:
                     codes_to_update.append((code, name, last_date))
 
@@ -202,25 +252,40 @@ def main(limit: int = 0, update: bool = False):
             print(f"需要更新 {len(codes_to_update)} 只股票")
 
             update_count = 0
+            max_new_date = None
+            new_chunks = []
             for idx, (code, name, last_date) in enumerate(tqdm(codes_to_update, desc="增量更新中", ncols=80)):
                 from_date = (pd.to_datetime(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
                 new_df = fetch_daily_increment(code, name, from_date)
                 if new_df is not None and not new_df.empty:
-                    # 追加新数据（保留历史数据）
-                    existing_df = pd.concat([existing_df, new_df], ignore_index=True)
+                    new_chunks.append(new_df)
                     update_count += 1
                 time.sleep(0.1)
 
-                if (idx + 1) % SAVE_EVERY == 0:
-                    save_to_csv(existing_df)
+                if (idx + 1) % SAVE_EVERY == 0 and new_chunks:
+                    batch = pd.concat(new_chunks, ignore_index=True)
+                    save_incremental_months(batch)
+                    if max_new_date is None:
+                        max_new_date = batch["date"].max()
+                    else:
+                        max_new_date = max(max_new_date, batch["date"].max())
+                    new_chunks = []
                     print(f"  已自动保存 (更新 {idx + 1}/{len(codes_to_update)})")
 
-            save_to_csv(existing_df)
-            # 记录最新数据日期
-            latest = existing_df["date"].max()
-            with open(os.path.join(DATA_DIR, ".last_date.txt"), "w") as f:
-                f.write(str(latest))
-            print(f"\n增量更新完成! 成功更新 {update_count} 只, 数据保存至: {OUTPUT_FILE}")
+            if new_chunks:
+                batch = pd.concat(new_chunks, ignore_index=True)
+                save_incremental_months(batch)
+                if max_new_date is None:
+                    max_new_date = batch["date"].max()
+                else:
+                    max_new_date = max(max_new_date, batch["date"].max())
+
+            if max_new_date:
+                with open(os.path.join(DATA_DIR, ".last_date.txt"), "w") as f:
+                    f.write(str(max_new_date))
+
+            files = list_monthly_files()
+            print(f"\n增量更新完成! 成功更新 {update_count} 只, 月度文件共 {len(files)} 个")
             return
 
         # ── 全量下载 / 断点续传 ──
@@ -239,13 +304,12 @@ def main(limit: int = 0, update: bool = False):
             print("所有股票已下载完毕!")
             return
 
-        success_count = skip_count  # 继承之前已成功的数量
+        success_count = skip_count
         fail_count = 0
 
         for idx, (code, name) in enumerate(tqdm(pending, desc="正在下载日K数据", ncols=80)):
             df = fetch_daily_full(code, name)
             if df is not None and not df.empty:
-                # 如果已有该股票的部分数据，先移除再合并（处理中断情况）
                 if not existing_df.empty and code in existing_df["代码"].values:
                     existing_df = existing_df[existing_df["代码"] != code]
                 existing_df = pd.concat([existing_df, df], ignore_index=True)
@@ -256,7 +320,6 @@ def main(limit: int = 0, update: bool = False):
 
             time.sleep(0.1)
 
-            # 定期保存
             total_done = skip_count + idx + 1
             if total_done % SAVE_EVERY == 0:
                 save_to_csv(existing_df)
@@ -267,14 +330,14 @@ def main(limit: int = 0, update: bool = False):
         save_to_csv(existing_df)
         save_completed(completed)
 
-        # 记录最新数据日期
         if not existing_df.empty:
             latest = existing_df["date"].max()
             with open(os.path.join(DATA_DIR, ".last_date.txt"), "w") as f:
                 f.write(str(latest))
 
+        files = list_monthly_files()
         total_stocks = len(existing_df["代码"].unique())
-        print(f"\n数据已保存至: {OUTPUT_FILE}")
+        print(f"\n数据已保存至月度文件，共 {len(files)} 个文件")
         print(f"总记录数: {len(existing_df):,}, 股票数: {total_stocks}")
         print(f"成功: {success_count}, 失败: {fail_count}, 跳过: {skip_count}, 总计: {len(stock_list)}")
 

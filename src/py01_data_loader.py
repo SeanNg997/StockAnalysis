@@ -19,15 +19,20 @@ warnings.filterwarnings('ignore')
 
 # ============ 路径配置 ============
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RAW_CSV = os.path.join(BASE_DIR, 'data', 'a_stock_daily_k_10y.csv')
+DATA_DIR = os.path.join(BASE_DIR, 'data')
 CLEAN_PKL = os.path.join(BASE_DIR, 'data', 'mainboard_clean.pkl')
 
 
-def load_raw_data(csv_path: str = RAW_CSV) -> pd.DataFrame:
-    """加载原始CSV数据"""
-    print("[1/6] 加载原始CSV数据...")
-    df = pd.read_csv(csv_path, encoding='utf-8-sig')
-    print(f"  原始数据: {df.shape[0]:,} 行, {df['代码'].nunique()} 只股票")
+def load_raw_data() -> pd.DataFrame:
+    """加载所有月度CSV数据并合并"""
+    import glob as _glob
+    print("[1/6] 加载月度CSV数据...")
+    files = sorted(_glob.glob(os.path.join(DATA_DIR, 'Stock_dailyK_*.csv')))
+    if not files:
+        raise FileNotFoundError(f"未找到月度CSV文件 (Stock_dailyK_*.csv) in {DATA_DIR}")
+    dfs = [pd.read_csv(f, encoding='utf-8-sig') for f in files]
+    df = pd.concat(dfs, ignore_index=True)
+    print(f"  读取 {len(files)} 个月度文件，原始数据: {df.shape[0]:,} 行, {df['代码'].nunique()} 只股票")
     print(f"  日期范围: {df['date'].min()} ~ {df['date'].max()}")
     return df
 
