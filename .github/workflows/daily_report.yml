@@ -38,7 +38,7 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 缓存数据文件（pkl），避免每次重新下载全量数据
+      # 缓存数据文件（pkl和CSV），避免每次重新下载全量数据
       - name: Restore data cache
         uses: actions/cache@v4
         id: data-cache
@@ -48,7 +48,9 @@ jobs:
             data/features.pkl
             data/predictions.pkl
             data/.last_date.txt
-          key: stock-data-${{ github.run_number }}
+            data/Stock_dailyK_*.csv
+            data/.download_status.txt
+          key: stock-data-cache
           restore-keys: stock-data-
 
       - name: Check if trading day
@@ -68,7 +70,14 @@ jobs:
         if: steps.check-trading-day.outputs.is_trading_day == 'true' || github.event_name == 'workflow_dispatch'
         run: |
           echo "===== Step 1: Update data ====="
-          python src/py00_fetch_stock_data.py --update
+          # 首次运行（无缓存）用全量下载，后续运行用增量更新
+          if [ -d "data" ] && [ -n "$(ls -1 data/Stock_dailyK_*.csv 2>/dev/null)" ]; then
+            echo "检测到现有CSV数据，使用增量更新模式"
+            python src/py00_fetch_stock_data.py --update
+          else
+            echo "首次运行或无CSV数据，使用全量下载模式"
+            python src/py00_fetch_stock_data.py
+          fi
 
           echo "===== Step 2: Clean data ====="
           python src/py01_data_loader.py
