@@ -136,42 +136,43 @@ def generate_stock_report(stock_code, target_date=None):
 
     exec_date = next_trading_day(latest_date.date())
     lines = []
-    lines.append(f"# {stock_name}（{full_code}）— 今日交易决策\n")
-    lines.append(f"- **决策基准日**: {latest_date.date()}（使用当日收盘数据）")
-    lines.append(f"- **决策应用日期**: {exec_date}（下一个交易日，盘前集合竞价）\n")
+    lines.append(f"# 📊 {stock_name}（{full_code}）· 今日决策\n")
+    lines.append(f"> **执行日**：{exec_date}（盘前集合竞价）\n")
 
-    lines.append("## 预测摘要\n")
+    lines.append("---\n")
+    lines.append("## 📈 预测摘要\n")
     lines.append("| 指标 | 数值 |")
-    lines.append("|------|------|")
-    lines.append(f"| 收盘价 | {close_price:.2f} |")
-    lines.append(f"| 开盘价 | {open_price:.2f} |")
+    lines.append("|------|:----:|")
+    lines.append(f"| 收盘价 | ¥{close_price:.2f} |")
+    lines.append(f"| 开盘价 | ¥{open_price:.2f} |")
     lines.append(f"| 预测收益率（T+1→T+2） | **{pred_return:+.4%}** |")
-    lines.append(f"| 预测标准差 | {pred_std:.6f} |")
-    lines.append(f"| 置信度 | {confidence:.4f} |")
+    lines.append(f"| 置信度 | {confidence:.2%} |")
     lines.append(f"| 全市场排名 | {rank} / {total}（前 {pct:.1%}） |")
     lines.append(f"| 成交量 | {volume:,.0f} |")
     lines.append(f"| 成交额 | {amount:,.0f} |")
 
-    lines.append(f"\n## 操作建议: {advice}\n")
+    lines.append(f"\n## 💡 操作建议：{advice}\n")
     lines.append(f"> {advice_detail}\n")
 
     # 历史趋势
-    lines.append("## 近5日预测趋势\n")
+    lines.append("## 🕐 近5日预测趋势\n")
     lines.append("| 日期 | 预测收益率 | 置信度 |")
-    lines.append("|------|-----------|--------|")
+    lines.append("|:----:|----------:|-------:|")
     for _, h in stock_history.iterrows():
-        lines.append(f"| {h['date'].date()} | {h['pred_return']:+.4%} | {h['confidence']:.4f} |")
+        lines.append(f"| {h['date'].date()} | {h['pred_return']:+.4%} | {h['confidence']:.2%} |")
 
     # 市场对比
-    lines.append("\n## 市场对比\n")
-    lines.append(f"- 全市场预测收益率均值: {latest['pred_return'].mean():.4%}")
-    lines.append(f"- 全市场预测收益率中位数: {latest['pred_return'].median():.4%}")
+    lines.append("\n## 🌐 市场对比\n")
     rel_strength = pred_return - latest['pred_return'].mean()
-    lines.append(f"- 相对强度（vs均值）: {rel_strength:+.4%}")
-    lines.append(f"- 置信度排名: 前 {(latest['confidence'] < confidence).sum() + 1} / {total}")
+    lines.append("| 指标 | 数值 |")
+    lines.append("|------|-----:|")
+    lines.append(f"| 全市场预测均值 | {latest['pred_return'].mean():.4%} |")
+    lines.append(f"| 全市场预测中位数 | {latest['pred_return'].median():.4%} |")
+    lines.append(f"| 相对强度（vs均值） | {rel_strength:+.4%} |")
+    lines.append(f"| 置信度排名 | 前 {(latest['confidence'] < confidence).sum() + 1} / {total} |")
 
     lines.append("\n---\n")
-    lines.append("*风险提示：以上为模型预测结果，仅供参考，不构成投资建议。策略严格遵守T+1规则。*")
+    lines.append("⚠️ *以上为模型预测结果，仅供参考，不构成投资建议。严格遵守 T+1 规则，以集合竞价开盘价成交。*")
 
     report = "\n".join(lines)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -203,54 +204,61 @@ def generate_today_strategy(target_date=None):
 
     # ===== 构建Markdown报告 =====
     lines = []
-    lines.append(f"# A股量化策略 — 今日实盘交易决策\n")
-    lines.append(f"- **决策基准日**: {latest_date.date()}（使用当日收盘数据）")
-    lines.append(f"- **决策应用日期**: {exec_date}（下一个交易日，盘前集合竞价）\n")
+    lines.append(f"# 📊 A股量化策略 · 今日决策\n")
+    lines.append(f"> **执行日**：{exec_date}（盘前集合竞价）\n")
+    lines.append("---\n")
 
     # 推荐买入TOP5
-    lines.append("## 推荐买入 TOP 5\n")
-    lines.append("| 排名 | 代码 | 名称 | 收盘价 | 预测收益率 | 置信度 | 建议仓位 |")
-    lines.append("|:----:|------|------|-------:|----------:|-------:|---------:|")
+    lines.append("## 🏆 今日推荐买入\n")
 
     top5 = qualified.head(5)
     n_buy = len(top5)
-    for i, (_, row) in enumerate(top5.iterrows()):
-        weight = 1.0 / max(n_buy, 1)
-        lines.append(
-            f"| {i+1} | {row['代码']} | {row.get('名称', 'N/A')} "
-            f"| {row.get('close', 0):.2f} "
-            f"| {row['pred_return']:+.4%} "
-            f"| {row['confidence']:.4f} "
-            f"| {weight:.1%} |"
-        )
 
     if n_buy == 0:
-        lines.append("\n> **建议空仓**：当前无股票满足买入条件\n")
+        lines.append("> **建议空仓**：当前无股票满足买入条件\n")
+    else:
+        for i, (_, row) in enumerate(top5.iterrows()):
+            weight = 1.0 / max(n_buy, 1)
+            lines.append(f"### TOP {i+1} — {row.get('名称', 'N/A')}　`{row['代码']}`\n")
+            lines.append("| 收盘价 | 预测收益率 | 置信度 | 建议仓位 |")
+            lines.append("|:------:|:---------:|:------:|:--------:|")
+            lines.append(
+                f"| ¥{row.get('close', 0):.2f}"
+                f" | **{row['pred_return']:+.4%}**"
+                f" | {row['confidence']:.2%}"
+                f" | {weight:.0%} |\n"
+            )
+
+    lines.append("---\n")
 
     # 市场概况
-    lines.append("\n## 市场概况\n")
-    lines.append(f"- 当日可预测股票数: **{len(latest)}**")
-    lines.append(f"- 预测收益率 > 0 的股票数: {(latest['pred_return'] > 0).sum()}")
-    lines.append(f"- 预测收益率 > 0.1% 的股票数: {(latest['pred_return'] > 0.001).sum()}")
-    lines.append(f"- 全市场预测收益率均值: {latest['pred_return'].mean():.4%}")
-    lines.append(f"- 全市场预测收益率中位数: {latest['pred_return'].median():.4%}")
+    lines.append("## 📈 市场概况\n")
+    lines.append("| 指标 | 数值 |")
+    lines.append("|------|-----:|")
+    lines.append(f"| 可预测股票数 | {len(latest):,} 只 |")
+    lines.append(f"| 预测收益率 > 0 | {(latest['pred_return'] > 0).sum():,} 只 |")
+    lines.append(f"| 突破 0.1% 阈值 | **{(latest['pred_return'] > 0.001).sum()} 只** |")
+    lines.append(f"| 全市场预测均值 | {latest['pred_return'].mean():.4%} |")
+    lines.append(f"| 全市场预测中位数 | {latest['pred_return'].median():.4%} |")
+
+    lines.append("\n---\n")
 
     # TOP20详细列表
-    lines.append("\n## 潜力排名 TOP 20\n")
+    lines.append("## 📋 潜力排名 TOP 20\n")
     lines.append("> 全市场排名，不限制阈值\n")
-    lines.append("| 排名 | 代码 | 名称 | 预测收益率 | 置信度 | 收盘价 |")
-    lines.append("|:----:|------|------|----------:|-------:|-------:|")
+    lines.append("| # | 代码 | 名称 | 预测收益率 | 置信度 | 收盘价 |")
+    lines.append("|:-:|------|------|----------:|-------:|-------:|")
     top20_all = latest.head(20)
     for i, (_, row) in enumerate(top20_all.iterrows()):
         lines.append(
             f"| {i+1} | {row['代码']} | {row.get('名称', 'N/A')} "
-            f"| {row['pred_return']:+.4%} "
-            f"| {row['confidence']:.4f} "
-            f"| {row.get('close', 0):.2f} |"
+            f"| **{row['pred_return']:+.4%}**"
+            f" | {row['confidence']:.2%}"
+            f" | {row.get('close', 0):.2f} |"
         )
 
     lines.append("\n---\n")
-    lines.append("*风险提示：以上为模型预测结果，仅供参考，不构成投资建议。策略严格遵守T+1规则，以集合竞价开盘价成交。*")
+    lines.append("⚠️ *以上为模型预测结果，仅供参考，不构成投资建议。严格遵守 T+1 规则，以集合竞价开盘价成交。*")
 
     report = "\n".join(lines)
 
