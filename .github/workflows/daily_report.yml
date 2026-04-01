@@ -90,19 +90,6 @@ jobs:
           echo "===== Step 5: Generate strategy ====="
           python src/py05_today.py
 
-      - name: Commit and push report
-        if: steps.check-trading-day.outputs.is_trading_day == 'true' || github.event_name == 'workflow_dispatch'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 归档策略报告（按日期命名）
-          DATE=$(date +%Y-%m-%d)
-          mkdir -p output/history
-          cp output/today_strategy.md "output/history/strategy_${DATE}.md"
-          git add output/today_strategy.md "output/history/strategy_${DATE}.md"
-          git diff --cached --quiet || git commit -m "daily report: ${DATE}"
-          git push
-
       # 将 Markdown 策略报告转为 HTML（供邮件发送）
       - name: Convert strategy report to HTML
         if: steps.check-trading-day.outputs.is_trading_day == 'true' || github.event_name == 'workflow_dispatch'
