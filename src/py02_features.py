@@ -295,9 +295,19 @@ def get_feature_columns(df: pd.DataFrame) -> list:
     return [c for c in df.columns if c not in exclude]
 
 
-def run_pipeline():
-    """执行特征工程流水线"""
+def run_pipeline(end_date=None):
+    """执行特征工程流水线
+
+    Args:
+        end_date: 数据截止日期（含），格式 'YYYY-MM-DD'。None 表示使用全部数据。
+    """
     df = pd.read_pickle(CLEAN_PKL)
+
+    # 截断到指定日期（在特征计算前截断，确保不使用未来数据）
+    if end_date is not None:
+        df = df[df['date'] <= pd.Timestamp(end_date)].copy()
+        print(f"  [date filter] 数据截断至 {end_date}")
+
     df = compute_all_features(df)
 
     # 保存
@@ -310,4 +320,10 @@ def run_pipeline():
 
 
 if __name__ == '__main__':
-    run_pipeline()
+    import sys as _sys
+    _end_date = None
+    _args = _sys.argv[1:]
+    if '--date' in _args:
+        _idx = _args.index('--date')
+        _end_date = _args[_idx + 1]
+    run_pipeline(end_date=_end_date)

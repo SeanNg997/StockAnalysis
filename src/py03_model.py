@@ -54,16 +54,101 @@ def get_feature_columns(df: pd.DataFrame) -> list:
     return [c for c in df.columns if c not in exclude]
 
 
-def train_and_predict(df: pd.DataFrame) -> pd.DataFrame:
+def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
     """
     Walk-forward滚动训练与预测
     返回包含预测结果的DataFrame
+
+    Args:
+        df: 特征数据（已截断到 end_date）
+        end_date: 若指定，则只预测该日（单日快速模式）；否则从 BACKTEST_START 全量预测
     """
     feature_cols = get_feature_columns(df)
     print(f"使用 {len(feature_cols)} 个特征: {feature_cols[:10]}...")
 
     # 获取所有交易日
     all_dates = sorted(df['date'].unique())
+
+    if end_date is not None:
+        # 单日模式：只预测 end_date 当天，用之前 TRAIN_YEARS 年数据训练
+        target_date = pd.Timestamp(end_date)
+        if target_date not in all_dates:
+            # 取 <= end_date 的最新交易日
+            candidates = [d for d in all_dates if d <= target_date]
+            if not candidates:
+                raise ValueError(f"end_date {end_date} 之前没有可用数据")
+            target_date = candidates[-1]
+            print(f"  [end_date 非交易日，取最近交易日 {target_date.date()}]")
+
+        target_idx = all_dates.index(target_date)
+        train_window = TRAIN_YEARS * 252
+        train_start_idx = max(0, target_idx - train_window)
+        train_dates = all_dates[train_start_idx:target_idx]
+
+        if len(train_dates) < 252:
+            raise ValueError(f"训练数据不足（{len(train_dates)} 天 < 252 天），请使用更早的 BACKTEST_START 或更长的历史数据")
+
+        val_split = int(len(train_dates) * 0.9)
+        train_date_set = set(train_dates[:val_split])
+        val_date_set = set(train_dates[val_split:])
+
+        train_mask = df['date'].isin(train_date_set)
+        val_mask = df['date'].isin(val_date_set)
+        X_train = df.loc[train_mask, feature_cols]
+        y_train = df.loc[train_mask, 'label']
+        X_val = df.loc[val_mask, feature_cols]
+        y_val = df.loc[val_mask, 'label']
+
+        valid_train = y_train.notna()
+        X_train, y_train = X_train[valid_train], y_train[valid_train]
+        valid_val = y_val.notna()
+        X_val, y_val = X_val[valid_val], y_val[valid_val]
+
+        print(f"单日预测模式: 目标日 {target_date.date()}")
+        print(f"训练集: {len(X_train):,} 行, 验证集: {len(X_val):,} 行")
+
+        models = []
+        for seed in range(N_ENSEMBLE):
+            params = LGB_PARAMS.copy()
+            params['seed'] = seed * 42
+            params['feature_fraction_seed'] = seed * 42
+            params['bagging_seed'] = seed * 42
+            dtrain = lgb.Dataset(X_train, label=y_train)
+            dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
+            model = lgb.train(
+                params, dtrain, num_boost_round=500,
+                valid_sets=[dval],
+                callbacks=[lgb.early_stopping(30, verbose=False)],
+            )
+            models.append(model)
+            print(f"  模型 {seed+1}/{N_ENSEMBLE} 完成, best_iter={model.best_iteration}")
+
+        del X_train, y_train, X_val, y_val
+        gc.collect()
+
+        day_mask = df['date'] == target_date
+        day_data = df.loc[day_mask]
+        X_pred = day_data[feature_cols]
+        preds = np.array([m.predict(X_pred) for m in models])
+        pred_mean = preds.mean(axis=0)
+        pred_std = preds.std(axis=0)
+        confidence = 1.0 / (1.0 + pred_std * 100)
+
+        pred_records = []
+        for j, idx in enumerate(day_data.index):
+            pred_records.append({
+                'idx': idx,
+                'date': target_date,
+                '代码': day_data.iloc[j]['代码'],
+                'pred_return': pred_mean[j],
+                'pred_std': pred_std[j],
+                'confidence': confidence[j],
+            })
+
+        print(f"\n预测完成! 共 {len(pred_records):,} 条记录")
+        return pd.DataFrame(pred_records)
+
+    # 全量 walk-forward 模式
     bt_start = pd.Timestamp(BACKTEST_START)
 
     # 找到回测起始日期在all_dates中的位置
@@ -184,8 +269,14 @@ def train_and_predict(df: pd.DataFrame) -> pd.DataFrame:
     return pred_df
 
 
-def run_pipeline():
-    """执行模型训练与预测流水线"""
+def run_pipeline(end_date=None):
+    """执行模型训练与预测流水线
+
+    Args:
+        end_date: 预测截止日期（含），格式 'YYYY-MM-DD'。
+                  None 表示从 BACKTEST_START 到最新日期全量 walk-forward。
+                  指定日期时只预测该日（用该日之前 TRAIN_YEARS 年数据训练）。
+    """
     print("加载特征数据...")
     df = pd.read_pickle(FEATURE_PKL)
     print(f"数据: {df.shape[0]:,} 行, {df['代码'].nunique()} 只股票")
@@ -194,7 +285,12 @@ def run_pipeline():
     feature_cols = get_feature_columns(df)
     df[feature_cols] = df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    pred_df = train_and_predict(df)
+    # 截断到指定日期（features.pkl 可能已截断，这里做双重保证）
+    if end_date is not None:
+        df = df[df['date'] <= pd.Timestamp(end_date)].copy()
+        print(f"  [date filter] 数据截断至 {end_date}")
+
+    pred_df = train_and_predict(df, end_date=end_date)
 
     # 保存预测结果
     pred_df.to_pickle(PREDICT_PKL)
@@ -211,4 +307,10 @@ def run_pipeline():
 
 
 if __name__ == '__main__':
-    run_pipeline()
+    import sys as _sys
+    _end_date = None
+    _args = _sys.argv[1:]
+    if '--date' in _args:
+        _idx = _args.index('--date')
+        _end_date = _args[_idx + 1]
+    run_pipeline(end_date=_end_date)

@@ -17,8 +17,17 @@ import numpy as np
 import os
 import sys
 import warnings
+from datetime import date, timedelta
 
 warnings.filterwarnings('ignore')
+
+
+def next_trading_day(d: date) -> date:
+    """返回 d 之后的下一个交易日（跳过周六、周日；不处理节假日）"""
+    next_d = d + timedelta(days=1)
+    while next_d.weekday() >= 5:  # 5=周六, 6=周日
+        next_d += timedelta(days=1)
+    return next_d
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PREDICT_PKL = os.path.join(BASE_DIR, 'data', 'predictions.pkl')
@@ -42,12 +51,26 @@ def normalize_stock_code(code):
     raise ValueError(f"无法识别股票代码: {code}，请输入6位主板代码（如 600000 或 002202）")
 
 
-def _load_latest_data():
-    """加载预测结果并返回最新日数据"""
+def _load_latest_data(target_date=None):
+    """加载预测结果并返回指定日（或最新日）数据
+
+    Args:
+        target_date: 目标日期字符串 'YYYY-MM-DD'，None 表示取最新日期
+    """
     pred_df = pd.read_pickle(PREDICT_PKL)
     df = pd.read_pickle(FEATURE_PKL)
 
-    latest_date = pred_df['date'].max()
+    if target_date is not None:
+        ts = pd.Timestamp(target_date)
+        available = pred_df[pred_df['date'] <= ts]['date']
+        if available.empty:
+            raise ValueError(f"predictions.pkl 中没有 <= {target_date} 的数据")
+        latest_date = available.max()
+        if latest_date != ts:
+            print(f"  [target_date={target_date} 非交易日，取最近交易日 {latest_date.date()}]")
+    else:
+        latest_date = pred_df['date'].max()
+
     print(f"最新数据日期: {latest_date.date()}")
 
     latest_pred = pred_df[pred_df['date'] == latest_date].copy()
@@ -58,12 +81,17 @@ def _load_latest_data():
     return latest, latest_date
 
 
-def generate_stock_report(stock_code):
-    """生成单只股票的预测报告"""
+def generate_stock_report(stock_code, target_date=None):
+    """生成单只股票的预测报告
+
+    Args:
+        stock_code: 股票代码（6位数字或带前缀）
+        target_date: 目标日期 'YYYY-MM-DD'，None 表示最新日期
+    """
     full_code = normalize_stock_code(stock_code)
     short_code = full_code.split('.')[1]  # 6位数字代码，用于文件名
     print(f"生成 {full_code} 的交易决策...")
-    latest, latest_date = _load_latest_data()
+    latest, latest_date = _load_latest_data(target_date)
 
     stock = latest[latest['代码'] == full_code].copy()
     if stock.empty:
@@ -106,10 +134,11 @@ def generate_stock_report(stock_code):
     pred_df = pd.read_pickle(PREDICT_PKL)
     stock_history = pred_df[pred_df['代码'] == full_code].sort_values('date').tail(5)
 
+    exec_date = next_trading_day(latest_date.date())
     lines = []
     lines.append(f"# {stock_name}（{full_code}）— 今日交易决策\n")
     lines.append(f"- **决策基准日**: {latest_date.date()}（使用当日收盘数据）")
-    lines.append(f"- **执行日期**: 下一个交易日 盘前集合竞价\n")
+    lines.append(f"- **决策应用日期**: {exec_date}（下一个交易日，盘前集合竞价）\n")
 
     lines.append("## 预测摘要\n")
     lines.append("| 指标 | 数值 |")
@@ -155,10 +184,14 @@ def generate_stock_report(stock_code):
     return report
 
 
-def generate_today_strategy():
-    """生成全市场今日实盘交易决策（Markdown格式）"""
+def generate_today_strategy(target_date=None):
+    """生成全市场实盘交易决策（Markdown格式）
+
+    Args:
+        target_date: 目标日期 'YYYY-MM-DD'，None 表示最新日期
+    """
     print("生成今日交易决策...")
-    latest, latest_date = _load_latest_data()
+    latest, latest_date = _load_latest_data(target_date)
 
     # 过滤：预测收益率 > 0.1% 且 置信度较高
     qualified = latest[
@@ -166,11 +199,13 @@ def generate_today_strategy():
         (latest['confidence'] > latest['confidence'].median())
     ].head(20)
 
+    exec_date = next_trading_day(latest_date.date())
+
     # ===== 构建Markdown报告 =====
     lines = []
     lines.append(f"# A股量化策略 — 今日实盘交易决策\n")
     lines.append(f"- **决策基准日**: {latest_date.date()}（使用当日收盘数据）")
-    lines.append(f"- **执行日期**: 下一个交易日 盘前集合竞价\n")
+    lines.append(f"- **决策应用日期**: {exec_date}（下一个交易日，盘前集合竞价）\n")
 
     # 推荐买入TOP5
     lines.append("## 推荐买入 TOP 5\n")
@@ -232,8 +267,20 @@ def generate_today_strategy():
 
 
 if __name__ == '__main__':
-    if len(sys.argv) > 1:
-        stock_code = sys.argv[1]
-        generate_stock_report(stock_code)
+    # 解析参数：支持 --date YYYY-MM-DD 和可选的股票代码
+    _target_date = None
+    _stock_code = None
+    _args = sys.argv[1:]
+
+    if '--date' in _args:
+        _idx = _args.index('--date')
+        _target_date = _args[_idx + 1]
+        _args = [a for i, a in enumerate(_args) if i != _idx and i != _idx + 1]
+
+    if _args:
+        _stock_code = _args[0]
+
+    if _stock_code:
+        generate_stock_report(_stock_code, target_date=_target_date)
     else:
-        generate_today_strategy()
+        generate_today_strategy(target_date=_target_date)

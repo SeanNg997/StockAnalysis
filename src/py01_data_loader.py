@@ -127,8 +127,12 @@ def filter_liquidity(df: pd.DataFrame, min_avg_amount: float = 500e4) -> pd.Data
     return df
 
 
-def run_pipeline() -> pd.DataFrame:
-    """执行完整数据清洗流水线"""
+def run_pipeline(end_date=None) -> pd.DataFrame:
+    """执行完整数据清洗流水线
+
+    Args:
+        end_date: 数据截止日期（含），格式 'YYYY-MM-DD'。None 表示使用全部数据。
+    """
     df = load_raw_data()
     df = filter_mainboard(df)
     df = remove_st(df)
@@ -142,6 +146,11 @@ def run_pipeline() -> pd.DataFrame:
     # 日期转换
     df['date'] = pd.to_datetime(df['date'])
 
+    # 截断到指定日期
+    if end_date is not None:
+        df = df[df['date'] <= pd.Timestamp(end_date)].copy()
+        print(f"  [date filter] 数据截断至 {end_date}")
+
     # 保存pickle
     df.to_pickle(CLEAN_PKL)
     print(f"\n✅ 清洗完成! 保存至 {CLEAN_PKL}")
@@ -152,4 +161,10 @@ def run_pipeline() -> pd.DataFrame:
 
 
 if __name__ == '__main__':
-    df = run_pipeline()
+    import sys as _sys
+    _end_date = None
+    _args = _sys.argv[1:]
+    if '--date' in _args:
+        _idx = _args.index('--date')
+        _end_date = _args[_idx + 1]
+    run_pipeline(end_date=_end_date)

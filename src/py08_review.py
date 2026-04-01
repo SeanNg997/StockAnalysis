@@ -2,7 +2,7 @@
 py08_review.py — 盘后决策评估模块
 ====================================
 职责：
-1. 解析今日盘前决策（output/today_strategy.txt）
+1. 解析今日盘前决策（output/today_strategy.md）
 2. 读取今日实际行情（最新月度CSV）
 3. 生成对比可视化图（output/today_review_YYYYMMDD.png）
 
@@ -12,8 +12,9 @@ py08_review.py — 盘后决策评估模块
   完整收益需次日开盘才能确认
 
 用法：
-  python src/py08_review.py                # 评估今日
-  python src/py08_review.py --force        # 跳过时间检查（调试用）
+  python src/py08_review.py                        # 评估今日
+  python src/py08_review.py --force                # 跳过时间检查（调试用）
+  python src/py08_review.py --date 2025-03-15      # 评估指定历史日期（自动跳过时间检查）
 """
 
 import os
@@ -29,13 +30,14 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 
-matplotlib.rcParams['font.family'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
+matplotlib.rcParams['font.family'] = ['PingFang HK', 'Hiragino Sans GB', 'STHeiti',
+                                       'Microsoft YaHei', 'SimHei', 'DejaVu Sans']
 matplotlib.rcParams['axes.unicode_minus'] = False
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
 DATA_DIR = os.path.join(BASE_DIR, 'data')
-STRATEGY_TXT = os.path.join(OUTPUT_DIR, 'today_strategy.txt')
+STRATEGY_MD = os.path.join(OUTPUT_DIR, 'today_strategy.md')
 
 # 评估时间窗口：收盘(15:00) + 1小时 = 16:00
 REVIEW_HOUR = 16
@@ -43,9 +45,10 @@ REVIEW_HOUR = 16
 
 # ── 时间检查 ─────────────────────────────────────────────────────
 
-def check_review_time(force: bool = False) -> None:
-    """检查当前时间是否满足评估条件（16:00之后）"""
-    if force:
+def check_review_time(force: bool = False, eval_date: date = None) -> None:
+    """检查当前时间是否满足评估条件（16:00之后）。
+    指定历史日期时自动跳过时间检查。"""
+    if force or (eval_date is not None and eval_date < datetime.now().date()):
         return
     now = datetime.now()
     if now.weekday() >= 5:
@@ -57,41 +60,51 @@ def check_review_time(force: bool = False) -> None:
 
 # ── 解析盘前决策 ──────────────────────────────────────────────────
 
-def parse_strategy(txt_path: str) -> tuple[date, list[dict], bool]:
+def parse_strategy(md_path: str) -> tuple[date, date, list[dict], bool]:
     """
-    解析 today_strategy.txt，返回：
+    解析 today_strategy.md，返回：
     - strategy_date: 决策基准日
+    - exec_date: 决策应用日期（执行日）
     - top5: 推荐买入TOP5列表（每项含代码、名称、预测收益率、建议仓位、收盘价）
     - is_empty: 是否建议空仓
     """
-    with open(txt_path, 'r', encoding='utf-8') as f:
+    with open(md_path, 'r', encoding='utf-8') as f:
         content = f.read()
 
-    # 提取决策日期
-    m = re.search(r'决策基准日[:：]\s*(\d{4}-\d{2}-\d{2})', content)
+    # 提取决策基准日（格式：**决策基准日**: YYYY-MM-DD 或 决策基准日：YYYY-MM-DD）
+    m = re.search(r'\*{0,2}决策基准日\*{0,2}[:：]\*{0,2}\s*(\d{4}-\d{2}-\d{2})', content)
     if not m:
         raise ValueError("无法从策略文件中解析决策基准日")
     strategy_date = datetime.strptime(m.group(1), '%Y-%m-%d').date()
 
+    # 提取决策应用日期（执行日）
+    m_exec = re.search(r'\*{0,2}决策应用日期\*{0,2}[:：]\*{0,2}\s*(\d{4}-\d{2}-\d{2})', content)
+    if not m_exec:
+        raise ValueError("无法从策略文件中解析决策应用日期")
+    exec_date = datetime.strptime(m_exec.group(1), '%Y-%m-%d').date()
+
     # 检查是否空仓
     if '建议空仓' in content:
-        return strategy_date, [], True
+        return strategy_date, exec_date, [], True
 
-    # 解析 TOP 5 表格行
-    # 格式: "  1   sh.600053   九鼎投资         15.04   0.3247%    0.9341   20.0%"
+    # 解析 TOP 5 Markdown 表格行
+    # 格式: "| 1 | sh.600053 | 九鼎投资 | 15.04 | +0.3247% | 0.9341 | 20.0% |"
     top5 = []
     in_top5 = False
     for line in content.splitlines():
         if '推荐买入' in line and 'TOP 5' in line:
             in_top5 = True
             continue
-        if in_top5 and '【' in line and '推荐买入' not in line:
+        if in_top5 and line.startswith('##') and '推荐买入' not in line:
             break
         if not in_top5:
             continue
-        # 匹配数据行：排名 + 代码 + 名称 + 数字
+        # 跳过表头和分隔行
+        if '代码' in line or '----' in line or '排名' in line:
+            continue
+        # 匹配 Markdown 表格数据行
         m = re.match(
-            r'\s*(\d+)\s+((?:sh|sz)\.\d{6})\s+(\S+)\s+([\d.]+)\s+([\d.]+)%\s+([\d.]+)\s+([\d.]+)%',
+            r'\|\s*(\d+)\s*\|\s*((?:sh|sz)\.\d{6})\s*\|\s*(\S+)\s*\|\s*([\d.]+)\s*\|\s*([+-]?[\d.]+)%\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)%\s*\|',
             line
         )
         if m:
@@ -107,7 +120,7 @@ def parse_strategy(txt_path: str) -> tuple[date, list[dict], bool]:
         if len(top5) == 5:
             break
 
-    return strategy_date, top5, False
+    return strategy_date, exec_date, top5, False
 
 
 # ── 读取今日实际行情 ──────────────────────────────────────────────
@@ -341,14 +354,15 @@ def plot_review(result_df: pd.DataFrame, market: dict,
 
 # ── 主流程 ────────────────────────────────────────────────────────
 
-def run_review(force: bool = False) -> None:
-    check_review_time(force)
+def run_review(force: bool = False, eval_date: date = None) -> None:
+    check_review_time(force, eval_date)
 
-    if not os.path.exists(STRATEGY_TXT):
-        sys.exit(f"找不到策略文件: {STRATEGY_TXT}，请先运行盘前报告。")
+    if not os.path.exists(STRATEGY_MD):
+        sys.exit(f"找不到策略文件: {STRATEGY_MD}，请先运行盘前报告。")
 
-    strategy_date, top5, is_empty = parse_strategy(STRATEGY_TXT)
+    strategy_date, exec_date, top5, is_empty = parse_strategy(STRATEGY_MD)
     print(f"盘前决策日期: {strategy_date}")
+    print(f"决策应用日期: {exec_date}")
 
     if is_empty:
         print("今日盘前建议空仓，无需评估。")
@@ -360,20 +374,20 @@ def run_review(force: bool = False) -> None:
 
     print(f"共解析到 {len(top5)} 只推荐股票: {[s['代码'] for s in top5]}")
 
-    # 今日 = 策略执行日（strategy_date + 1个交易日），
-    # 但数据只到盘前日，用 strategy_date 当天数据做"执行当日"评估
-    # 实际执行日为下一交易日，今日（当前日期）的数据才是真实执行日
-    today = datetime.now().date()
+    # 评估日 = 策略中的决策应用日期（执行日），而非当前系统日期
+    # --date 参数仅在显式指定时覆盖（用于历史回测场景）
+    today = eval_date if eval_date is not None else exec_date
     print(f"评估日期（执行日）: {today}")
 
     try:
         today_df = load_today_data(today)
     except (FileNotFoundError, ValueError) as e:
-        # 尝试用策略基准日的数据（当数据尚未更新至今日时）
-        print(f"警告: {e}")
-        print(f"尝试读取盘前基准日 {strategy_date} 的数据作为参考...")
-        today_df = load_today_data(strategy_date)
-        today = strategy_date
+        sys.exit(
+            f"无法读取执行日 {today} 的行情数据: {e}\n"
+            f"评估需要执行日（决策应用日期）的实际行情数据，请确认:\n"
+            f"  1. 执行日 {today} 已收盘\n"
+            f"  2. 已运行数据更新（py00_fetch_stock_data.py --update）"
+        )
 
     result_df = merge_decision_with_actual(top5, today_df)
     market = calc_market_stats(today_df)
@@ -399,4 +413,8 @@ def run_review(force: bool = False) -> None:
 
 if __name__ == '__main__':
     force = '--force' in sys.argv
-    run_review(force)
+    _eval_date = None
+    if '--date' in sys.argv:
+        _idx = sys.argv.index('--date')
+        _eval_date = datetime.strptime(sys.argv[_idx + 1], '%Y-%m-%d').date()
+    run_review(force, eval_date=_eval_date)

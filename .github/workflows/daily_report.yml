@@ -2,9 +2,8 @@ name: Daily Stock Strategy Report
 
 on:
   schedule:
-    # 每个交易日北京时间 8:00 (UTC 00:00) 运行
-    # baostock 数据T+1延迟，8点已可获取前一交易日数据
-    - cron: '0 0 * * 1-5'  # UTC 每个工作日 00:00 = 北京时间 每个工作日 8:00
+    # 每个交易日北京时间 7:30 (UTC 23:30 前一天) 运行
+    - cron: '30 23 * * 0-4'  # UTC Sun-Thu 23:30 = 北京时间 Mon-Fri 7:30
   workflow_dispatch:  # 支持手动触发
 
 env:
@@ -104,6 +103,33 @@ jobs:
           git diff --cached --quiet || git commit -m "daily report: ${DATE}"
           git push
 
+      # 将 Markdown 策略报告转为 HTML（供邮件发送）
+      - name: Convert strategy report to HTML
+        if: steps.check-trading-day.outputs.is_trading_day == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          pip install markdown
+          python - <<'PYEOF'
+          import markdown, pathlib
+          md_text = pathlib.Path("output/today_strategy.md").read_text(encoding="utf-8")
+          html_body = markdown.markdown(md_text, extensions=["tables", "sane_lists"])
+          full_html = f"""<!DOCTYPE html>
+          <html><head><meta charset="utf-8"><style>
+          body {{ font-family: -apple-system, "Segoe UI", Arial, "PingFang SC", "Microsoft YaHei", sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; color: #333; line-height: 1.6; }}
+          h1 {{ color: #c0392b; border-bottom: 2px solid #c0392b; padding-bottom: 8px; }}
+          h2 {{ color: #2c3e50; margin-top: 24px; }}
+          table {{ border-collapse: collapse; width: 100%; margin: 16px 0; }}
+          th, td {{ border: 1px solid #ddd; padding: 8px 12px; text-align: left; }}
+          th {{ background: #f5f5f5; font-weight: 600; }}
+          tr:nth-child(even) {{ background: #fafafa; }}
+          blockquote {{ border-left: 4px solid #e74c3c; margin: 16px 0; padding: 8px 16px; background: #fdf2f2; }}
+          hr {{ border: none; border-top: 1px solid #eee; margin: 24px 0; }}
+          em {{ color: #888; }}
+          strong {{ color: #222; }}
+          </style></head><body>{html_body}</body></html>"""
+          pathlib.Path("output/today_strategy.html").write_text(full_html, encoding="utf-8")
+          print("✓ HTML email generated: output/today_strategy.html")
+          PYEOF
+
       # 邮件推送报告
       - name: Send email notification
         if: (steps.check-trading-day.outputs.is_trading_day == 'true' || github.event_name == 'workflow_dispatch') && env.EMAIL_RECIPIENT != ''
@@ -118,12 +144,4 @@ jobs:
           subject: '股票策略日报 - ${{ github.run_id }}'
           to: ${{ secrets.EMAIL_RECIPIENT }}
           from: ${{ secrets.EMAIL_USERNAME }}
-          body: |
-            A股量化交易策略日报
-            ======================
-
-            执行时间: $(date '+%Y-%m-%d %H:%M:%S')
-
-            策略报告详情:
-            ${{ env.REPORT_CONTENT }}
-          html_body: file://output/today_strategy.md
+          html_body: file://output/today_strategy.html
