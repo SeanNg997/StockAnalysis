@@ -23,7 +23,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 START_DATE = (datetime.now() - timedelta(days=365 * 10)).strftime("%Y-%m-%d")
 END_DATE = datetime.now().strftime("%Y-%m-%d")
 
-SAVE_EVERY = 200  # 每下载50只股票保存一次
+SAVE_EVERY = 200  # 每下载200只股票保存一次
 
 # 测试用的10只股票
 TEST_STOCKS = [
