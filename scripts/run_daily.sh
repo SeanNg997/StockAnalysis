@@ -12,6 +12,9 @@
 #
 set -e
 
+# 设置时区为北京时间（与 GitHub 工作流保持一致）
+export TZ=Asia/Shanghai
+
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SRC_DIR="$PROJECT_DIR/src"
 
@@ -32,8 +35,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-TODAY=$(date +%Y-%m-%d)
-DISPLAY_DATE="${DATE_ARG:-$TODAY}"
+# 如果未指定日期，使用当前日期（与 GitHub 工作流保持一致）
+if [ -z "$DATE_ARG" ]; then
+    DATE_ARG=$(date +%Y-%m-%d)
+fi
+DISPLAY_DATE="$DATE_ARG"
 
 echo "=============================================="
 echo "  A股量化策略 — 每日预测 $DISPLAY_DATE"
@@ -45,13 +51,9 @@ if [ -n "$STOCK_CODE" ]; then
 fi
 echo "=============================================="
 
-# 构建 --date 参数（若指定）
-DATE_FLAG=""
-[ -n "$DATE_ARG" ] && DATE_FLAG="--date $DATE_ARG"
-
-# Step 1: 增量更新数据（历史模式跳过，数据已存在）
+# Step 1: 增量更新数据（仅最新日期执行）
 echo ""
-if [ -n "$DATE_ARG" ]; then
+if [ "$DATE_ARG" != "$(date +%Y-%m-%d)" ]; then
     echo "[Step 1/4] 历史模式：跳过数据更新，使用现有 CSV 数据"
 else
     echo "[Step 1/4] 增量更新数据..."
@@ -61,25 +63,25 @@ fi
 # Step 2: 数据清洗（截断到指定日期）
 echo ""
 echo "[Step 2/4] 数据清洗..."
-python "$SRC_DIR/py01_data_loader.py" $DATE_FLAG
+python "$SRC_DIR/py01_data_loader.py" --date "$DATE_ARG"
 
 # Step 3: 特征工程（截断到指定日期）
 echo ""
 echo "[Step 3/4] 特征工程..."
-python "$SRC_DIR/py02_features.py" $DATE_FLAG
+python "$SRC_DIR/py02_features.py" --date "$DATE_ARG"
 
 # Step 4: 单日快速预测（只预测指定日期，不做 walk-forward）
 echo ""
 echo "[Step 4/4] 单日快速预测..."
-python "$SRC_DIR/py03_model.py" $DATE_FLAG
+python "$SRC_DIR/py03_model.py" --date "$DATE_ARG"
 
 # Step 5: 生成策略报告
 echo ""
 echo "[Step 5] 生成策略报告..."
 if [ -n "$STOCK_CODE" ]; then
-    python "$SRC_DIR/py05_today.py" $DATE_FLAG "$STOCK_CODE"
+    python "$SRC_DIR/py05_today.py" --date "$DATE_ARG" "$STOCK_CODE"
 else
-    python "$SRC_DIR/py05_today.py" $DATE_FLAG
+    python "$SRC_DIR/py05_today.py" --date "$DATE_ARG"
     python "$SRC_DIR/py06_report.py"
 fi
 

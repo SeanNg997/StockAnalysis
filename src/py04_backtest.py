@@ -29,8 +29,6 @@ STAMP_TAX = 0.0005           # 印花税 0.05%（卖出时收取）
 MAX_POSITIONS = 5            # 最大持仓数
 MIN_PRED_RETURN = 0.001      # 最低预测收益率阈值（0.1%）
 INITIAL_CAPITAL = 1_000_000  # 初始资金100万
-LIMIT_UP_PCT = 0.098         # 涨停判定阈值（接近10%）
-LIMIT_DOWN_PCT = -0.098      # 跌停判定阈值
 
 
 def load_data():
@@ -54,20 +52,53 @@ def load_data():
     return merged
 
 
+def get_limit_price(prev_close: float, code: str) -> tuple:
+    """
+    根据股票类型计算涨停价和跌停价（精确到分，四舍五入到小数点后2位）
+
+    涨跌停规则：
+    - 沪深主板（sh.60xxx / sz.00xxx）普通股：±10%
+    - ST / *ST 股：±5%（本项目已剔除ST，保留作备用）
+    - 科创板（sh.688xxx）：±20%
+    - 创业板（sz.300xxx）：±20%
+    - 北交所（bj.8xxxxx / bj.4xxxxx）：±30%
+
+    本项目数据仅含主板（sh.60 / sz.00），因此均为 ±10%。
+    此处保留完整分支以应对将来宇宙扩展。
+    """
+    code_lower = code.lower()
+    if code_lower.startswith('sh.688') or code_lower.startswith('sz.300'):
+        pct = 0.20
+    elif code_lower.startswith('bj.'):
+        pct = 0.30
+    else:
+        pct = 0.10  # 主板（sh.60 / sz.00）及默认
+
+    limit_up = round(prev_close * (1 + pct), 2)
+    limit_down = round(prev_close * (1 - pct), 2)
+    return limit_up, limit_down
+
+
 def check_limit(row_today, row_prev):
     """
-    检查是否涨跌停
-    涨停：当日open >= 前日close * 1.098
-    跌停：当日open <= 前日close * 0.902
+    检查当日开盘价是否触及涨停或跌停。
+
+    判定方式：计算前收盘价对应的涨/跌停价（四舍五入到分），
+    若开盘价 >= 涨停价则视为涨停无法买入；
+    若开盘价 <= 跌停价则视为跌停无法卖出。
+    允许 0.001 元的浮点误差。
     """
     if row_prev is None:
         return False, False
 
     prev_close = row_prev['close']
     today_open = row_today['open']
+    code = row_today['代码']
 
-    is_limit_up = today_open >= prev_close * (1 + LIMIT_UP_PCT)
-    is_limit_down = today_open <= prev_close * (1 - abs(LIMIT_DOWN_PCT))
+    limit_up_price, limit_down_price = get_limit_price(prev_close, code)
+
+    is_limit_up = today_open >= limit_up_price - 0.001
+    is_limit_down = today_open <= limit_down_price + 0.001
 
     return is_limit_up, is_limit_down
 
@@ -200,6 +231,11 @@ def run_backtest(merged: pd.DataFrame) -> dict:
             sell_cost = sell_amount * (SELL_COMMISSION + STAMP_TAX)
             cash += sell_amount - sell_cost
 
+            # 计算买入成本和收益
+            buy_cost_total = pos['shares'] * pos['buy_price'] * (1 + BUY_COMMISSION)
+            profit = sell_amount - sell_cost - buy_cost_total
+            profit_pct = (profit / buy_cost_total * 100) if buy_cost_total > 0 else 0
+
             trade_log.append({
                 'date': current_date,
                 '代码': code,
@@ -209,7 +245,8 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                 'shares': pos['shares'],
                 'amount': sell_amount,
                 'cost': sell_cost,
-                'profit': sell_amount - sell_cost - pos['shares'] * pos['buy_price'] * (1 + BUY_COMMISSION),
+                'profit': profit,
+                'profit_pct': profit_pct,
             })
 
             del positions[code]
@@ -266,6 +303,7 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                         'amount': buy_amount,
                         'cost': buy_cost,
                         'profit': 0,
+                        'profit_pct': np.nan,
                     })
 
         # ===== 步骤5：记录当日资产 =====
