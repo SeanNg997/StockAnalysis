@@ -100,7 +100,8 @@ def save_to_csv(df: pd.DataFrame):
 def save_incremental_months(new_df: pd.DataFrame):
     """
     增量更新专用：仅重写 new_df 中涉及的月度文件。
-    对每个月：先剔除该月文件中相同股票的旧行，再追加新行。
+    对每个月：先剔除该月文件中与新数据重复的行（按代码+日期去重），再追加新行。
+    保留该月文件中已有的其他日期数据，避免丢失。
     """
     if new_df.empty:
         return
@@ -111,8 +112,11 @@ def save_incremental_months(new_df: pd.DataFrame):
         monthly_file = get_monthly_file(month)
         if os.path.exists(monthly_file):
             existing_month = pd.read_csv(monthly_file, encoding="utf-8-sig")
-            codes_in_update = group["代码"].unique()
-            existing_month = existing_month[~existing_month["代码"].isin(codes_in_update)]
+            # 仅删除与新数据代码+日期完全重复的行，保留同股票其他日期的旧数据
+            new_keys = group[["代码", "date"]].drop_duplicates()
+            new_keys["_dup"] = True
+            existing_month = existing_month.merge(new_keys, on=["代码", "date"], how="left")
+            existing_month = existing_month[existing_month["_dup"] != True].drop(columns=["_dup"])
             combined = pd.concat([existing_month, group], ignore_index=True)
             combined = combined.sort_values(["代码", "date"]).reset_index(drop=True)
             combined.to_csv(monthly_file, index=False, encoding="utf-8-sig")
@@ -234,22 +238,20 @@ def main(limit: int = 0, update: bool = False):
             # 预先计算每只股票的最后日期
             print("正在分析已有数据...")
             last_date_map = {}
-            actual_latest_date = None  # 从实际数据中获取最新的交易日期
             if not existing_df.empty:
                 last_date_map = existing_df.groupby("代码")["date"].max().to_dict()
-                # 获取所有数据中的最新日期，作为"理想的最新日期"
-                actual_latest_date = existing_df["date"].max()
             existing_df = None  # 释放内存，增量模式不再需要全量数据
 
             # 增量模式：处理所有已有数据但最后日期不是最新的股票
             # 注意：不依赖 completed 集合，直接检查 last_date_map，避免遗漏不完整的股票
+            # 与 END_DATE 前2天比较（留出非交易日余量），确保跨月时也能触发更新
+            threshold_date = (pd.to_datetime(END_DATE) - timedelta(days=2)).strftime("%Y-%m-%d")
             codes_to_update = []
             for code, name in stock_list:
                 last_date = last_date_map.get(code)
                 if last_date is None:
                     continue  # 该股票在CSV中无数据，跳过（增量模式只更新已有数据的股票）
-                # 用实际的最新日期来判断，而不是用 END_DATE（今天可能是非交易日）
-                if actual_latest_date and last_date < actual_latest_date:
+                if last_date < threshold_date:
                     codes_to_update.append((code, name, last_date))
 
             if not codes_to_update:
