@@ -16,6 +16,7 @@ py02_features.py — 特征工程模块
 import pandas as pd
 import numpy as np
 import os
+import gc
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -215,13 +216,12 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # 分组计算（使用高效的apply）
     print("  计算个股技术指标...")
-    grouped = df.groupby('代码', group_keys=False)
 
     # 分批处理避免内存问题
     stocks = df['代码'].unique()
     n_stocks = len(stocks)
-    batch_size = 200
-    feat_list = []
+    batch_size = 100
+    feat_cols_initialized = False
 
     for i in range(0, n_stocks, batch_size):
         batch_stocks = stocks[i:i+batch_size]
@@ -229,11 +229,19 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
         batch_feats = batch_df.groupby('代码', group_keys=False).apply(
             compute_features_for_stock
         )
-        feat_list.append(batch_feats)
-        print(f"  进度: {min(i+batch_size, n_stocks)}/{n_stocks} 只股票")
 
-    feat_all = pd.concat(feat_list)
-    df = pd.concat([df, feat_all], axis=1)
+        # 首批时初始化特征列
+        if not feat_cols_initialized:
+            for col in batch_feats.columns:
+                df[col] = np.nan
+            feat_cols_initialized = True
+
+        # 直接写入原 DataFrame，避免 concat 双倍内存
+        df.loc[batch_feats.index, batch_feats.columns] = batch_feats
+
+        del batch_df, batch_feats
+        gc.collect()
+        print(f"  进度: {min(i+batch_size, n_stocks)}/{n_stocks} 只股票")
 
     # ===== 截面特征（市场环境） =====
     print("  计算截面特征...")
@@ -267,6 +275,13 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
     df['_rank'] = df.groupby('代码').cumcount()
     df = df[df['_rank'] >= 60].drop(columns=['_rank'])
     df = df.reset_index(drop=True)
+
+    # 特征列转 float32 节省内存
+    feat_cols = get_feature_columns(df)
+    for col in feat_cols:
+        if df[col].dtype == np.float64:
+            df[col] = df[col].astype(np.float32)
+    gc.collect()
 
     print(f"✅ 特征工程完成! {df.shape[0]:,} 行, {df.shape[1]} 列")
     return df

@@ -99,8 +99,8 @@ jobs:
           # 归档策略报告（按日期命名）
           DATE=$(date +%Y-%m-%d)
           mkdir -p output/history
-          cp output/today_strategy.txt "output/history/strategy_${DATE}.txt"
-          git add output/today_strategy.txt "output/history/strategy_${DATE}.txt"
+          cp output/today_strategy.md "output/history/strategy_${DATE}.md"
+          git add output/today_strategy.md "output/history/strategy_${DATE}.md"
           git diff --cached --quiet || git commit -m "daily report: ${DATE}"
           git push
 
@@ -126,4 +126,4 @@ jobs:
 
             策略报告详情:
             ${{ env.REPORT_CONTENT }}
-          html_body: file://output/today_strategy.txt
+          html_body: file://output/today_strategy.md
