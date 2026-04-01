@@ -79,13 +79,13 @@ jobs:
           fi
 
           echo "===== Step 2: Clean data ====="
-          python src/py01_data_loader.py
+          python src/py01_data_loader.py --date $(date +%Y-%m-%d)
 
           echo "===== Step 3: Feature engineering ====="
-          python src/py02_features.py
+          python src/py02_features.py --date $(date +%Y-%m-%d)
 
-          echo "===== Step 4: Full model training and prediction ====="
-          python src/py03_model.py
+          echo "===== Step 4: Single-day prediction ====="
+          python src/py03_model.py --date $(date +%Y-%m-%d)
 
           echo "===== Step 5: Generate strategy ====="
           python src/py05_today.py
