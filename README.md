@@ -53,7 +53,7 @@ scripts/
 
 ## GitHub Actions
 
-仓库已配置定时工作流，**每个交易日北京时间 7:30 自动运行**，完成数据更新 → 特征 → 预测 → 策略报告 → 邮件推送全流程。
+仓库已配置定时工作流，**每个交易日北京时间 8:30 自动运行**，完成数据更新 → 特征 → 预测 → 策略报告 → 邮件推送全流程。
 
 **邮件推送**需在 Settings → Secrets and variables → Actions 中配置：
 `EMAIL_SERVER` / `EMAIL_PORT` / `EMAIL_USERNAME` / `EMAIL_PASSWORD` / `EMAIL_RECIPIENT`

@@ -2,8 +2,8 @@ name: Daily Stock Strategy Report
 
 on:
   schedule:
-    # 每个交易日北京时间 7:30 (UTC 23:30 前一天) 运行
-    - cron: '30 23 * * 0-4'  # UTC Sun-Thu 23:30 = 北京时间 Mon-Fri 7:30
+    # 每个交易日北京时间 8:30 (UTC 00:30) 运行
+    - cron: '30 0 * * 1-5'  # UTC Mon-Fri 00:30 = 北京时间 Mon-Fri 8:30
   workflow_dispatch:  # 支持手动触发
 
 env:
@@ -117,7 +117,7 @@ jobs:
           print("✓ HTML email generated: output/today_strategy.html")
           PYEOF
 
-      # 邮件推送报告
+      # 邮件推送报告（支持多个收件人，用逗号分隔）
       - name: Send email notification
         if: (steps.check-trading-day.outputs.is_trading_day == 'true' || github.event_name == 'workflow_dispatch') && env.EMAIL_RECIPIENT != ''
         env:
