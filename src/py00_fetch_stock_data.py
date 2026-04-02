@@ -23,12 +23,54 @@ os.makedirs(DATA_DIR, exist_ok=True)
 START_DATE = "2019-12-01"
 
 def get_end_date():
-    """获取今天日期（考虑可能需要的市场时间）"""
+    """获取今天日期，用于 baostock API 的 end_date 参数"""
     return datetime.now().strftime("%Y-%m-%d")
 
 END_DATE = get_end_date()
 
 SAVE_EVERY = 200  # 每下载200只股票保存一次
+
+# baostock 一般在收盘后、约 17:00 前完成当日数据入库
+# 早于此时间认为当日数据尚未就绪，预期最新数据仍为上一交易日
+MARKET_DATA_READY_HOUR = 17
+
+
+def get_expected_latest_date() -> str:
+    """
+    根据当前时间和 baostock 交易日历，确定当前 baostock 中
+    预期已入库的最新交易日期。
+
+    规则：
+    - 当前时间 >= 17:00 且今天是交易日 → 预期最新 = 今天
+    - 当前时间 < 17:00，或今天是非交易日（周末/节假日） → 预期最新 = 上一个交易日
+
+    注意：调用前须已登录 baostock（bs.login()）。
+    """
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+
+    # 查近 45 个日历日的交易日历（覆盖节假日连休场景）
+    start_str = (now - timedelta(days=45)).strftime("%Y-%m-%d")
+    rs = bs.query_trade_dates(start_date=start_str, end_date=today_str)
+    trading_days = []
+    while rs.next():
+        row = rs.get_row_data()
+        if row[1] == "1":
+            trading_days.append(row[0])  # 'YYYY-MM-DD'
+
+    if not trading_days:
+        # 降级：若接口异常则回退到昨天
+        return (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    today_is_trading = trading_days[-1] == today_str
+
+    if today_is_trading and now.hour >= MARKET_DATA_READY_HOUR:
+        # 今天是交易日且已过数据就绪时间
+        return today_str
+    else:
+        # 盘前 / 非交易日：预期最新数据为今天之前最近一个交易日
+        prev_days = [d for d in trading_days if d < today_str]
+        return prev_days[-1] if prev_days else trading_days[-1]
 
 # 测试用的10只股票
 TEST_STOCKS = [
@@ -200,17 +242,18 @@ def fetch_daily_increment(symbol: str, name: str, from_date: str) -> pd.DataFram
 
 # ── 核心逻辑 ──────────────────────────────────────────────
 
-def is_complete(existing_df: pd.DataFrame, code: str) -> bool:
+def is_complete(existing_df: pd.DataFrame, code: str, expected_date: str) -> bool:
     """
-    判断某只股票在已有数据中是否完整。
-    逻辑：该股票的最后一天 >= END_DATE 的前一个交易日（允许1天偏差）
+    判断某只股票在已有数据中是否已包含 expected_date 的数据。
+
+    Args:
+        expected_date: 由 get_expected_latest_date() 确定的预期最新交易日（字符串）
     """
     stock_data = existing_df[existing_df["代码"] == code]
     if stock_data.empty:
         return False
-    last_date = pd.to_datetime(stock_data["date"].max())
-    expected_last = pd.to_datetime(END_DATE) - timedelta(days=1)
-    return last_date >= expected_last
+    last_date = stock_data["date"].max()
+    return last_date >= expected_date
 
 
 def main(limit: int = 0, update: bool = False):
@@ -220,6 +263,10 @@ def main(limit: int = 0, update: bool = False):
         return
 
     try:
+        # 登录后立即确定预期最新数据日期（考虑交易日历和当前时间）
+        expected_latest_date = get_expected_latest_date()
+        print(f"当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}, "
+              f"预期最新数据日期: {expected_latest_date}")
         # 获取股票列表
         if limit > 0 and limit <= len(TEST_STOCKS):
             stock_list = TEST_STOCKS[:limit]
@@ -247,20 +294,21 @@ def main(limit: int = 0, update: bool = False):
                 last_date_map = existing_df.groupby("代码")["date"].max().to_dict()
             existing_df = None  # 释放内存，增量模式不再需要全量数据
 
-            # 增量模式：检查数据是否包含最新交易日
-            # 策略：如果最后日期 < 今天（END_DATE），就更新
-            # 这样无论是否是交易日，都能正确判断
-            today_str = get_end_date()
+            # 增量模式：检查数据是否已包含最新交易日
+            # 用 expected_latest_date 判断，而非原始"今天"：
+            # - 盘前运行时 expected_latest_date = 上一交易日，数据已是最新 → 无需更新
+            # - 盘后运行时 expected_latest_date = 今天，有新数据 → 触发更新
+            # - 周末/节假日 expected_latest_date = 上一交易日，同盘前逻辑
             codes_to_update = []
             for code, name in stock_list:
                 last_date = last_date_map.get(code)
                 if last_date is None:
                     continue  # 该股票在CSV中无数据，跳过（增量模式只更新已有数据的股票）
-                if last_date < today_str:
+                if last_date < expected_latest_date:
                     codes_to_update.append((code, name, last_date))
 
             if not codes_to_update:
-                print("所有股票数据已是最新，无需更新")
+                print(f"所有股票数据已是最新（{expected_latest_date}），无需更新")
                 return
 
             print(f"需要更新 {len(codes_to_update)} 只股票")
@@ -306,7 +354,7 @@ def main(limit: int = 0, update: bool = False):
         skip_count = 0
         pending = []
         for code, name in stock_list:
-            if code in completed and not existing_df.empty and is_complete(existing_df, code):
+            if code in completed and not existing_df.empty and is_complete(existing_df, code, expected_latest_date):
                 skip_count += 1
             else:
                 pending.append((code, name))

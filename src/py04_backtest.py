@@ -30,9 +30,19 @@ PREDICT_PKL = os.path.join(BASE_DIR, 'data', 'predictions.pkl')
 OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
 
 # ============ 交易成本 ============
-BUY_COMMISSION = 0.000085    # 买入手续费 0.0085%
-SELL_COMMISSION = 0.000085   # 卖出手续费 0.0085%
+COMMISSION_RATE = 0.000085   # 手续费费率 0.0085%
+MIN_COMMISSION = 1.0         # 每笔最低佣金 1 元
 STAMP_TAX = 0.0005           # 印花税 0.05%（卖出时收取）
+
+
+def calc_buy_cost(amount: float) -> float:
+    """计算买入交易成本（佣金，有最低限额）"""
+    return max(amount * COMMISSION_RATE, MIN_COMMISSION)
+
+
+def calc_sell_cost(amount: float) -> float:
+    """计算卖出交易成本（佣金 + 印花税，佣金有最低限额）"""
+    return max(amount * COMMISSION_RATE, MIN_COMMISSION) + amount * STAMP_TAX
 
 # ============ 策略参数 ============
 MAX_POSITIONS = 5            # 最大持仓数
@@ -41,7 +51,7 @@ MIN_CONFIDENCE = 0.5         # 最低置信度阈值
 HOLD_DAYS = 5                # 目标持有天数
 STOP_LOSS = -0.05            # 止损线 -5%
 TAKE_PROFIT = 0.08           # 止盈线 +8%
-INITIAL_CAPITAL = 1_000_000  # 初始资金100万
+INITIAL_CAPITAL = 100_000  # 初始资金10万
 MAX_DAILY_BUY = 2            # 每天最多买入2只（分批建仓）
 
 
@@ -85,13 +95,12 @@ def compute_composite_score(pred_return, confidence):
     return pred_return * 0.6 + confidence * pred_return * 0.4
 
 
-def check_market_regime(merged, current_date, lookback=10):
+def check_market_regime(daily_mkt_ret: pd.Series, current_date, lookback=10):
     """
-    市场择时：检查近期市场环境
+    市场择时：检查近期市场环境（使用预计算的每日市场平均收益率）
     返回仓位系数 0.0~1.0
     """
-    recent = merged[merged['date'] <= current_date].groupby('date')['pctChg'].mean()
-    recent = recent.sort_index().tail(lookback)
+    recent = daily_mkt_ret[daily_mkt_ret.index <= current_date].tail(lookback)
 
     if len(recent) < 5:
         return 1.0
@@ -128,35 +137,44 @@ def run_backtest(merged: pd.DataFrame) -> dict:
     all_dates = sorted(merged['date'].unique())
     print(f"回测期间: {all_dates[0].date()} ~ {all_dates[-1].date()}, 共 {len(all_dates)} 个交易日")
 
-    # 构建 (date, 代码) -> row 的映射
+    # 构建 (date, 代码) -> row 的映射（向量化构建，替代 iterrows）
     print("构建数据索引...")
-    date_stock_map = {}
-    for _, row in merged.iterrows():
-        date_stock_map[(row['date'], row['代码'])] = row
+    indexed = merged.set_index(['date', '代码'])
+    date_stock_map = {idx: row for idx, row in indexed.iterrows()}
+
+    # 预分组：每日数据（避免循环内重复过滤）
+    date_grouped = {d: g for d, g in merged.groupby('date')}
 
     # 构建日期索引映射
     next_date_map = {}
     for i in range(len(all_dates) - 1):
         next_date_map[all_dates[i]] = all_dates[i+1]
 
-    date_to_idx = {d: i for i, d in enumerate(all_dates)}
+    # 预计算每日市场平均涨跌幅（用于市场择时，避免循环内全表扫描）
+    daily_mkt_ret = merged.groupby('date')['pctChg'].mean().sort_index()
 
     # ============ 回测状态 ============
     cash = INITIAL_CAPITAL
-    positions = {}  # {股票代码: {'shares', 'buy_price', 'buy_date', 'current_price', 'hold_days'}}
-    locked_stocks = set()  # 当日买入锁定（T+1）
+    positions = {}  # {股票代码: {'shares', 'buy_price', 'buy_cost', 'buy_date', 'current_price', 'hold_days'}}
 
-    # 记录
-    daily_records = []
+    # 记录（插入初始资本记录，确保首日收益率不丢失）
+    daily_records = [{
+        'date': all_dates[0],
+        'cash': INITIAL_CAPITAL,
+        'portfolio_value': INITIAL_CAPITAL,
+        'n_positions': 0,
+        'n_trades': 0,
+    }]
     trade_log = []
     position_log = []  # 每日持仓快照
+    n_trades_today = 0  # 当日交易计数
 
     for day_idx in range(len(all_dates)):
         decision_date = all_dates[day_idx]
         exec_date = next_date_map.get(decision_date)
 
-        # 获取决策日数据
-        decision_data = merged[merged['date'] == decision_date]
+        # 获取决策日数据（使用预分组）
+        decision_data = date_grouped.get(decision_date, pd.DataFrame())
 
         if exec_date is None:
             # 最后一个交易日：无后续执行，仅记录资产和持仓快照
@@ -195,18 +213,16 @@ def run_backtest(merged: pd.DataFrame) -> dict:
             })
             continue
 
-        exec_data = merged[merged['date'] == exec_date]
+        exec_data = date_grouped.get(exec_date, pd.DataFrame())
 
-        # ===== 步骤1：解锁昨日买入的股票，更新持有天数 =====
-        locked_stocks.clear()
+        # ===== 步骤1：更新持有天数 =====
         for code in positions:
             positions[code]['hold_days'] += 1
+        n_trades_today = 0
 
         # ===== 步骤2：卖出决策（T日，不受T日涨跌停影响） =====
         sell_list = []
         for code, pos in list(positions.items()):
-            if code in locked_stocks:
-                continue
 
             dec_pred = decision_data[decision_data['代码'] == code]
             if len(dec_pred) == 0:
@@ -291,12 +307,12 @@ def run_backtest(merged: pd.DataFrame) -> dict:
 
             # 正常卖出
             sell_amount = pos['shares'] * t1_open
-            sell_cost = sell_amount * (SELL_COMMISSION + STAMP_TAX)
+            sell_cost = calc_sell_cost(sell_amount)
             cash += sell_amount - sell_cost
 
-            buy_cost_total = pos['shares'] * pos['buy_price'] * (1 + BUY_COMMISSION)
+            buy_cost_total = pos['shares'] * pos['buy_price'] + pos['buy_cost']
             profit = sell_amount - sell_cost - buy_cost_total
-            profit_pct_val = (profit / buy_cost_total * 100) if buy_cost_total > 0 else 0
+            profit_pct_val = (profit / buy_cost_total) if buy_cost_total > 0 else 0
 
             trade_log.append({
                 'date': exec_date,
@@ -312,6 +328,7 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                 'reason': sell_reason,
                 'hold_days': pos['hold_days'],
             })
+            n_trades_today += 1
 
             actually_sold.add(code)
             del positions[code]
@@ -320,7 +337,7 @@ def run_backtest(merged: pd.DataFrame) -> dict:
         n_empty = MAX_POSITIONS - len(positions)
         if n_empty > 0:
             # 市场择时系数
-            mkt_factor = check_market_regime(merged, decision_date)
+            mkt_factor = check_market_regime(daily_mkt_ret, decision_date)
 
             # 根据市场状态调整最大仓位
             adjusted_max = max(1, int(MAX_POSITIONS * mkt_factor))
@@ -398,7 +415,7 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                                 continue
 
                             buy_amount = shares * t1_open
-                            buy_cost = buy_amount * BUY_COMMISSION
+                            buy_cost = calc_buy_cost(buy_amount)
 
                             if buy_amount + buy_cost > cash:
                                 continue
@@ -408,11 +425,11 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                             positions[code] = {
                                 'shares': shares,
                                 'buy_price': t1_open,
+                                'buy_cost': buy_cost,
                                 'buy_date': exec_date,
                                 'current_price': t1_open,
                                 'hold_days': 0,
                             }
-                            locked_stocks.add(code)
 
                             trade_log.append({
                                 'date': exec_date,
@@ -428,6 +445,7 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                                 'reason': 'SIGNAL',
                                 'hold_days': 0,
                             })
+                            n_trades_today += 1
 
         # ===== 步骤6：记录资产与持仓快照 =====
         # 买卖操作发生在 exec_date，所以应使用 exec_date 的 close 做估值
@@ -468,7 +486,7 @@ def run_backtest(merged: pd.DataFrame) -> dict:
             'cash': cash,
             'portfolio_value': total_value,
             'n_positions': len(positions),
-            'n_trades': sum(1 for t in trade_log if t['date'] == exec_date),
+            'n_trades': n_trades_today,
         })
 
         # 定期打印进度
@@ -497,20 +515,32 @@ def compute_metrics(daily_df: pd.DataFrame) -> dict:
 
     total_days = len(daily_df)
     total_return = daily_df.iloc[-1]['portfolio_value'] / INITIAL_CAPITAL - 1
-    annual_return = (1 + total_return) ** (252 / total_days) - 1
+    annual_return = (1 + total_return) ** (252 / max(total_days, 1)) - 1
 
     # 夏普比率（无风险利率2.5%）
     rf_daily = 0.025 / 252
-    excess_returns = daily_df['daily_return'].dropna() - rf_daily
+    daily_returns = daily_df['daily_return'].dropna()
+    excess_returns = daily_returns - rf_daily
     sharpe = excess_returns.mean() / (excess_returns.std() + 1e-10) * np.sqrt(252)
+
+    # Sortino比率（仅考虑下行风险）
+    downside_returns = excess_returns[excess_returns < 0]
+    downside_std = downside_returns.std() if len(downside_returns) > 0 else 1e-10
+    sortino = excess_returns.mean() / (downside_std + 1e-10) * np.sqrt(252)
 
     # 最大回撤
     cummax = daily_df['portfolio_value'].cummax()
     drawdown = (daily_df['portfolio_value'] - cummax) / cummax
     max_drawdown = drawdown.min()
 
+    # 最大回撤持续天数
+    in_drawdown = drawdown < 0
+    dd_groups = (~in_drawdown).cumsum()
+    dd_durations = in_drawdown.groupby(dd_groups).sum()
+    max_dd_duration = int(dd_durations.max()) if len(dd_durations) > 0 else 0
+
     # 年化波动率
-    annual_vol = daily_df['daily_return'].dropna().std() * np.sqrt(252)
+    annual_vol = daily_returns.std() * np.sqrt(252)
 
     # Calmar比率
     calmar = annual_return / abs(max_drawdown) if max_drawdown != 0 else 0
@@ -521,7 +551,9 @@ def compute_metrics(daily_df: pd.DataFrame) -> dict:
         '总回报率': f"{total_return:.2%}",
         '年化收益率': f"{annual_return:.2%}",
         '夏普比率': f"{sharpe:.3f}",
+        'Sortino比率': f"{sortino:.3f}",
         '最大回撤': f"{max_drawdown:.2%}",
+        '最大回撤持续天数': max_dd_duration,
         '年化波动率': f"{annual_vol:.2%}",
         'Calmar比率': f"{calmar:.3f}",
         '交易天数': total_days,

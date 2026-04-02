@@ -43,18 +43,18 @@ src/
 ├── py04_backtest.py           回测引擎（T+1、涨跌停、交易成本）
 ├── py05_today.py              今日交易决策（生成TOP5买入建议）
 ├── py06_report.py             可视化报告（净值、回撤、热力图）
-└── py08_review.py             盘后复盘（预测 vs 实际对比）
+└── py07_review.py             盘后复盘（预测 vs 实际对比）
 scripts/
 ├── run_daily.sh               日常快速预测
 ├── run_model.sh               完整重训练
 └── run_daily_review.sh        盘后复盘
 .github/workflows/
-└── daily_report.yml           每个交易日北京时间7:30自动运行 + 邮件推送
+└── daily_report.yml           每个交易日北京时间19:03盘后自动运行 + 邮件推送
 ```
 
 ## GitHub Actions
 
-仓库已配置定时工作流，**每个交易日北京时间 8:30 自动运行**，完成数据更新 → 特征 → 预测 → 策略报告 → 邮件推送全流程。
+仓库已配置定时工作流，**每个交易日北京时间 19:03（盘后）自动运行**，完成数据更新 → 特征 → 预测 → 策略报告 → 邮件推送全流程。
 
 **邮件推送**需在 Settings → Secrets and variables → Actions 中配置：
 `EMAIL_SERVER` / `EMAIL_PORT` / `EMAIL_USERNAME` / `EMAIL_PASSWORD` / `EMAIL_RECIPIENT`

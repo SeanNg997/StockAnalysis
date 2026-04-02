@@ -16,7 +16,7 @@
    - [py04 — 回测引擎](#py04--回测引擎)
    - [py05 — 今日决策](#py05--今日决策)
    - [py06 — 可视化报告](#py06--可视化报告)
-   - [py08 — 盘后复盘](#py08--盘后复盘)
+   - [py07 — 盘后复盘](#py07--盘后复盘)
 4. [Shell 脚本](#4-shell-脚本)
 5. [GitHub Actions 自动化](#5-github-actions-自动化)
 6. [特征工程详解](#6-特征工程详解)
@@ -41,7 +41,7 @@ StockAnalysis/
 │   ├── py04_backtest.py                    #   回测引擎
 │   ├── py05_today.py                       #   今日交易决策
 │   ├── py06_report.py                      #   可视化报告
-│   └── py08_review.py                      #   盘后复盘评估
+│   └── py07_review.py                      #   盘后复盘评估
 ├── scripts/
 │   ├── run_daily.sh                        #   日常快速预测脚本
 │   ├── run_daily_review.sh                 #   盘后复盘脚本
@@ -118,7 +118,7 @@ StockAnalysis/
 │  py06_report.py                                                     │
 │    └─ 生成可视化图表（净值、回撤、持仓、热力图、特征重要性）            │
 │                          ↓（收盘后）                                 │
-│  py08_review.py                                                     │
+│  py07_review.py                                                     │
 │    └─ 对比预测收益 vs 实际收益，生成盘后复盘图                        │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -358,9 +358,9 @@ python src/py06_report.py
 
 ---
 
-### py08 — 盘后复盘
+### py07 — 盘后复盘
 
-**文件**：`src/py08_review.py`
+**文件**：`src/py07_review.py`
 
 **功能**：
 
@@ -376,13 +376,13 @@ python src/py06_report.py
 
 ```bash
 # 正常模式（需要16:00后运行）
-python src/py08_review.py
+python src/py07_review.py
 
 # 强制模式（调试用，跳过时间检查）
-python src/py08_review.py --force
+python src/py07_review.py --force
 
 # 历史日期复盘
-python src/py08_review.py --date 2025-03-14
+python src/py07_review.py --date 2025-03-14
 ```
 
 **输出**：`output/today_review_YYYYMMDD.png`

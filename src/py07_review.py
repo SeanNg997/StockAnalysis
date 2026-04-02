@@ -2,26 +2,28 @@
 py08_review.py — 盘后决策评估模块
 ====================================
 职责：
-1. 基于T-1日预测结果生成T日决策（买入推荐TOP5 + 潜力TOP20）
-2. 读取T日实际行情（需先运行 py00 --update 更新数据）
-3. 评估T日买入推荐和TOP20的预测准确度
-4. 生成评估报告（Markdown）
+1. 基于决策日(T)的预测结果，评估执行日(T+1)的实际表现
+2. 读取执行日行情（需先运行 py00 --update 更新数据）
+3. 评估买入推荐TOP5和潜力TOP20的预测准确度
+4. 生成评估报告（Markdown）+ 可视化图表
 
-日期定义：
-  T-1日 = 决策基准日（预测数据来源日）
-  T日   = 评估日（以T日开盘买入，用T日收盘评估首日表现）
-  注意：T+1日策略报告由 py05_today.py 生成（today_strategy.md），
-        本模块输出独立文件（today_review_*.md），不会覆盖。
+日期定义（与 py05_today.py 一致）：
+  T日   = 决策日（predictions.pkl 中的日期，盘后生成策略报告）
+  T+1日 = 执行日/评估日（以T+1日开盘集合竞价买入，用T+1日收盘评估首日表现）
+
+  这与 py05_today.py 的逻辑一致：
+    py05 读取 predictions.pkl 最新日期 T → 推荐在 T+1 买入
+    py08 评估 T+1 的表现：T+1 开盘买入 → T+1 收盘评估首日浮盈
 
 评估口径：
-  买入价 = T日开盘价
-  首日浮盈 = (T日收盘 - T日开盘) / T日开盘
+  买入价 = T+1日开盘价
+  首日浮盈 = (T+1日收盘 - T+1日开盘) / T+1日开盘
   完整收益 = 持有5天后开盘卖出（此处仅评估首日）
 
 用法：
-  python src/py08_review.py                        # 评估今日(T日)
+  python src/py08_review.py                        # 自动检测
   python src/py08_review.py --force                # 跳过时间检查
-  python src/py08_review.py --date 2025-03-15      # 评估指定历史日期
+  python src/py08_review.py --date 2025-03-15      # 指定执行日(T+1日)
 """
 
 import os
@@ -57,16 +59,16 @@ def is_trading_day(check_date: date) -> bool:
     return check_date.weekday() < 5
 
 
-def check_review_time(force: bool = False, eval_date: date = None) -> None:
+def check_review_time(force: bool = False, exec_date_arg: date = None) -> None:
     """检查当前时间是否满足评估条件。
 
     允许条件：
     1. 指定 --force 标志
-    2. 指定历史日期（eval_date < 今日）
+    2. 指定历史日期（exec_date_arg < 今日）
     3. 当前时间在第二个交易日开盘前都可以（即从今天 15:00 到明天 09:30 前都行，
        只要没有跨越到后一个交易日的 09:30 之后）
     """
-    if force or (eval_date is not None and eval_date < datetime.now().date()):
+    if force or (exec_date_arg is not None and exec_date_arg < datetime.now().date()):
         return
 
     now = datetime.now()
@@ -130,63 +132,78 @@ def load_today_data(target_date: date) -> pd.DataFrame:
     return today_df
 
 
-def determine_eval_date(pred_df: pd.DataFrame, eval_date: date = None):
+def determine_eval_date(pred_df: pd.DataFrame, exec_date_arg: date = None):
     """
-    确定评估日(T日)和决策基准日(T-1日)。
+    确定决策日(T)和执行日(T+1)。
+
+    逻辑：
+    - 决策日 T = predictions.pkl 中的日期（盘后选股）
+    - 执行日 T+1 = T 的下一个交易日（开盘买入、收盘评估）
+
+    参数：
+    - exec_date_arg: 用户通过 --date 指定的执行日。
+      - 若指定：找 predictions.pkl 中 < exec_date_arg 的最新日期作为决策日 T
+      - 若不指定：T = predictions.pkl 最新日期，从CSV中找 T 之后最近的交易日作为执行日
 
     Returns:
-        pred_date: T-1日（预测基准日）
-        eval_date: T日（评估日）
+        decision_date: T日（决策日，predictions.pkl 的日期）
+        exec_date: T+1日（执行日/评估日）
     """
-    if eval_date is not None:
-        # 指定评估日：找 predictions.pkl 中 < eval_date 的最新预测日
-        ts = pd.Timestamp(eval_date)
-        candidates = pred_df[pred_df['date'] < ts]['date']
-        if candidates.empty:
-            sys.exit(f"predictions.pkl 中没有 {eval_date} 之前的预测数据。"
-                     f"请确认已运行过 py03 且预测日期正确。")
-        pred_date = candidates.max()
-        return pred_date, eval_date
+    all_pred_dates = sorted(pred_df['date'].unique())
 
-    # 自动检测：预测日 = predictions.pkl 中最新日期（T-1），T日 = 下一个交易日
-    pred_date = pred_df['date'].max()
+    if exec_date_arg is not None:
+        # 用户指定执行日 → 反推决策日
+        ts = pd.Timestamp(exec_date_arg)
+        candidates = [d for d in all_pred_dates if d < ts]
+        if not candidates:
+            sys.exit(f"predictions.pkl 中没有 {exec_date_arg} 之前的预测数据。\n"
+                     f"可用日期范围: {all_pred_dates[0].date()} ~ {all_pred_dates[-1].date()}")
+        decision_date = candidates[-1]
+        return decision_date, exec_date_arg
 
-    # 从CSV中查找pred_date之后的最早日期作为T日
+    # 自动模式：决策日 = 最新预测日
+    decision_date = all_pred_dates[-1]
+
+    # 从CSV中查找决策日之后最近的交易日作为执行日
     csv_files = sorted(_glob.glob(os.path.join(DATA_DIR, 'Stock_dailyK_*.csv')))
     if csv_files:
-        # 从最后几个月度文件中查找
         for f in reversed(csv_files[-3:]):
             tmp = pd.read_csv(f, encoding='utf-8-sig', usecols=['date'])
             tmp['date'] = pd.to_datetime(tmp['date'])
-            future_dates = tmp[tmp['date'] > pred_date]['date'].unique()
+            future_dates = tmp[tmp['date'] > decision_date]['date'].unique()
             if len(future_dates) > 0:
-                eval_dt = pd.Timestamp(min(future_dates)).date()
-                return pred_date, eval_dt
+                exec_dt = pd.Timestamp(min(future_dates)).date()
+                return decision_date, exec_dt
 
-    # Fallback：pred_date后第一个工作日
-    next_d = pred_date.date() if hasattr(pred_date, 'date') else pred_date
+    # Fallback：决策日后第一个工作日
+    next_d = decision_date.date() if hasattr(decision_date, 'date') else decision_date
     next_d = next_d + timedelta(days=1)
     while next_d.weekday() >= 5:
         next_d += timedelta(days=1)
-    return pred_date, next_d
+    return decision_date, next_d
 
 
 # ── 决策生成 ─────────────────────────────────────────────────────
 
-def generate_decisions(pred_df: pd.DataFrame, pred_date, price_df: pd.DataFrame):
+def generate_decisions(pred_df: pd.DataFrame, decision_date, price_df: pd.DataFrame):
     """
-    基于T-1日预测生成T日决策。
+    基于决策日(T)的预测生成买入推荐。
+
+    Args:
+        pred_df: 完整预测数据
+        decision_date: 决策日(T)
+        price_df: 决策日的价格信息
 
     Returns:
         top5: 买入推荐TOP5 DataFrame
         top20: 潜力排名TOP20 DataFrame
         all_pred: 所有预测（合并了价格信息）
     """
-    latest_pred = pred_df[pred_df['date'] == pred_date].copy()
+    latest_pred = pred_df[pred_df['date'] == decision_date].copy()
     if latest_pred.empty:
-        sys.exit(f"predictions.pkl 中无 {pred_date} 的预测数据")
+        sys.exit(f"predictions.pkl 中无 {decision_date} 的预测数据")
 
-    # 合并T-1日价格信息（收盘价用于展示）
+    # 合并决策日价格信息（收盘价用于展示）
     if not price_df.empty:
         latest_pred = latest_pred.merge(
             price_df[['代码', '名称', 'close']].rename(columns={'close': 'prev_close'}),
@@ -218,21 +235,21 @@ def generate_decisions(pred_df: pd.DataFrame, pred_date, price_df: pd.DataFrame)
 
 # ── 评估计算 ─────────────────────────────────────────────────────
 
-def evaluate_stocks(decision_df: pd.DataFrame, today_df: pd.DataFrame) -> pd.DataFrame:
+def evaluate_stocks(decision_df: pd.DataFrame, exec_day_df: pd.DataFrame) -> pd.DataFrame:
     """
-    将决策与T日实际行情合并，计算评估指标。
+    将决策与执行日(T+1)实际行情合并，计算评估指标。
 
     对每只推荐股票：
-    - actual_open: T日开盘价（买入价）
-    - actual_close: T日收盘价
+    - actual_open: T+1日开盘价（买入价）
+    - actual_close: T+1日收盘价
     - intraday_return: (close - open) / open（开盘→收盘收益）
-    - actual_pctChg: T日涨跌幅
+    - actual_pctChg: T+1日涨跌幅
     - status: 正常/涨停/跌停/停牌
     """
     rows = []
     for _, item in decision_df.iterrows():
         code = item['代码']
-        actual = today_df[today_df['代码'] == code]
+        actual = exec_day_df[exec_day_df['代码'] == code]
         row = item.to_dict()
 
         if actual.empty:
@@ -302,27 +319,27 @@ def _pct_fmt(v, nan_str="N/A") -> str:
 
 
 def generate_markdown_report(
-    pred_date, eval_date,
+    decision_date, exec_date,
     top5_eval: pd.DataFrame, top20_eval: pd.DataFrame,
     market: dict,
 ) -> str:
     """生成评估 Markdown 报告"""
     lines = []
-    pred_date_str = pred_date.date() if hasattr(pred_date, 'date') else pred_date
-    eval_date_str = eval_date
+    decision_date_str = decision_date.date() if hasattr(decision_date, 'date') else decision_date
+    exec_date_str = exec_date
 
-    lines.append(f"# 盘后决策评估 — {eval_date_str}\n")
-    lines.append(f"> **决策基准日(T-1)**: {pred_date_str} | **评估日(T)**: {eval_date_str}\n")
+    lines.append(f"# 盘后决策评估 — {exec_date_str}\n")
+    lines.append(f"> **决策日(T)**: {decision_date_str} | **执行日(T+1)**: {exec_date_str}\n")
     lines.append("---\n")
 
     # ── 一、买入推荐 TOP5 ──
-    lines.append("## 一、T日买入推荐 (TOP 5)\n")
+    lines.append("## 一、买入推荐 (TOP 5)\n")
     lines.append(f"> 筛选条件: 预测收益率 > {MIN_PRED_RETURN:.1%}, 置信度 > {MIN_CONFIDENCE:.0%}\n")
 
     if len(top5_eval) == 0:
         lines.append("> **无股票满足买入条件**\n")
     else:
-        lines.append("| # | 代码 | 名称 | 预测收益率 | 置信度 | T日开盘 | T日收盘 | 开→收 | 状态 |")
+        lines.append("| # | 代码 | 名称 | 预测收益率 | 置信度 | T+1开盘 | T+1收盘 | 开→收 | 状态 |")
         lines.append("|:-:|------|------|----------:|-------:|--------:|--------:|------:|:----:|")
         for i, (_, r) in enumerate(top5_eval.iterrows()):
             name = r.get('名称', 'N/A')
@@ -351,7 +368,7 @@ def generate_markdown_report(
     # ── 二、潜力 TOP20 评估 ──
     lines.append("## 二、潜力排名 TOP 20 评估\n")
     lines.append("> 全市场按预测收益率排名，不限制阈值\n")
-    lines.append("| # | 代码 | 名称 | 预测收益率 | T日开盘 | T日收盘 | 开→收 | 命中 |")
+    lines.append("| # | 代码 | 名称 | 预测收益率 | T+1开盘 | T+1收盘 | 开→收 | 命中 |")
     lines.append("|:-:|------|------|----------:|--------:|--------:|------:|:----:|")
 
     hit_count = 0
@@ -403,7 +420,7 @@ def generate_markdown_report(
     lines.append("---\n")
 
     # ── 三、市场概况 ──
-    lines.append("## 三、T日市场概况\n")
+    lines.append("## 三、T+1日市场概况\n")
     lines.append("| 指标 | 数值 |")
     lines.append("|------|-----:|")
     lines.append(f"| 全市场股票数 | {market['total']:,} |")
@@ -414,7 +431,7 @@ def generate_markdown_report(
     lines.append(f"| 市场中位数 | {_pct_fmt(market['median_pct'])} |")
 
     lines.append("\n---\n")
-    lines.append("*仅评估首日（T日开→收）表现，完整收益需持有5天后确认。*")
+    lines.append("*仅评估首日（T+1日开→收）表现，完整收益需持有5天后确认。*")
 
     return "\n".join(lines)
 
@@ -428,9 +445,9 @@ def _color(v: float, nan_color: str = '#888888') -> str:
 
 
 def plot_review(top5_eval: pd.DataFrame, top20_eval: pd.DataFrame,
-                market: dict, pred_date, eval_date, out_path: str) -> None:
+                market: dict, decision_date, exec_date, out_path: str) -> None:
     """生成盘后评估图"""
-    pred_date_str = pred_date.date() if hasattr(pred_date, 'date') else pred_date
+    decision_date_str = decision_date.date() if hasattr(decision_date, 'date') else decision_date
 
     fig = plt.figure(figsize=(16, 12), facecolor='#1C1C1E')
     fig.patch.set_facecolor('#1C1C1E')
@@ -461,9 +478,9 @@ def plot_review(top5_eval: pd.DataFrame, top20_eval: pd.DataFrame,
         pred_vals = top5_eval['pred_return'].values
         intraday_vals = top5_eval['intraday_return'].fillna(0).values
 
-        ax1.bar(x - w/2, pred_vals, w, label='T-1预测收益率',
+        ax1.bar(x - w/2, pred_vals, w, label='T日预测收益率',
                 color='#5E81F4', alpha=0.9, zorder=3)
-        bars2 = ax1.bar(x + w/2, intraday_vals, w, label='T日开→收',
+        bars2 = ax1.bar(x + w/2, intraday_vals, w, label='T+1日开→收',
                         color=[_color(v) for v in intraday_vals], alpha=0.9, zorder=3)
 
         # 标注数值
@@ -493,7 +510,7 @@ def plot_review(top5_eval: pd.DataFrame, top20_eval: pd.DataFrame,
     ax1.set_ylabel('收益率', color=text_color, fontsize=9)
     ax1.legend(fontsize=8, labelcolor=text_color, facecolor=dark_bg,
                edgecolor=grid_color, loc='upper right')
-    ax1.set_title(f'买入推荐 TOP 5 — 预测 vs 实际  ({eval_date})',
+    ax1.set_title(f'买入推荐 TOP 5 — 预测 vs 实际  ({exec_date})',
                   color=text_color, fontsize=12, fontweight='bold', pad=10)
     ax1.grid(axis='y', color=grid_color, linewidth=0.5, zorder=1)
 
@@ -514,7 +531,7 @@ def plot_review(top5_eval: pd.DataFrame, top20_eval: pd.DataFrame,
     ax2.text(0.97, 0.97, note, transform=ax2.transAxes,
              ha='right', va='top', color=text_color, fontsize=8,
              bbox=dict(facecolor='#3A3A3C', edgecolor='none', alpha=0.8, pad=5))
-    ax2.set_title('T日市场概况', color=text_color, fontsize=10, fontweight='bold')
+    ax2.set_title('T+1日市场概况', color=text_color, fontsize=10, fontweight='bold')
     ax2.set_ylabel('股票数量', color=text_color, fontsize=9)
     ax2.grid(axis='y', color=grid_color, linewidth=0.5, zorder=1)
 
@@ -558,8 +575,8 @@ def plot_review(top5_eval: pd.DataFrame, top20_eval: pd.DataFrame,
         pred20 = top20_eval['pred_return'].values
         actual20 = top20_eval['intraday_return'].fillna(0).values
 
-        ax4.bar(x20 - w20/2, pred20, w20, label='T-1预测', color='#5E81F4', alpha=0.9, zorder=3)
-        ax4.bar(x20 + w20/2, actual20, w20, label='T日开→收',
+        ax4.bar(x20 - w20/2, pred20, w20, label='T日预测', color='#5E81F4', alpha=0.9, zorder=3)
+        ax4.bar(x20 + w20/2, actual20, w20, label='T+1日开→收',
                 color=[_color(v) for v in actual20], alpha=0.9, zorder=3)
 
         labels20 = []
@@ -584,7 +601,7 @@ def plot_review(top5_eval: pd.DataFrame, top20_eval: pd.DataFrame,
     verdict_color = _color(portfolio_avg)
     title_color = verdict_color if portfolio_avg != 0 else text_color
     fig.suptitle(
-        f"盘后决策评估  |  T-1: {pred_date_str}  →  T: {eval_date}"
+        f"盘后决策评估  |  T: {decision_date_str}  →  T+1: {exec_date}"
         f"  |  TOP5均值: {_pct_fmt(portfolio_avg)}  [{verdict}]",
         color=title_color, fontsize=13, fontweight='bold', y=0.96
     )
@@ -597,47 +614,47 @@ def plot_review(top5_eval: pd.DataFrame, top20_eval: pd.DataFrame,
 
 # ── 主流程 ────────────────────────────────────────────────────────
 
-def run_review(force: bool = False, eval_date: date = None) -> None:
-    check_review_time(force, eval_date)
+def run_review(force: bool = False, exec_date_arg: date = None) -> None:
+    check_review_time(force, exec_date_arg)
 
     # 1. 加载预测数据
     pred_df = load_predictions()
 
-    # 2. 确定T-1日和T日
-    pred_date, t_day = determine_eval_date(pred_df, eval_date)
-    pred_date_str = pred_date.date() if hasattr(pred_date, 'date') else pred_date
-    print(f"决策基准日(T-1): {pred_date_str}")
-    print(f"评估日(T):       {t_day}")
+    # 2. 确定决策日(T)和执行日(T+1)
+    decision_date, exec_date = determine_eval_date(pred_df, exec_date_arg)
+    decision_date_str = decision_date.date() if hasattr(decision_date, 'date') else decision_date
+    print(f"决策日(T):   {decision_date_str}")
+    print(f"执行日(T+1): {exec_date}")
 
-    # 3. 加载T-1价格信息
-    price_df = load_price_info(pred_date)
+    # 3. 加载决策日的价格信息（收盘价用于展示）
+    price_df = load_price_info(decision_date)
 
-    # 4. 生成T日决策（基于T-1预测）
-    top5, top20, all_pred = generate_decisions(pred_df, pred_date, price_df)
+    # 4. 基于决策日预测生成推荐
+    top5, top20, all_pred = generate_decisions(pred_df, decision_date, price_df)
     print(f"买入推荐: {len(top5)} 只, 潜力TOP20: {len(top20)} 只")
     if len(top5) > 0:
         print(f"  TOP5: {top5['代码'].tolist()}")
 
-    # 5. 加载T日实际行情
-    t_day_date = t_day if isinstance(t_day, date) else t_day.date()
+    # 5. 加载执行日(T+1)实际行情
+    exec_date_val = exec_date if isinstance(exec_date, date) else exec_date.date()
     try:
-        today_df = load_today_data(t_day_date)
+        exec_day_df = load_today_data(exec_date_val)
     except (FileNotFoundError, ValueError) as e:
         sys.exit(
-            f"无法读取T日 {t_day} 的行情数据: {e}\n"
+            f"无法读取执行日 {exec_date} 的行情数据: {e}\n"
             f"请确认:\n"
-            f"  1. T日 {t_day} 已收盘\n"
+            f"  1. 执行日 {exec_date} 已收盘\n"
             f"  2. 已运行数据更新（python src/py00_fetch_stock_data.py --update）"
         )
 
     # 6. 评估
-    top5_eval = evaluate_stocks(top5, today_df) if len(top5) > 0 else pd.DataFrame()
-    top20_eval = evaluate_stocks(top20, today_df)
-    market = calc_market_stats(today_df)
+    top5_eval = evaluate_stocks(top5, exec_day_df) if len(top5) > 0 else pd.DataFrame()
+    top20_eval = evaluate_stocks(top20, exec_day_df)
+    market = calc_market_stats(exec_day_df)
 
     # 7. 控制台摘要
     print(f"\n{'='*70}")
-    print(f"  T日决策评估  |  T-1: {pred_date_str}  →  T: {t_day}")
+    print(f"  决策评估  |  T: {decision_date_str}  →  T+1: {exec_date}")
     print(f"{'='*70}")
 
     if len(top5_eval) > 0:
@@ -671,24 +688,24 @@ def run_review(force: bool = False, eval_date: date = None) -> None:
     print(f"{'='*70}")
 
     # 8. 生成 Markdown 报告
-    md_report = generate_markdown_report(pred_date, t_day, top5_eval, top20_eval, market)
+    md_report = generate_markdown_report(decision_date, exec_date, top5_eval, top20_eval, market)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    md_path = os.path.join(OUTPUT_DIR, f"today_review_{t_day_date.strftime('%Y%m%d')}.md")
+    md_path = os.path.join(OUTPUT_DIR, f"today_review_{exec_date_val.strftime('%Y%m%d')}.md")
     with open(md_path, 'w', encoding='utf-8') as f:
         f.write(md_report)
     print(f"评估报告已保存: {md_path}")
 
     # 9. 生成 PNG 图表
-    png_path = os.path.join(OUTPUT_DIR, f"today_review_{t_day_date.strftime('%Y%m%d')}.png")
-    plot_review(top5_eval, top20_eval, market, pred_date, t_day, png_path)
+    png_path = os.path.join(OUTPUT_DIR, f"today_review_{exec_date_val.strftime('%Y%m%d')}.png")
+    plot_review(top5_eval, top20_eval, market, decision_date, exec_date, png_path)
 
     print("\n评估完成。")
 
 
 if __name__ == '__main__':
     _force = '--force' in sys.argv
-    _eval_date = None
+    _exec_date = None
     if '--date' in sys.argv:
         _idx = sys.argv.index('--date')
-        _eval_date = datetime.strptime(sys.argv[_idx + 1], '%Y-%m-%d').date()
-    run_review(_force, eval_date=_eval_date)
+        _exec_date = datetime.strptime(sys.argv[_idx + 1], '%Y-%m-%d').date()
+    run_review(_force, exec_date_arg=_exec_date)

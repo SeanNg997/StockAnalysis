@@ -240,7 +240,9 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     else:
         open_next_n[:] = np.nan
 
-    # 扣除交易成本: 买入手续费0.0085%, 卖出手续费0.0085%+印花税0.05%
+    # 扣除交易成本: 买入佣金0.0085%, 卖出佣金0.0085%+印花税0.05%
+    # 注意：最低佣金1元在标签计算中无法体现（不知道交易金额），
+    # 但由于每笔交易通常数万元，比例费率的影响更大
     buy_cost = 1.0 + 0.000085
     sell_cost = 1.0 - 0.000585
     raw_label = (open_next_n * sell_cost) / (open_next1 * buy_cost) - 1.0

@@ -97,8 +97,11 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
             raise ValueError(f"训练数据不足（{len(train_dates)} 天 < 252 天），请使用更早的 BACKTEST_START 或更长的历史数据")
 
         val_split = int(len(train_dates) * 0.9)
+        # 训练集与验证集之间加入 HOLD_DAYS 天的 purge gap，
+        # 防止验证集的 label 依赖训练集末尾的未来价格
+        val_start = min(val_split + HOLD_DAYS, len(train_dates))
         train_date_set = set(train_dates[:val_split])
-        val_date_set = set(train_dates[val_split:])
+        val_date_set = set(train_dates[val_start:])
 
         train_mask = df['date'].isin(train_date_set)
         val_mask = df['date'].isin(val_date_set)
@@ -195,10 +198,11 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
             if len(train_dates) < 252:  # 至少1年数据才训练
                 continue
 
-            # 划分训练集和验证集（最后10%作为验证）
+            # 划分训练集和验证集（最后10%作为验证，中间加 purge gap）
             val_split = int(len(train_dates) * 0.9)
+            val_start = min(val_split + HOLD_DAYS, len(train_dates))
             train_date_set = set(train_dates[:val_split])
-            val_date_set = set(train_dates[val_split:])
+            val_date_set = set(train_dates[val_start:])
 
             train_mask = df['date'].isin(train_date_set)
             val_mask = df['date'].isin(val_date_set)
@@ -293,9 +297,9 @@ def run_pipeline(end_date=None):
     df = pd.read_pickle(FEATURE_PKL)
     print(f"数据: {df.shape[0]:,} 行, {df['代码'].nunique()} 只股票")
 
-    # 替换inf为NaN再填0
+    # 替换inf为NaN（保留NaN让LightGBM原生处理，避免0值被误读为有意义信号）
     feature_cols = get_feature_columns(df)
-    df[feature_cols] = df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+    df[feature_cols] = df[feature_cols].replace([np.inf, -np.inf], np.nan)
 
     # 截断到指定日期（features.pkl 可能已截断，这里做双重保证）
     if end_date is not None:
@@ -304,7 +308,13 @@ def run_pipeline(end_date=None):
 
     pred_df = train_and_predict(df, end_date=end_date)
 
-    # 保存预测结果
+    # 保存预测结果（单日模式增量追加，全量模式覆盖）
+    if end_date is not None and os.path.exists(PREDICT_PKL):
+        old_pred = pd.read_pickle(PREDICT_PKL)
+        # 剔除旧文件中与新预测同日的数据，再追加
+        old_pred = old_pred[~old_pred['date'].isin(pred_df['date'].unique())]
+        pred_df = pd.concat([old_pred, pred_df], ignore_index=True)
+        pred_df = pred_df.sort_values(['date', '代码']).reset_index(drop=True)
     pred_df.to_pickle(PREDICT_PKL)
     print(f"保存至 {PREDICT_PKL}")
 

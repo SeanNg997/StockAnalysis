@@ -64,10 +64,10 @@ print(m.group(1) if m else '')
 fi
 
 # ── Step 2: 运行盘后评估 ─────────────────────────────────────
-# 不传 --date 给 py08_review.py，执行日由策略文件中的"决策应用日期"自动确定
+# 不传 --date 给 py07_review.py，执行日由策略文件中的"决策应用日期"自动确定
 echo ""
 echo "[Step 2] 运行盘后决策评估..."
-python "$SRC_DIR/py08_review.py" $FORCE_FLAG
+python "$SRC_DIR/py07_review.py" $FORCE_FLAG
 
 echo ""
 echo "=============================================="

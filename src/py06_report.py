@@ -28,7 +28,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
 FEATURE_PKL = os.path.join(BASE_DIR, 'data', 'features.pkl')
 
-INITIAL_CAPITAL = 1_000_000
+INITIAL_CAPITAL = 100_000
 
 
 def plot_equity_curve(daily_df: pd.DataFrame):
