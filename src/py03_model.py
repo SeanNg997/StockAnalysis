@@ -28,18 +28,20 @@ RETRAIN_DAYS = 22       # 每22个交易日（约1个月）重新训练
 BACKTEST_START = '2023-01-01'  # 回测起始日期
 
 LGB_PARAMS = {
-    'objective': 'regression',
+    'objective': 'huber',          # Huber损失，对异常值更鲁棒
+    'alpha': 0.9,                  # Huber delta参数
     'metric': 'mae',
     'boosting_type': 'gbdt',
-    'num_leaves': 63,
-    'max_depth': 7,
-    'learning_rate': 0.05,
-    'feature_fraction': 0.7,
-    'bagging_fraction': 0.8,
+    'num_leaves': 31,              # 降低复杂度防过拟合 (63→31)
+    'max_depth': 5,                # 限制树深度 (7→5)
+    'learning_rate': 0.03,         # 更小学习率，更稳定 (0.05→0.03)
+    'feature_fraction': 0.6,       # 更强随机性 (0.7→0.6)
+    'bagging_fraction': 0.7,       # 更强随机性 (0.8→0.7)
     'bagging_freq': 5,
-    'min_child_samples': 100,
-    'lambda_l1': 0.1,
-    'lambda_l2': 1.0,
+    'min_child_samples': 200,      # 更保守的叶节点 (100→200)
+    'lambda_l1': 1.0,              # 更强L1正则 (0.1→1.0)
+    'lambda_l2': 5.0,              # 更强L2正则 (1.0→5.0)
+    'min_gain_to_split': 0.01,     # 分裂最小增益，防止无意义分裂
     'verbose': -1,
     'n_jobs': -1,
 }
@@ -116,9 +118,9 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
             dtrain = lgb.Dataset(X_train, label=y_train)
             dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
             model = lgb.train(
-                params, dtrain, num_boost_round=500,
+                params, dtrain, num_boost_round=800,
                 valid_sets=[dval],
-                callbacks=[lgb.early_stopping(30, verbose=False)],
+                callbacks=[lgb.early_stopping(50, verbose=False)],
             )
             models.append(model)
             print(f"  模型 {seed+1}/{N_ENSEMBLE} 完成, best_iter={model.best_iteration}")
@@ -218,9 +220,9 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
                 model = lgb.train(
                     params,
                     dtrain,
-                    num_boost_round=500,
+                    num_boost_round=800,
                     valid_sets=[dval],
-                    callbacks=[lgb.early_stopping(30, verbose=False)],
+                    callbacks=[lgb.early_stopping(50, verbose=False)],
                 )
                 models.append(model)
 

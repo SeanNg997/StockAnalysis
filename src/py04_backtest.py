@@ -1,11 +1,12 @@
 """
-py04_backtest.py — 回测引擎模块
-=================================
+py04_backtest.py — 回测引擎模块（优化版）
+===========================================
 职责：
 1. 基于模型预测结果执行完整回测
 2. 严格模拟：集合竞价open价成交、T+1、交易成本、持仓≤5只
 3. 涨跌停处理
-4. 输出回测指标与交易日志
+4. 持有期5天策略 + 止损止盈 + 市场择时
+5. 输出回测指标与交易日志
 """
 
 import pandas as pd
@@ -27,8 +28,13 @@ STAMP_TAX = 0.0005           # 印花税 0.05%（卖出时收取）
 
 # ============ 策略参数 ============
 MAX_POSITIONS = 5            # 最大持仓数
-MIN_PRED_RETURN = 0.001      # 最低预测收益率阈值（0.1%）
+MIN_PRED_RETURN = 0.002      # 最低预测收益率阈值（0.2%，提高门槛）
+MIN_CONFIDENCE = 0.5         # 最低置信度阈值
+HOLD_DAYS = 5                # 目标持有天数
+STOP_LOSS = -0.05            # 止损线 -5%
+TAKE_PROFIT = 0.08           # 止盈线 +8%
 INITIAL_CAPITAL = 1_000_000  # 初始资金100万
+MAX_DAILY_BUY = 2            # 每天最多买入2只（分批建仓）
 
 
 def load_data():
@@ -38,7 +44,6 @@ def load_data():
     pred_df = pd.read_pickle(PREDICT_PKL)
 
     # 合并预测结果到主数据
-    # 只保留原始价格数据和预测
     price_cols = ['代码', '名称', 'date', 'open', 'high', 'low', 'close',
                   'volume', 'amount', 'pctChg']
     price_df = df[price_cols].copy()
@@ -53,26 +58,14 @@ def load_data():
 
 
 def get_limit_price(prev_close: float, code: str) -> tuple:
-    """
-    根据股票类型计算涨停价和跌停价（精确到分，四舍五入到小数点后2位）
-
-    涨跌停规则：
-    - 沪深主板（sh.60xxx / sz.00xxx）普通股：±10%
-    - ST / *ST 股：±5%（本项目已剔除ST，保留作备用）
-    - 科创板（sh.688xxx）：±20%
-    - 创业板（sz.300xxx）：±20%
-    - 北交所（bj.8xxxxx / bj.4xxxxx）：±30%
-
-    本项目数据仅含主板（sh.60 / sz.00），因此均为 ±10%。
-    此处保留完整分支以应对将来宇宙扩展。
-    """
+    """根据股票类型计算涨停价和跌停价"""
     code_lower = code.lower()
     if code_lower.startswith('sh.688') or code_lower.startswith('sz.300'):
         pct = 0.20
     elif code_lower.startswith('bj.'):
         pct = 0.30
     else:
-        pct = 0.10  # 主板（sh.60 / sz.00）及默认
+        pct = 0.10
 
     limit_up = round(prev_close * (1 + pct), 2)
     limit_down = round(prev_close * (1 - pct), 2)
@@ -80,14 +73,7 @@ def get_limit_price(prev_close: float, code: str) -> tuple:
 
 
 def check_limit(row_today, row_prev):
-    """
-    检查当日开盘价是否触及涨停或跌停。
-
-    判定方式：计算前收盘价对应的涨/跌停价（四舍五入到分），
-    若开盘价 >= 涨停价则视为涨停无法买入；
-    若开盘价 <= 跌停价则视为跌停无法卖出。
-    允许 0.001 元的浮点误差。
-    """
+    """检查当日开盘价是否触及涨停或跌停"""
     if row_prev is None:
         return False, False
 
@@ -103,15 +89,48 @@ def check_limit(row_today, row_prev):
     return is_limit_up, is_limit_down
 
 
+def compute_composite_score(pred_return, confidence):
+    """综合评分 = 预测收益率权重 * 0.6 + 置信度权重 * 0.4"""
+    return pred_return * 0.6 + confidence * pred_return * 0.4
+
+
+def check_market_regime(merged, current_date, lookback=10):
+    """
+    市场择时：检查近期市场环境
+    返回仓位系数 0.0~1.0
+    """
+    recent = merged[merged['date'] <= current_date].groupby('date')['pctChg'].mean()
+    recent = recent.sort_index().tail(lookback)
+
+    if len(recent) < 5:
+        return 1.0
+
+    # 近期市场平均涨跌幅
+    mkt_ret = recent.mean()
+    # 近期下跌天数占比
+    down_ratio = (recent < 0).mean()
+
+    # 市场极度弱势（均值 < -1% 且下跌天数 > 70%）→ 半仓
+    if mkt_ret < -0.01 and down_ratio > 0.7:
+        return 0.4
+    # 市场偏弱 → 减仓
+    elif mkt_ret < -0.005 and down_ratio > 0.6:
+        return 0.6
+    # 正常
+    else:
+        return 1.0
+
+
 def run_backtest(merged: pd.DataFrame) -> dict:
     """
-    执行回测
+    执行回测（优化版）
 
-    核心逻辑（时序严格正确）：
-    - 决策日T：T日收盘后，用T日特征和pred_return选股
-    - 执行日T+1：T+1日开盘集合竞价，用open[T+1]成交
-    - 涨跌停检查：基于T+1日的open和T日的close
-    - T+1约束：T+1日买入的股票，T+2日才可卖出
+    核心逻辑：
+    - 决策日T：T日收盘后选股
+    - 执行日T+1：T+1日开盘集合竞价成交
+    - 持有5个交易日后卖出（或触发止损/止盈提前卖出）
+    - 每天最多买入2只，分批建仓
+    - 不在top名单且持有超过目标天数的股票卖出
     """
     all_dates = sorted(merged['date'].unique())
     print(f"回测期间: {all_dates[0].date()} ~ {all_dates[-1].date()}, 共 {len(all_dates)} 个交易日")
@@ -122,30 +141,31 @@ def run_backtest(merged: pd.DataFrame) -> dict:
     for _, row in merged.iterrows():
         date_stock_map[(row['date'], row['代码'])] = row
 
-    # 构建日期索引映射：next_date_map[T] = T+1
+    # 构建日期索引映射
     next_date_map = {}
     for i in range(len(all_dates) - 1):
         next_date_map[all_dates[i]] = all_dates[i+1]
 
+    date_to_idx = {d: i for i, d in enumerate(all_dates)}
+
     # ============ 回测状态 ============
     cash = INITIAL_CAPITAL
-    positions = {}  # {股票代码: {'shares': 股数, 'buy_price': 买入价, 'buy_date': 买入日期}}
+    positions = {}  # {股票代码: {'shares', 'buy_price', 'buy_date', 'current_price', 'hold_days'}}
     locked_stocks = set()  # 当日买入锁定（T+1）
 
     # 记录
-    daily_records = []    # 每日资产记录
-    trade_log = []        # 交易日志
+    daily_records = []
+    trade_log = []
 
-    # 遍历每个决策日T（最后一天没有T+1，无法执行交易）
     for day_idx in range(len(all_dates)):
-        decision_date = all_dates[day_idx]  # 决策日T
-        exec_date = next_date_map.get(decision_date)  # 执行日T+1
+        decision_date = all_dates[day_idx]
+        exec_date = next_date_map.get(decision_date)
 
-        # 获取决策日数据（用于选股排名）
+        # 获取决策日数据
         decision_data = merged[merged['date'] == decision_date]
 
         if exec_date is None:
-            # 最后一个交易日：没有执行日，仅记录资产
+            # 最后一个交易日
             total_value = cash
             for code, pos in positions.items():
                 key = (decision_date, code)
@@ -165,92 +185,70 @@ def run_backtest(merged: pd.DataFrame) -> dict:
             })
             continue
 
-        # 获取执行日数据（用于获取成交价和涨跌停判断）
         exec_data = merged[merged['date'] == exec_date]
 
-        # ===== 步骤1：解锁昨日买入的股票 =====
+        # ===== 步骤1：解锁昨日买入的股票，更新持有天数 =====
         locked_stocks.clear()
+        for code in positions:
+            positions[code]['hold_days'] += 1
 
-        # ===== 步骤2：用决策日pred_return选股，在执行日成交 =====
-
-        # --- 卖出决策 ---
+        # ===== 步骤2：卖出决策 =====
         sell_list = []
-        for code, pos in positions.items():
+        for code, pos in list(positions.items()):
             if code in locked_stocks:
-                continue  # T+1：当日买入的不能卖出
-
-            # 使用决策日的 pred_return 判断是否卖出
-            dec_pred = decision_data[decision_data['代码'] == code]
-            if len(dec_pred) == 0:
-                continue  # 决策日无数据（停牌）
+                continue
 
             # 检查执行日是否可交易
             exec_info = exec_data[exec_data['代码'] == code]
             if len(exec_info) == 0:
-                continue  # 执行日停牌，无法卖出
+                continue  # 停牌
 
-            # 检查执行日跌停（用决策日close作为前收盘价）
+            dec_pred = decision_data[decision_data['代码'] == code]
+            if len(dec_pred) == 0:
+                continue
+
+            # 检查执行日跌停
             row_exec = exec_info.iloc[0]
             row_decision = dec_pred.iloc[0]
             _, is_limit_down = check_limit(row_exec, row_decision)
-
             if is_limit_down:
-                continue  # 执行日跌停开盘，不能卖出
-
-            pred_ret = dec_pred.iloc[0]['pred_return']
-            if pred_ret < 0:
-                sell_list.append(code)
-
-        # 选股排名（基于决策日的 pred_return）
-        day_ranked = decision_data[decision_data['pred_return'] > MIN_PRED_RETURN].sort_values(
-            'pred_return', ascending=False
-        )
-
-        # 当日top候选（检查执行日涨停）
-        top_candidates = []
-        for _, cand in day_ranked.iterrows():
-            code = cand['代码']
-
-            # 检查执行日是否可买入
-            exec_info = exec_data[exec_data['代码'] == code]
-            if len(exec_info) == 0:
-                continue  # 执行日停牌
-
-            # 检查执行日涨停（用决策日close作为前收盘价）
-            row_exec = exec_info.iloc[0]
-            is_limit_up, _ = check_limit(row_exec, cand)
-            if not is_limit_up:
-                top_candidates.append(code)
-            if len(top_candidates) >= MAX_POSITIONS * 2:
-                break
-
-        top_set = set(top_candidates[:MAX_POSITIONS])
-
-        # 持仓中不在top名单的也卖出
-        for code in list(positions.keys()):
-            if code in locked_stocks:
                 continue
-            if code not in top_set and code not in sell_list:
-                # 检查执行日是否可交易
-                exec_info = exec_data[exec_data['代码'] == code]
-                if len(exec_info) == 0:
-                    continue
 
-                dec_pred = decision_data[decision_data['代码'] == code]
-                if len(dec_pred) == 0:
-                    continue
+            # 计算浮动盈亏（使用决策日close估算）
+            current_price = row_decision['close']
+            profit_pct = (current_price - pos['buy_price']) / pos['buy_price']
 
-                # 检查执行日跌停
-                row_exec = exec_info.iloc[0]
-                row_decision = dec_pred.iloc[0]
-                _, is_limit_down = check_limit(row_exec, row_decision)
-                if not is_limit_down:
-                    sell_list.append(code)
+            # 卖出条件
+            should_sell = False
+            sell_reason = ''
 
-        sell_list = list(set(sell_list))
+            # 1. 止损
+            if profit_pct <= STOP_LOSS:
+                should_sell = True
+                sell_reason = 'STOP_LOSS'
 
-        # 执行卖出（用执行日T+1的open价）
-        for code in sell_list:
+            # 2. 止盈
+            elif profit_pct >= TAKE_PROFIT:
+                should_sell = True
+                sell_reason = 'TAKE_PROFIT'
+
+            # 3. 持有到期（达到目标持有天数）
+            elif pos['hold_days'] >= HOLD_DAYS:
+                should_sell = True
+                sell_reason = 'HOLD_EXPIRE'
+
+            # 4. 持有超过3天且预测转负
+            elif pos['hold_days'] >= 3:
+                pred_ret = row_decision['pred_return']
+                if pred_ret < -0.001:
+                    should_sell = True
+                    sell_reason = 'SIGNAL_REVERSE'
+
+            if should_sell:
+                sell_list.append((code, sell_reason))
+
+        # 执行卖出
+        for code, sell_reason in sell_list:
             if code not in positions:
                 continue
             exec_info = exec_data[exec_data['代码'] == code]
@@ -258,7 +256,7 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                 continue
 
             pos = positions[code]
-            sell_price = exec_info.iloc[0]['open']  # T+1日open
+            sell_price = exec_info.iloc[0]['open']
             sell_amount = pos['shares'] * sell_price
             sell_cost = sell_amount * (SELL_COMMISSION + STAMP_TAX)
             cash += sell_amount - sell_cost
@@ -268,7 +266,7 @@ def run_backtest(merged: pd.DataFrame) -> dict:
             profit_pct = (profit / buy_cost_total * 100) if buy_cost_total > 0 else 0
 
             trade_log.append({
-                'date': exec_date,  # 记录执行日
+                'date': exec_date,
                 '代码': code,
                 '名称': exec_info.iloc[0]['名称'],
                 'action': 'SELL',
@@ -278,67 +276,111 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                 'cost': sell_cost,
                 'profit': profit,
                 'profit_pct': profit_pct,
+                'reason': sell_reason,
+                'hold_days': pos['hold_days'],
             })
 
             del positions[code]
 
-        # --- 买入决策 ---
-        sold_today = set(sell_list)
+        # ===== 步骤3：买入决策 =====
         n_empty = MAX_POSITIONS - len(positions)
-        if n_empty > 0 and len(top_candidates) > 0:
-            buy_candidates = [c for c in top_candidates
-                              if c not in positions and c not in sold_today][:n_empty]
+        if n_empty > 0:
+            # 市场择时系数
+            mkt_factor = check_market_regime(merged, decision_date)
 
-            if buy_candidates:
-                available_cash = cash
+            # 根据市场状态调整最大仓位
+            adjusted_max = max(1, int(MAX_POSITIONS * mkt_factor))
+            n_empty = min(n_empty, adjusted_max - len(positions))
+            n_empty = min(n_empty, MAX_DAILY_BUY)  # 每天最多买入2只
 
-                # 获取执行日的买入价格
-                exec_buy_info = exec_data[exec_data['代码'].isin(buy_candidates)].copy()
-                # 按决策日的pred_return排序
-                dec_info = decision_data[decision_data['代码'].isin(buy_candidates)][['代码', 'pred_return']]
-                exec_buy_info = exec_buy_info.merge(dec_info, on='代码', suffixes=('', '_dec'))
-                exec_buy_info = exec_buy_info.sort_values('pred_return_dec', ascending=False)
+            if n_empty > 0:
+                # 综合评分选股
+                candidates = decision_data[
+                    (decision_data['pred_return'] > MIN_PRED_RETURN) &
+                    (decision_data['confidence'] > MIN_CONFIDENCE)
+                ].copy()
 
-                n_buy = min(len(exec_buy_info), n_empty)
-                per_stock_cash = available_cash / max(n_buy, 1) * 0.98
+                if len(candidates) > 0:
+                    candidates['score'] = candidates.apply(
+                        lambda r: compute_composite_score(r['pred_return'], r['confidence']),
+                        axis=1
+                    )
+                    candidates = candidates.sort_values('score', ascending=False)
 
-                for _, cand in exec_buy_info.head(n_buy).iterrows():
-                    code = cand['代码']
-                    buy_price = cand['open']  # T+1日open
+                    # 过滤已持仓和当日卖出的
+                    sold_today = set(code for code, _ in sell_list)
+                    buy_candidates = []
 
-                    if buy_price <= 0:
-                        continue
+                    for _, cand in candidates.iterrows():
+                        code = cand['代码']
+                        if code in positions or code in sold_today:
+                            continue
 
-                    shares = int(per_stock_cash / buy_price / 100) * 100
-                    if shares < 100:
-                        continue
+                        # 检查执行日涨停
+                        exec_info = exec_data[exec_data['代码'] == code]
+                        if len(exec_info) == 0:
+                            continue
 
-                    buy_amount = shares * buy_price
-                    buy_cost = buy_amount * BUY_COMMISSION
-                    cash -= buy_amount + buy_cost
+                        row_exec = exec_info.iloc[0]
+                        is_limit_up, _ = check_limit(row_exec, cand)
+                        if not is_limit_up:
+                            buy_candidates.append(code)
 
-                    positions[code] = {
-                        'shares': shares,
-                        'buy_price': buy_price,
-                        'buy_date': exec_date,
-                        'current_price': buy_price,
-                    }
-                    locked_stocks.add(code)
+                        if len(buy_candidates) >= n_empty:
+                            break
 
-                    trade_log.append({
-                        'date': exec_date,  # 记录执行日
-                        '代码': code,
-                        '名称': cand['名称'],
-                        'action': 'BUY',
-                        'price': buy_price,
-                        'shares': shares,
-                        'amount': buy_amount,
-                        'cost': buy_cost,
-                        'profit': 0,
-                        'profit_pct': np.nan,
-                    })
+                    # 执行买入
+                    if buy_candidates:
+                        available_cash = cash * 0.95  # 保留5%现金
+                        # 分配资金：按空仓位数平均分配
+                        per_stock_cash = available_cash / max(MAX_POSITIONS, 1)
 
-        # ===== 步骤3：记录决策日资产（用决策日close估值） =====
+                        for code in buy_candidates:
+                            exec_info = exec_data[exec_data['代码'] == code]
+                            if len(exec_info) == 0:
+                                continue
+
+                            buy_price = exec_info.iloc[0]['open']
+                            if buy_price <= 0:
+                                continue
+
+                            shares = int(per_stock_cash / buy_price / 100) * 100
+                            if shares < 100:
+                                continue
+
+                            buy_amount = shares * buy_price
+                            buy_cost = buy_amount * BUY_COMMISSION
+
+                            if buy_amount + buy_cost > cash:
+                                continue
+
+                            cash -= buy_amount + buy_cost
+
+                            positions[code] = {
+                                'shares': shares,
+                                'buy_price': buy_price,
+                                'buy_date': exec_date,
+                                'current_price': buy_price,
+                                'hold_days': 0,
+                            }
+                            locked_stocks.add(code)
+
+                            trade_log.append({
+                                'date': exec_date,
+                                '代码': code,
+                                '名称': exec_info.iloc[0]['名称'],
+                                'action': 'BUY',
+                                'price': buy_price,
+                                'shares': shares,
+                                'amount': buy_amount,
+                                'cost': buy_cost,
+                                'profit': 0,
+                                'profit_pct': np.nan,
+                                'reason': 'SIGNAL',
+                                'hold_days': 0,
+                            })
+
+        # ===== 步骤4：记录资产 =====
         total_value = cash
         for code, pos in positions.items():
             key = (decision_date, code)
@@ -363,7 +405,6 @@ def run_backtest(merged: pd.DataFrame) -> dict:
             print(f"  [{decision_date.date()}] 资产: {total_value:,.0f}, "
                   f"收益: {ret:+.2f}%, 持仓: {len(positions)}只")
 
-    # ===== 转换为DataFrame =====
     daily_df = pd.DataFrame(daily_records)
     trade_df = pd.DataFrame(trade_log)
 
@@ -433,6 +474,16 @@ def compute_trade_metrics(trade_df: pd.DataFrame) -> dict:
     total_days = (trade_df['date'].max() - trade_df['date'].min()).days
     buys = trade_df[trade_df['action'] == 'BUY']
 
+    # 平均持有天数
+    sell_holds = sells['hold_days'] if 'hold_days' in sells.columns else pd.Series([0])
+    avg_hold = sell_holds.mean() if len(sell_holds) > 0 else 0
+
+    # 卖出原因统计
+    reason_stats = ''
+    if 'reason' in sells.columns:
+        reasons = sells['reason'].value_counts()
+        reason_stats = ', '.join([f"{k}:{v}" for k, v in reasons.items()])
+
     return {
         '总交易笔数(买入)': len(buys),
         '总交易笔数(卖出)': len(sells),
@@ -440,7 +491,9 @@ def compute_trade_metrics(trade_df: pd.DataFrame) -> dict:
         '盈亏比': f"{profit_loss_ratio:.3f}",
         '平均盈利': f"{avg_win:,.0f}",
         '平均亏损': f"{-losses['profit'].mean() if len(losses) > 0 else 0:,.0f}",
+        '平均持有天数': f"{avg_hold:.1f}",
         '日均交易次数': f"{len(trade_df) / max(total_days, 1) * 365 / 252:.2f}",
+        '卖出原因': reason_stats,
     }
 
 

@@ -190,19 +190,62 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
         ma20 = col_s.rolling(20, min_periods=1).mean().values
         feats[f'{col_name}_chg'] = (col_vals - ma20) / (np.abs(ma20) + 1e-10)
 
-    # ===== 12. 标签：T+1开盘买入 → T+2开盘卖出 收益率 =====
+    # ===== 12. 额外alpha因子 =====
+    # 反转因子：短期超跌反弹
+    if n >= 5:
+        ret_5d = feats['ret_5d']
+        vol_5d = feats['volatility_5d']
+        feats['reversal_5d'] = -ret_5d  # 短期反转
+        # 波动率调整动量
+        safe_vol = np.where(np.isnan(vol_5d) | (vol_5d < 1e-10), 1e-10, vol_5d)
+        feats['risk_adj_mom_20d'] = feats['ret_20d'] / safe_vol
+
+    # 成交额变化趋势
+    amt_5ma = pd.Series(amount).rolling(5, min_periods=1).mean().values
+    amt_20ma = pd.Series(amount).rolling(20, min_periods=1).mean().values
+    feats['amt_trend'] = amt_5ma / (amt_20ma + 1e-10)
+
+    # 价格加速度（动量变化率）
+    ret_1d = feats['ret_1d']
+    ret_1d_s = pd.Series(ret_1d)
+    feats['momentum_acc'] = ret_1d_s.rolling(5, min_periods=2).mean().values - \
+                            ret_1d_s.rolling(20, min_periods=5).mean().values
+
+    # 量价背离：价格上涨但成交量萎缩
+    price_trend = pd.Series(close).pct_change(5).values
+    vol_trend = pd.Series(volume).pct_change(5).values
+    feats['vol_price_diverge'] = np.where(
+        np.isnan(price_trend) | np.isnan(vol_trend), np.nan,
+        price_trend - vol_trend
+    )
+
+    # 上影线比例（卖压指标）
+    body = np.abs(close - open_)
+    total_range = high - low + 1e-10
+    feats['upper_shadow'] = (high - np.maximum(close, open_)) / total_range
+    feats['lower_shadow'] = (np.minimum(close, open_) - low) / total_range
+
+    # ===== 13. 标签：T+1开盘买入 → T+N开盘卖出 收益率 =====
+    HOLD_DAYS = 5  # 持有5个交易日
     open_next1 = np.empty(n)
     open_next1[:-1] = open_[1:]
     open_next1[-1] = np.nan
 
-    open_next2 = np.empty(n)
-    open_next2[:-2] = open_[2:]
-    open_next2[-2:] = np.nan
+    open_next_n = np.empty(n)
+    if n > HOLD_DAYS:
+        open_next_n[:n-HOLD_DAYS] = open_[HOLD_DAYS:]
+        open_next_n[n-HOLD_DAYS:] = np.nan
+    else:
+        open_next_n[:] = np.nan
 
     # 扣除交易成本: 买入手续费0.0085%, 卖出手续费0.0085%+印花税0.05%
     buy_cost = 1.0 + 0.000085
     sell_cost = 1.0 - 0.000585
-    feats['label'] = (open_next2 * sell_cost) / (open_next1 * buy_cost) - 1.0
+    raw_label = (open_next_n * sell_cost) / (open_next1 * buy_cost) - 1.0
+
+    # Winsorize极端标签值（截断到±10%）
+    raw_label = np.clip(raw_label, -0.10, 0.10)
+    feats['label'] = raw_label
 
     # 将所有特征转为DataFrame
     feat_df = pd.DataFrame(feats, index=g.index)

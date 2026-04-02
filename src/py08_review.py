@@ -7,9 +7,9 @@ py08_review.py — 盘后决策评估模块
 3. 生成对比可视化图（output/today_review_YYYYMMDD.png）
 
 评估口径：
-  策略为"T+1开盘买入 → T+2开盘卖出"
+  策略为"T+1开盘买入 → 持有5个交易日"
   今日评估 = 买入价（今日开盘）→ 收盘价（浮动盈亏，持有中）
-  完整收益需次日开盘才能确认
+  完整收益需持有期满才能确认
 
 用法：
   python src/py08_review.py                        # 评估今日
@@ -63,62 +63,103 @@ def check_review_time(force: bool = False, eval_date: date = None) -> None:
 def parse_strategy(md_path: str) -> tuple[date, date, list[dict], bool]:
     """
     解析 today_strategy.md，返回：
-    - strategy_date: 决策基准日
+    - strategy_date: 决策基准日（执行日前一天）
     - exec_date: 决策应用日期（执行日）
     - top5: 推荐买入TOP5列表（每项含代码、名称、预测收益率、建议仓位、收盘价）
     - is_empty: 是否建议空仓
+
+    支持两种格式：
+    1. 新格式（TOP N 子标题 + 小表格）：
+       ### TOP 1 — 名称　`代码`
+       | 收盘价 | 预测收益率 | 置信度 | 建议仓位 |
+       | ¥36.01 | **+0.1659%** | 84.72% | 50% |
+
+    2. 旧格式（大表格）：
+       | 1 | sh.600053 | 九鼎投资 | 15.04 | +0.3247% | 0.9341 | 20.0% |
     """
     with open(md_path, 'r', encoding='utf-8') as f:
         content = f.read()
 
-    # 提取决策基准日（格式：**决策基准日**: YYYY-MM-DD 或 决策基准日：YYYY-MM-DD）
-    m = re.search(r'\*{0,2}决策基准日\*{0,2}[:：]\*{0,2}\s*(\d{4}-\d{2}-\d{2})', content)
-    if not m:
-        raise ValueError("无法从策略文件中解析决策基准日")
-    strategy_date = datetime.strptime(m.group(1), '%Y-%m-%d').date()
-
-    # 提取决策应用日期（执行日）
-    m_exec = re.search(r'\*{0,2}决策应用日期\*{0,2}[:：]\*{0,2}\s*(\d{4}-\d{2}-\d{2})', content)
+    # 提取执行日（格式：**执行日**：YYYY-MM-DD）
+    m_exec = re.search(r'\*{0,2}执行日\*{0,2}[:：]\s*(\d{4}-\d{2}-\d{2})', content)
     if not m_exec:
-        raise ValueError("无法从策略文件中解析决策应用日期")
+        # 兼容旧格式
+        m_exec = re.search(r'\*{0,2}决策应用日期\*{0,2}[:：]\*{0,2}\s*(\d{4}-\d{2}-\d{2})', content)
+    if not m_exec:
+        raise ValueError("无法从策略文件中解析执行日期")
     exec_date = datetime.strptime(m_exec.group(1), '%Y-%m-%d').date()
+
+    # 决策基准日 = 执行日前一天（简化处理，跳过周末）
+    from datetime import timedelta
+    strategy_date = exec_date - timedelta(days=1)
+    while strategy_date.weekday() >= 5:
+        strategy_date -= timedelta(days=1)
+
+    # 也尝试解析显式的决策基准日
+    m_base = re.search(r'\*{0,2}决策基准日\*{0,2}[:：]\*{0,2}\s*(\d{4}-\d{2}-\d{2})', content)
+    if m_base:
+        strategy_date = datetime.strptime(m_base.group(1), '%Y-%m-%d').date()
 
     # 检查是否空仓
     if '建议空仓' in content:
         return strategy_date, exec_date, [], True
 
-    # 解析 TOP 5 Markdown 表格行
-    # 格式: "| 1 | sh.600053 | 九鼎投资 | 15.04 | +0.3247% | 0.9341 | 20.0% |"
+    # 尝试新格式解析：### TOP N — 名称　`代码`
     top5 = []
-    in_top5 = False
-    for line in content.splitlines():
-        if '推荐买入' in line and 'TOP 5' in line:
-            in_top5 = True
-            continue
-        if in_top5 and line.startswith('##') and '推荐买入' not in line:
-            break
-        if not in_top5:
-            continue
-        # 跳过表头和分隔行
-        if '代码' in line or '----' in line or '排名' in line:
-            continue
-        # 匹配 Markdown 表格数据行
-        m = re.match(
-            r'\|\s*(\d+)\s*\|\s*((?:sh|sz)\.\d{6})\s*\|\s*(\S+)\s*\|\s*([\d.]+)\s*\|\s*([+-]?[\d.]+)%\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)%\s*\|',
-            line
-        )
-        if m:
-            top5.append({
-                'rank': int(m.group(1)),
-                '代码': m.group(2),
-                '名称': m.group(3),
-                'pred_close': float(m.group(4)),   # 盘前收盘价（昨收）
-                'pred_return': float(m.group(5)) / 100,
-                'confidence': float(m.group(6)),
-                'weight': float(m.group(7)) / 100,
-            })
-        if len(top5) == 5:
-            break
+    top_blocks = re.findall(
+        r'###\s+TOP\s+(\d+)\s*[—–-]\s*(\S+)\s+`([^`]+)`(.*?)(?=###|---|$)',
+        content, re.DOTALL
+    )
+
+    if top_blocks:
+        for rank_str, name, code, block in top_blocks:
+            # 解析小表格中的数据行
+            # | ¥36.01 | **+0.1659%** | 84.72% | 50% |
+            m = re.search(
+                r'\|\s*[¥￥]?([\d.]+)\s*\|\s*\*{0,2}([+-]?[\d.]+)%\*{0,2}\s*\|\s*([\d.]+)%\s*\|\s*([\d.]+)%\s*\|',
+                block
+            )
+            if m:
+                top5.append({
+                    'rank': int(rank_str),
+                    '代码': code,
+                    '名称': name,
+                    'pred_close': float(m.group(1)),
+                    'pred_return': float(m.group(2)) / 100,
+                    'confidence': float(m.group(3)) / 100,
+                    'weight': float(m.group(4)) / 100,
+                })
+            if len(top5) >= 5:
+                break
+    else:
+        # 旧格式解析
+        in_top5 = False
+        for line in content.splitlines():
+            if '推荐买入' in line and 'TOP 5' in line:
+                in_top5 = True
+                continue
+            if in_top5 and line.startswith('##') and '推荐买入' not in line:
+                break
+            if not in_top5:
+                continue
+            if '代码' in line or '----' in line or '排名' in line:
+                continue
+            m = re.match(
+                r'\|\s*(\d+)\s*\|\s*((?:sh|sz)\.\d{6})\s*\|\s*(\S+)\s*\|\s*([\d.]+)\s*\|\s*([+-]?[\d.]+)%\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)%\s*\|',
+                line
+            )
+            if m:
+                top5.append({
+                    'rank': int(m.group(1)),
+                    '代码': m.group(2),
+                    '名称': m.group(3),
+                    'pred_close': float(m.group(4)),
+                    'pred_return': float(m.group(5)) / 100,
+                    'confidence': float(m.group(6)),
+                    'weight': float(m.group(7)) / 100,
+                })
+            if len(top5) == 5:
+                break
 
     return strategy_date, exec_date, top5, False
 

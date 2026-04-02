@@ -114,12 +114,12 @@ def generate_stock_report(stock_code, target_date=None):
     pct = 1 - (rank - 1) / total
 
     # 判断建议
-    if pred_return > 0.003 and confidence > 0.6:
+    if pred_return > 0.005 and confidence > 0.6:
         advice = "强烈推荐买入"
-        advice_detail = "预测收益率较高且置信度强，建议积极关注"
-    elif pred_return > 0.001 and confidence > latest['confidence'].median():
+        advice_detail = "预测收益率较高且置信度强，建议积极关注（持有5个交易日）"
+    elif pred_return > 0.002 and confidence > 0.5:
         advice = "建议买入"
-        advice_detail = "预测有正向收益且置信度高于中位数"
+        advice_detail = "预测有正向收益且置信度高于阈值（持有5个交易日）"
     elif pred_return > 0:
         advice = "谨慎关注"
         advice_detail = "预测有正向收益但信号较弱，可少量仓位试探"
@@ -194,11 +194,17 @@ def generate_today_strategy(target_date=None):
     print("生成今日交易决策...")
     latest, latest_date = _load_latest_data(target_date)
 
-    # 过滤：预测收益率 > 0.1% 且 置信度较高
+    # 过滤：预测收益率 > 0.2% 且 置信度 > 50%
     qualified = latest[
-        (latest['pred_return'] > 0.001) &
-        (latest['confidence'] > latest['confidence'].median())
-    ].head(20)
+        (latest['pred_return'] > 0.002) &
+        (latest['confidence'] > 0.5)
+    ].copy()
+    if len(qualified) > 0:
+        qualified['score'] = qualified['pred_return'] * 0.6 + \
+                             qualified['confidence'] * qualified['pred_return'] * 0.4
+        qualified = qualified.sort_values('score', ascending=False).head(20)
+    else:
+        qualified = qualified.head(0)
 
     exec_date = next_trading_day(latest_date.date())
 
@@ -237,7 +243,7 @@ def generate_today_strategy(target_date=None):
     lines.append("|------|-----:|")
     lines.append(f"| 可预测股票数 | {len(latest):,} 只 |")
     lines.append(f"| 预测收益率 > 0 | {(latest['pred_return'] > 0).sum():,} 只 |")
-    lines.append(f"| 突破 0.1% 阈值 | **{(latest['pred_return'] > 0.001).sum()} 只** |")
+    lines.append(f"| 突破 0.2% 阈值 | **{(latest['pred_return'] > 0.002).sum()} 只** |")
     lines.append(f"| 全市场预测均值 | {latest['pred_return'].mean():.4%} |")
     lines.append(f"| 全市场预测中位数 | {latest['pred_return'].median():.4%} |")
 
