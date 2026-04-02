@@ -354,7 +354,7 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                     # ===== 步骤5：执行买入（T+1日，检查T+1日涨停） =====
                     if buy_candidates:
                         available_cash = cash * 0.95  # 保留5%现金
-                        per_stock_cash = available_cash / max(MAX_POSITIONS, 1)
+                        per_stock_cash = available_cash / max(n_empty, 1)
 
                         for code in buy_candidates:
                             exec_info = exec_data[exec_data['代码'] == code]
@@ -611,24 +611,38 @@ def run_pipeline():
     trade_df.to_csv(os.path.join(OUTPUT_DIR, 'trade_log.csv'), index=False)
     position_df.to_csv(os.path.join(OUTPUT_DIR, 'position_log.csv'), index=False)
 
-    # 保存指标
-    with open(os.path.join(OUTPUT_DIR, 'backtest_metrics.txt'), 'w') as f:
-        f.write("=" * 50 + "\n")
-        f.write("A股量化策略回测报告\n")
-        f.write(f"回测期间: {daily_df.iloc[0]['date'].date()} ~ {daily_df.iloc[-1]['date'].date()}\n")
-        f.write("=" * 50 + "\n\n")
-        f.write("【资产表现】\n")
+    # 保存指标（Markdown格式）
+    md_path = os.path.join(OUTPUT_DIR, 'backtest_metrics.md')
+    with open(md_path, 'w', encoding='utf-8') as f:
+        start_date = daily_df.iloc[0]['date'].date()
+        end_date = daily_df.iloc[-1]['date'].date()
+        f.write(f"# A股量化策略回测报告\n\n")
+        f.write(f"> 回测期间：**{start_date}** ~ **{end_date}**\n\n")
+        f.write("---\n\n")
+
+        f.write("## 资产表现\n\n")
+        f.write("| 指标 | 数值 |\n")
+        f.write("|------|-----:|\n")
         for k, v in metrics.items():
-            f.write(f"  {k}: {v}\n")
-        f.write("\n【交易统计】\n")
-        for k, v in trade_metrics.items():
-            f.write(f"  {k}: {v}\n")
+            f.write(f"| {k} | **{v}** |\n")
+        f.write("\n")
+
+        if trade_metrics:
+            f.write("## 交易统计\n\n")
+            f.write("| 指标 | 数值 |\n")
+            f.write("|------|-----:|\n")
+            for k, v in trade_metrics.items():
+                f.write(f"| {k} | {v} |\n")
+            f.write("\n")
+
+        f.write("---\n\n")
+        f.write("*以上为历史回测结果，不代表未来收益，仅供参考。*\n")
 
     print(f"\n✅ 结果已保存至 {OUTPUT_DIR}/")
     print(f"   - backtest_daily.csv  (每日资产)")
     print(f"   - trade_log.csv       (交易日志，含涨跌停失败记录)")
     print(f"   - position_log.csv    (每日持仓快照)")
-    print(f"   - backtest_metrics.txt (回测指标)")
+    print(f"   - backtest_metrics.md (回测指标，Markdown格式)")
 
     return results, metrics, trade_metrics
 

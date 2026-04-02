@@ -37,16 +37,21 @@ def plot_equity_curve(daily_df: pd.DataFrame):
     fig, ax = plt.subplots(figsize=(14, 6))
 
     dates = pd.to_datetime(daily_df['date'])
-    strategy_ret = daily_df['portfolio_value'] / INITIAL_CAPITAL
+    strategy_pct = (daily_df['portfolio_value'] / INITIAL_CAPITAL - 1) * 100
 
-    ax.plot(dates, strategy_ret, label='策略', color='#e74c3c', linewidth=1.5)
+    ax.plot(dates, strategy_pct, label='策略收益率', color='#e74c3c', linewidth=1.5)
+    ax.fill_between(dates, strategy_pct, 0,
+                    where=(strategy_pct >= 0), color='#e74c3c', alpha=0.1)
+    ax.fill_between(dates, strategy_pct, 0,
+                    where=(strategy_pct < 0), color='#2ecc71', alpha=0.1)
 
-    # 基准线（买入持有=1）
-    ax.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5, label='基准(现金)')
+    # 基准线（0%）
+    ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5, label='基准(0%)')
 
-    ax.set_title('A股量化策略 — 累计净值曲线', fontsize=14, fontweight='bold')
+    ax.set_title('A股量化策略 — 累计收益率曲线', fontsize=14, fontweight='bold')
     ax.set_xlabel('日期')
-    ax.set_ylabel('净值')
+    ax.set_ylabel('累计收益率 (%)')
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:+.0f}%'))
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
@@ -139,7 +144,8 @@ def plot_monthly_returns(daily_df: pd.DataFrame):
     ).unstack(fill_value=0)
 
     fig, ax = plt.subplots(figsize=(14, 5))
-    im = ax.imshow(monthly.values * 100, cmap='RdYlGn', aspect='auto', vmin=-10, vmax=10)
+    # A股惯例：红涨绿跌，使用反转的 RdYlGn_r（正收益=红，负收益=绿）
+    im = ax.imshow(monthly.values * 100, cmap='RdYlGn_r', aspect='auto', vmin=-10, vmax=10)
 
     ax.set_xticks(range(len(monthly.columns)))
     ax.set_xticklabels([f'{m}月' for m in monthly.columns])
@@ -151,8 +157,8 @@ def plot_monthly_returns(daily_df: pd.DataFrame):
         for j in range(len(monthly.columns)):
             val = monthly.values[i, j] * 100
             if not np.isnan(val) and val != 0:
-                ax.text(j, i, f'{val:.1f}%', ha='center', va='center',
-                        fontsize=9, color='black' if abs(val) < 5 else 'white')
+                ax.text(j, i, f'{val:+.1f}%', ha='center', va='center',
+                        fontsize=9, color='white' if abs(val) >= 4 else 'black')
 
     plt.colorbar(im, ax=ax, label='月度收益率 (%)')
     ax.set_title('月度收益率热力图', fontsize=14, fontweight='bold')

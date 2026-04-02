@@ -153,7 +153,8 @@ def generate_stock_report(stock_code, target_date=None):
     exec_date = next_trading_day(latest_date.date(), known_trading_days=known_days)
     lines = []
     lines.append(f"# 📊 {stock_name}（{full_code}）· 今日决策\n")
-    lines.append(f"> **执行日**：{exec_date}（盘前集合竞价）\n")
+    lines.append(f"> **决策基准日**：{latest_date.date()}  \n")
+    lines.append(f"> **决策应用日期**：{exec_date}（盘前集合竞价）\n")
 
     lines.append("---\n")
     lines.append("## 📈 预测摘要\n")
@@ -229,60 +230,75 @@ def generate_today_strategy(target_date=None):
     # ===== 构建Markdown报告 =====
     lines = []
     lines.append(f"# 📊 A股量化策略 · 今日决策\n")
-    lines.append(f"> **执行日**：{exec_date}（盘前集合竞价）\n")
+    lines.append(f"| 决策基准日 | 执行日期 |")
+    lines.append(f"|:----------:|:--------:|")
+    lines.append(f"| {latest_date.date()} | **{exec_date}**（盘前集合竞价） |\n")
+    lines.append("---\n")
+
+    # 市场概况
+    n_total = len(latest)
+    n_positive = (latest['pred_return'] > 0).sum()
+    n_qualified = (latest['pred_return'] > 0.002).sum()
+    mkt_mean = latest['pred_return'].mean()
+    mkt_median = latest['pred_return'].median()
+    # 市场情绪：多头/空头/中性
+    bullish_pct = n_positive / n_total if n_total > 0 else 0
+    if bullish_pct >= 0.65:
+        sentiment = "🟢 偏多"
+    elif bullish_pct >= 0.45:
+        sentiment = "🟡 中性"
+    else:
+        sentiment = "🔴 偏空"
+
+    lines.append("## 📈 市场概况\n")
+    lines.append("| 指标 | 数值 | 指标 | 数值 |")
+    lines.append("|------|-----:|------|-----:|")
+    lines.append(f"| 可预测股票数 | {n_total:,} 只 | 市场情绪 | {sentiment} |")
+    lines.append(f"| 预测收益率 > 0 | {n_positive:,} 只（{bullish_pct:.0%}） | 突破 0.2% 阈值 | **{n_qualified:,} 只** |")
+    lines.append(f"| 全市场预测均值 | {mkt_mean:+.4%} | 全市场预测中位数 | {mkt_median:+.4%} |\n")
     lines.append("---\n")
 
     # 推荐买入TOP5
     lines.append("## 🏆 今日推荐买入\n")
-
     top5 = qualified.head(5)
     n_buy = len(top5)
 
     if n_buy == 0:
-        lines.append("> **建议空仓**：当前无股票满足买入条件\n")
+        lines.append("> **建议空仓**：当前无股票满足买入条件（预测收益率 > 0.2% 且置信度 > 50%）\n")
     else:
+        lines.append(f"> 共 **{n_buy}** 只股票满足买入条件，建议各 **{1/n_buy:.0%}** 仓位，持有 5 个交易日\n")
+        lines.append("| # | 名称 | 代码 | 收盘价 | 预测收益率 | 置信度 | 建议仓位 |")
+        lines.append("|:-:|:----:|:----:|-------:|-----------:|-------:|:--------:|")
         for i, (_, row) in enumerate(top5.iterrows()):
             weight = 1.0 / max(n_buy, 1)
-            lines.append(f"### TOP {i+1} — {row.get('名称', 'N/A')}　`{row['代码']}`\n")
-            lines.append("| 收盘价 | 预测收益率 | 置信度 | 建议仓位 |")
-            lines.append("|:------:|:---------:|:------:|:--------:|")
             lines.append(
-                f"| ¥{row.get('close', 0):.2f}"
-                f" | **{row['pred_return']:+.4%}**"
-                f" | {row['confidence']:.2%}"
-                f" | {weight:.0%} |\n"
+                f"| **{i+1}** | {row.get('名称', 'N/A')} | `{row['代码']}`"
+                f" | ¥{row.get('close', 0):.2f}"
+                f" | 🔺 **{row['pred_return']:+.4%}**"
+                f" | {row['confidence']:.1%}"
+                f" | {weight:.0%} |"
             )
-
-    lines.append("---\n")
-
-    # 市场概况
-    lines.append("## 📈 市场概况\n")
-    lines.append("| 指标 | 数值 |")
-    lines.append("|------|-----:|")
-    lines.append(f"| 可预测股票数 | {len(latest):,} 只 |")
-    lines.append(f"| 预测收益率 > 0 | {(latest['pred_return'] > 0).sum():,} 只 |")
-    lines.append(f"| 突破 0.2% 阈值 | **{(latest['pred_return'] > 0.002).sum()} 只** |")
-    lines.append(f"| 全市场预测均值 | {latest['pred_return'].mean():.4%} |")
-    lines.append(f"| 全市场预测中位数 | {latest['pred_return'].median():.4%} |")
-
     lines.append("\n---\n")
 
     # TOP20详细列表
-    lines.append("## 📋 潜力排名 TOP 20\n")
+    lines.append("## 📋 全市场潜力排名 TOP 20\n")
     lines.append("> 全市场排名，不限制阈值\n")
-    lines.append("| # | 代码 | 名称 | 预测收益率 | 置信度 | 收盘价 |")
-    lines.append("|:-:|------|------|----------:|-------:|-------:|")
+    lines.append("| # | 名称 | 代码 | 收盘价 | 预测收益率 | 置信度 |")
+    lines.append("|:-:|:----:|:----:|-------:|-----------:|-------:|")
     top20_all = latest.head(20)
     for i, (_, row) in enumerate(top20_all.iterrows()):
+        arrow = "🔺" if row['pred_return'] > 0 else "🔻"
+        in_top5 = "**" if i < n_buy else ""
         lines.append(
-            f"| {i+1} | {row['代码']} | {row.get('名称', 'N/A')} "
-            f"| **{row['pred_return']:+.4%}**"
-            f" | {row['confidence']:.2%}"
-            f" | {row.get('close', 0):.2f} |"
+            f"| {in_top5}{i+1}{in_top5} | {in_top5}{row.get('名称', 'N/A')}{in_top5}"
+            f" | `{row['代码']}`"
+            f" | ¥{row.get('close', 0):.2f}"
+            f" | {arrow} {row['pred_return']:+.4%}"
+            f" | {row['confidence']:.1%} |"
         )
 
     lines.append("\n---\n")
-    lines.append("⚠️ *以上为模型预测结果，仅供参考，不构成投资建议。严格遵守 T+1 规则，以集合竞价开盘价成交。*")
+    lines.append("> ⚠️ 以上为模型预测结果，仅供参考，不构成投资建议。严格遵守 T+1 规则，以集合竞价开盘价成交。")
 
     report = "\n".join(lines)
 
@@ -292,8 +308,16 @@ def generate_today_strategy(target_date=None):
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write(report)
 
+    # 归档到历史目录
+    history_dir = os.path.join(OUTPUT_DIR, 'history')
+    os.makedirs(history_dir, exist_ok=True)
+    archive_path = os.path.join(history_dir, f'strategy_{latest_date.date()}.md')
+    with open(archive_path, 'w', encoding='utf-8') as f:
+        f.write(report)
+
     print(report)
     print(f"\n策略已保存至 {report_path}")
+    print(f"历史归档: {archive_path}")
 
     return report
 
