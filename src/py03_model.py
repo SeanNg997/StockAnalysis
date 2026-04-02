@@ -14,6 +14,7 @@ import lightgbm as lgb
 import os
 import warnings
 import gc
+from concurrent.futures import ThreadPoolExecutor
 
 warnings.filterwarnings('ignore')
 
@@ -57,6 +58,36 @@ def get_feature_columns(df: pd.DataFrame) -> list:
                'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM', 'label',
                'ma_5', 'ma_10', 'ma_20', 'ma_60'}
     return [c for c in df.columns if c not in exclude]
+
+
+def _train_single_model(seed, params, X_train, y_train, X_val, y_val):
+    """训练单个LightGBM模型（用于并行执行）
+
+    Args:
+        seed: 随机种子
+        params: LightGBM参数
+        X_train, y_train: 训练数据
+        X_val, y_val: 验证数据
+
+    Returns:
+        tuple: (seed, trained_model)
+    """
+    params_copy = params.copy()
+    params_copy['seed'] = seed * 42
+    params_copy['feature_fraction_seed'] = seed * 42
+    params_copy['bagging_seed'] = seed * 42
+
+    dtrain = lgb.Dataset(X_train, label=y_train)
+    dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
+
+    model = lgb.train(
+        params_copy,
+        dtrain,
+        num_boost_round=800,
+        valid_sets=[dval],
+        callbacks=[lgb.early_stopping(50, verbose=False)],
+    )
+    return seed, model
 
 
 def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
@@ -118,21 +149,20 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
         print(f"单日预测模式: 目标日 {target_date.date()}")
         print(f"训练集: {len(X_train):,} 行, 验证集: {len(X_val):,} 行")
 
-        models = []
-        for seed in range(N_ENSEMBLE):
-            params = LGB_PARAMS.copy()
-            params['seed'] = seed * 42
-            params['feature_fraction_seed'] = seed * 42
-            params['bagging_seed'] = seed * 42
-            dtrain = lgb.Dataset(X_train, label=y_train)
-            dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
-            model = lgb.train(
-                params, dtrain, num_boost_round=800,
-                valid_sets=[dval],
-                callbacks=[lgb.early_stopping(50, verbose=False)],
-            )
-            models.append(model)
-            print(f"  模型 {seed+1}/{N_ENSEMBLE} 完成, best_iter={model.best_iteration}")
+        # 并行训练Ensemble模型
+        models_dict = {}
+        with ThreadPoolExecutor(max_workers=N_ENSEMBLE) as executor:
+            futures = [
+                executor.submit(_train_single_model, seed, LGB_PARAMS,
+                               X_train, y_train, X_val, y_val)
+                for seed in range(N_ENSEMBLE)
+            ]
+            for future in futures:
+                seed, model = future.result()
+                models_dict[seed] = model
+                print(f"  模型 {seed+1}/{N_ENSEMBLE} 完成, best_iter={model.best_iteration}")
+
+        models = [models_dict[seed] for seed in range(N_ENSEMBLE)]
 
         del X_train, y_train, X_val, y_val
         gc.collect()
@@ -220,25 +250,19 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
             X_val = X_val[valid_val]
             y_val = y_val[valid_val]
 
-            # 训练Ensemble
-            models = []
-            for seed in range(N_ENSEMBLE):
-                params = LGB_PARAMS.copy()
-                params['seed'] = seed * 42
-                params['feature_fraction_seed'] = seed * 42
-                params['bagging_seed'] = seed * 42
+            # 并行训练Ensemble模型
+            models_dict = {}
+            with ThreadPoolExecutor(max_workers=N_ENSEMBLE) as executor:
+                futures = [
+                    executor.submit(_train_single_model, seed, LGB_PARAMS,
+                                   X_train, y_train, X_val, y_val)
+                    for seed in range(N_ENSEMBLE)
+                ]
+                for future in futures:
+                    seed, model = future.result()
+                    models_dict[seed] = model
 
-                dtrain = lgb.Dataset(X_train, label=y_train)
-                dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
-
-                model = lgb.train(
-                    params,
-                    dtrain,
-                    num_boost_round=800,
-                    valid_sets=[dval],
-                    callbacks=[lgb.early_stopping(50, verbose=False)],
-                )
-                models.append(model)
+            models = [models_dict[seed] for seed in range(N_ENSEMBLE)]
 
             last_train_idx = day_idx
             if day_idx % (RETRAIN_DAYS * 3) == bt_start_idx % (RETRAIN_DAYS * 3):
