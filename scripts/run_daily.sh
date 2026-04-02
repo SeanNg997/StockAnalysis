@@ -82,7 +82,6 @@ if [ -n "$STOCK_CODE" ]; then
     python "$SRC_DIR/py05_today.py" --date "$DATE_ARG" "$STOCK_CODE"
 else
     python "$SRC_DIR/py05_today.py" --date "$DATE_ARG"
-    python "$SRC_DIR/py06_report.py"
 fi
 
 echo ""

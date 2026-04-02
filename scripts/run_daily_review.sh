@@ -78,9 +78,9 @@ content = open('$STRATEGY_MD', encoding='utf-8').read()
 m = re.search(r'\*{0,2}决策应用日期\*{0,2}[:：]\*{0,2}\s*(\d{4}-\d{2}-\d{2})', content)
 print(m.group(1).replace('-', '') if m else '')
 ")
-REVIEW_FILE="$OUTPUT_DIR/today_review_${EXEC_DATE}.png"
+REVIEW_FILE="$OUTPUT_DIR/today_review_${EXEC_DATE}.md"
 if [ -f "$REVIEW_FILE" ]; then
-    echo "  完成! 评估图: $REVIEW_FILE"
+    echo "  完成! 评估报告: $REVIEW_FILE"
 else
     echo "  完成!"
 fi

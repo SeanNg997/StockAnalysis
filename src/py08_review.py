@@ -5,13 +5,13 @@ py08_review.py — 盘后决策评估模块
 1. 基于T-1日预测结果生成T日决策（买入推荐TOP5 + 潜力TOP20）
 2. 读取T日实际行情（需先运行 py00 --update 更新数据）
 3. 评估T日买入推荐和TOP20的预测准确度
-4. 生成评估报告（Markdown）和可视化图（PNG）
+4. 生成评估报告（Markdown）
 
 日期定义：
   T-1日 = 决策基准日（预测数据来源日）
   T日   = 评估日（以T日开盘买入，用T日收盘评估首日表现）
   注意：T+1日策略报告由 py05_today.py 生成（today_strategy.md），
-        本模块输出独立文件（today_review_*.md / .png），不会覆盖。
+        本模块输出独立文件（today_review_*.md），不会覆盖。
 
 评估口径：
   买入价 = T日开盘价
@@ -50,24 +50,43 @@ FEATURE_PKL = os.path.join(BASE_DIR, 'data', 'features.pkl')
 MIN_PRED_RETURN = 0.002
 MIN_CONFIDENCE = 0.5
 
-# 评估时间窗口：收盘(15:00) + 1小时 = 16:00
-REVIEW_HOUR = 16
-
-
 # ── 时间检查 ─────────────────────────────────────────────────────
 
+def is_trading_day(check_date: date) -> bool:
+    """判断是否为交易日（周一到周五）"""
+    return check_date.weekday() < 5
+
+
 def check_review_time(force: bool = False, eval_date: date = None) -> None:
-    """检查当前时间是否满足评估条件（16:00之后）。
-    指定历史日期时自动跳过时间检查。"""
+    """检查当前时间是否满足评估条件。
+
+    允许条件：
+    1. 指定 --force 标志
+    2. 指定历史日期（eval_date < 今日）
+    3. 当前时间在第二个交易日开盘前都可以（即从今天 15:00 到明天 09:30 前都行，
+       只要没有跨越到后一个交易日的 09:30 之后）
+    """
     if force or (eval_date is not None and eval_date < datetime.now().date()):
         return
+
     now = datetime.now()
-    if now.weekday() >= 5:
-        sys.exit("今日为周末，非交易日，无需评估。")
-    if now.hour < REVIEW_HOUR:
-        remain = REVIEW_HOUR - now.hour
-        sys.exit(f"当前时间 {now.strftime('%H:%M')}，请在 {REVIEW_HOUR}:00 之后运行评估"
-                 f"（还需等待约 {remain} 小时）。")
+
+    # 计算第二个交易日开盘时间（09:30）
+    check_date = now.date()
+    days_offset = 1
+    next_trading_day = check_date
+    while days_offset <= 3:  # 最多向后查找3天
+        next_trading_day = check_date + timedelta(days=days_offset)
+        if is_trading_day(next_trading_day):
+            break
+        days_offset += 1
+
+    # 第二个交易日开盘时间（09:30）
+    next_open_time = datetime.combine(next_trading_day, datetime.min.time().replace(hour=9, minute=30))
+
+    if now >= next_open_time:
+        sys.exit(f"当前时间 {now.strftime('%Y-%m-%d %H:%M')} 已超过第二交易日开盘时间 {next_open_time.strftime('%Y-%m-%d %H:%M')}，"
+                 f"无法评估。请在下个评估周期进行。")
 
 
 # ── 数据加载 ─────────────────────────────────────────────────────
@@ -659,9 +678,10 @@ def run_review(force: bool = False, eval_date: date = None) -> None:
         f.write(md_report)
     print(f"评估报告已保存: {md_path}")
 
-    # 9. 生成 PNG 图表
-    png_path = os.path.join(OUTPUT_DIR, f"today_review_{t_day_date.strftime('%Y%m%d')}.png")
-    plot_review(top5_eval, top20_eval, market, pred_date, t_day, png_path)
+    # 9. PNG 图表已禁用 - 仅输出 Markdown 报告
+    # 如需恢复图表，请取消注释以下代码：
+    # png_path = os.path.join(OUTPUT_DIR, f"today_review_{t_day_date.strftime('%Y%m%d')}.png")
+    # plot_review(top5_eval, top20_eval, market, pred_date, t_day, png_path)
 
     print("\n评估完成。")
 
