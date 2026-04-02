@@ -678,10 +678,9 @@ def run_review(force: bool = False, eval_date: date = None) -> None:
         f.write(md_report)
     print(f"评估报告已保存: {md_path}")
 
-    # 9. PNG 图表已禁用 - 仅输出 Markdown 报告
-    # 如需恢复图表，请取消注释以下代码：
-    # png_path = os.path.join(OUTPUT_DIR, f"today_review_{t_day_date.strftime('%Y%m%d')}.png")
-    # plot_review(top5_eval, top20_eval, market, pred_date, t_day, png_path)
+    # 9. 生成 PNG 图表
+    png_path = os.path.join(OUTPUT_DIR, f"today_review_{t_day_date.strftime('%Y%m%d')}.png")
+    plot_review(top5_eval, top20_eval, market, pred_date, t_day, png_path)
 
     print("\n评估完成。")
 
