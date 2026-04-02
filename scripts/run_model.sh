@@ -21,28 +21,33 @@ echo "=============================================="
 
 # Step 1: 增量更新数据
 echo ""
-echo "[Step 1/5] 增量更新数据..."
+echo "[Step 1/6] 增量更新数据..."
 python "$SRC_DIR/py00_fetch_stock_data.py" --update
 
 # Step 2: 数据清洗（全量）
 echo ""
-echo "[Step 2/5] 数据清洗..."
+echo "[Step 2/6] 数据清洗..."
 python "$SRC_DIR/py01_data_loader.py"
 
 # Step 3: 特征工程（全量）
 echo ""
-echo "[Step 3/5] 特征工程..."
+echo "[Step 3/6] 特征工程..."
 python "$SRC_DIR/py02_features.py"
 
 # Step 4: 全量 walk-forward 训练 + 预测
 echo ""
-echo "[Step 4/5] Walk-Forward 训练与预测..."
+echo "[Step 4/6] Walk-Forward 训练与预测..."
 python "$SRC_DIR/py03_model.py"
 
 # Step 5: 回测报告
 echo ""
-echo "[Step 5/5] 生成回测报告..."
+echo "[Step 5/6] 生成回测报告..."
 python "$SRC_DIR/py04_backtest.py"
+
+# Step 6: 可视化图表
+echo ""
+echo "[Step 6/6] 生成可视化图表..."
+python "$SRC_DIR/py06_report.py"
 
 echo ""
 echo "=============================================="

@@ -107,26 +107,25 @@ def run_backtest(merged: pd.DataFrame) -> dict:
     """
     执行回测
 
-    核心逻辑：
-    - 每个交易日T，在T-1日收盘后用模型打分
-    - T日开盘集合竞价执行交易
-    - 买入用T日open，卖出用T日open
-    - T+1约束：当日买入的股票次日才可卖出
+    核心逻辑（时序严格正确）：
+    - 决策日T：T日收盘后，用T日特征和pred_return选股
+    - 执行日T+1：T+1日开盘集合竞价，用open[T+1]成交
+    - 涨跌停检查：基于T+1日的open和T日的close
+    - T+1约束：T+1日买入的股票，T+2日才可卖出
     """
     all_dates = sorted(merged['date'].unique())
     print(f"回测期间: {all_dates[0].date()} ~ {all_dates[-1].date()}, 共 {len(all_dates)} 个交易日")
 
-    # 为了检查涨跌停，需要前日数据
     # 构建 (date, 代码) -> row 的映射
     print("构建数据索引...")
     date_stock_map = {}
     for _, row in merged.iterrows():
         date_stock_map[(row['date'], row['代码'])] = row
 
-    # 构建日期到前一交易日的映射
-    prev_date_map = {}
-    for i in range(1, len(all_dates)):
-        prev_date_map[all_dates[i]] = all_dates[i-1]
+    # 构建日期索引映射：next_date_map[T] = T+1
+    next_date_map = {}
+    for i in range(len(all_dates) - 1):
+        next_date_map[all_dates[i]] = all_dates[i+1]
 
     # ============ 回测状态 ============
     cash = INITIAL_CAPITAL
@@ -137,64 +136,89 @@ def run_backtest(merged: pd.DataFrame) -> dict:
     daily_records = []    # 每日资产记录
     trade_log = []        # 交易日志
 
-    for day_idx, current_date in enumerate(all_dates):
-        # 获取当日所有股票数据
-        day_data = merged[merged['date'] == current_date]
-        prev_date = prev_date_map.get(current_date)
+    # 遍历每个决策日T（最后一天没有T+1，无法执行交易）
+    for day_idx in range(len(all_dates)):
+        decision_date = all_dates[day_idx]  # 决策日T
+        exec_date = next_date_map.get(decision_date)  # 执行日T+1
+
+        # 获取决策日数据（用于选股排名）
+        decision_data = merged[merged['date'] == decision_date]
+
+        if exec_date is None:
+            # 最后一个交易日：没有执行日，仅记录资产
+            total_value = cash
+            for code, pos in positions.items():
+                key = (decision_date, code)
+                if key in date_stock_map:
+                    current_price = date_stock_map[key]['close']
+                    pos['current_price'] = current_price
+                else:
+                    current_price = pos['current_price']
+                total_value += pos['shares'] * current_price
+
+            daily_records.append({
+                'date': decision_date,
+                'cash': cash,
+                'portfolio_value': total_value,
+                'n_positions': len(positions),
+                'n_trades': 0,
+            })
+            continue
+
+        # 获取执行日数据（用于获取成交价和涨跌停判断）
+        exec_data = merged[merged['date'] == exec_date]
 
         # ===== 步骤1：解锁昨日买入的股票 =====
         locked_stocks.clear()
 
-        # ===== 步骤2：计算当前持仓市值 =====
-        portfolio_value = cash
-        positions_to_remove = []
+        # ===== 步骤2：用决策日pred_return选股，在执行日成交 =====
 
-        for code, pos in positions.items():
-            key = (current_date, code)
-            if key in date_stock_map:
-                row = date_stock_map[key]
-                pos['current_price'] = row['open']  # 以当日open估值
-                portfolio_value += pos['shares'] * row['open']
-            else:
-                # 股票停牌，用上一个已知价格
-                portfolio_value += pos['shares'] * pos.get('current_price', pos['buy_price'])
-
-        # ===== 步骤3：决定卖出 =====
-        # 获取当日持仓股的预测
+        # --- 卖出决策 ---
         sell_list = []
         for code, pos in positions.items():
-            day_pred = day_data[day_data['代码'] == code]
-            if len(day_pred) == 0:
-                continue  # 停牌，不能交易
+            if code in locked_stocks:
+                continue  # T+1：当日买入的不能卖出
 
-            pred_ret = day_pred.iloc[0]['pred_return']
-            row_today = day_pred.iloc[0]
+            # 使用决策日的 pred_return 判断是否卖出
+            dec_pred = decision_data[decision_data['代码'] == code]
+            if len(dec_pred) == 0:
+                continue  # 决策日无数据（停牌）
 
-            # 检查跌停（跌停不能卖出）
-            prev_key = (prev_date, code) if prev_date else None
-            row_prev = date_stock_map.get(prev_key) if prev_key else None
-            _, is_limit_down = check_limit(row_today, row_prev)
+            # 检查执行日是否可交易
+            exec_info = exec_data[exec_data['代码'] == code]
+            if len(exec_info) == 0:
+                continue  # 执行日停牌，无法卖出
+
+            # 检查执行日跌停（用决策日close作为前收盘价）
+            row_exec = exec_info.iloc[0]
+            row_decision = dec_pred.iloc[0]
+            _, is_limit_down = check_limit(row_exec, row_decision)
 
             if is_limit_down:
-                continue  # 跌停，不能卖出
+                continue  # 执行日跌停开盘，不能卖出
 
-            # 卖出条件：预测收益率 < 0 或 不在当日top5中
+            pred_ret = dec_pred.iloc[0]['pred_return']
             if pred_ret < 0:
                 sell_list.append(code)
 
-        # 如果持仓股不在当日top选股名单中，也考虑卖出
-        # 先获取当日选股排名
-        day_ranked = day_data[day_data['pred_return'] > MIN_PRED_RETURN].sort_values(
+        # 选股排名（基于决策日的 pred_return）
+        day_ranked = decision_data[decision_data['pred_return'] > MIN_PRED_RETURN].sort_values(
             'pred_return', ascending=False
         )
 
-        # 当日top候选（排除涨停）
+        # 当日top候选（检查执行日涨停）
         top_candidates = []
         for _, cand in day_ranked.iterrows():
             code = cand['代码']
-            prev_key = (prev_date, code) if prev_date else None
-            row_prev = date_stock_map.get(prev_key) if prev_key else None
-            is_limit_up, _ = check_limit(cand, row_prev)
+
+            # 检查执行日是否可买入
+            exec_info = exec_data[exec_data['代码'] == code]
+            if len(exec_info) == 0:
+                continue  # 执行日停牌
+
+            # 检查执行日涨停（用决策日close作为前收盘价）
+            row_exec = exec_info.iloc[0]
+            is_limit_up, _ = check_limit(row_exec, cand)
             if not is_limit_up:
                 top_candidates.append(code)
             if len(top_candidates) >= MAX_POSITIONS * 2:
@@ -204,42 +228,49 @@ def run_backtest(merged: pd.DataFrame) -> dict:
 
         # 持仓中不在top名单的也卖出
         for code in list(positions.keys()):
+            if code in locked_stocks:
+                continue
             if code not in top_set and code not in sell_list:
-                day_pred = day_data[day_data['代码'] == code]
-                if len(day_pred) == 0:
+                # 检查执行日是否可交易
+                exec_info = exec_data[exec_data['代码'] == code]
+                if len(exec_info) == 0:
                     continue
-                row_today = day_pred.iloc[0]
-                prev_key = (prev_date, code) if prev_date else None
-                row_prev = date_stock_map.get(prev_key) if prev_key else None
-                _, is_limit_down = check_limit(row_today, row_prev)
+
+                dec_pred = decision_data[decision_data['代码'] == code]
+                if len(dec_pred) == 0:
+                    continue
+
+                # 检查执行日跌停
+                row_exec = exec_info.iloc[0]
+                row_decision = dec_pred.iloc[0]
+                _, is_limit_down = check_limit(row_exec, row_decision)
                 if not is_limit_down:
                     sell_list.append(code)
 
         sell_list = list(set(sell_list))
 
-        # 执行卖出
+        # 执行卖出（用执行日T+1的open价）
         for code in sell_list:
             if code not in positions:
                 continue
-            day_info = day_data[day_data['代码'] == code]
-            if len(day_info) == 0:
+            exec_info = exec_data[exec_data['代码'] == code]
+            if len(exec_info) == 0:
                 continue
 
             pos = positions[code]
-            sell_price = day_info.iloc[0]['open']
+            sell_price = exec_info.iloc[0]['open']  # T+1日open
             sell_amount = pos['shares'] * sell_price
             sell_cost = sell_amount * (SELL_COMMISSION + STAMP_TAX)
             cash += sell_amount - sell_cost
 
-            # 计算买入成本和收益
             buy_cost_total = pos['shares'] * pos['buy_price'] * (1 + BUY_COMMISSION)
             profit = sell_amount - sell_cost - buy_cost_total
             profit_pct = (profit / buy_cost_total * 100) if buy_cost_total > 0 else 0
 
             trade_log.append({
-                'date': current_date,
+                'date': exec_date,  # 记录执行日
                 '代码': code,
-                '名称': day_info.iloc[0]['名称'],
+                '名称': exec_info.iloc[0]['名称'],
                 'action': 'SELL',
                 'price': sell_price,
                 'shares': pos['shares'],
@@ -251,32 +282,33 @@ def run_backtest(merged: pd.DataFrame) -> dict:
 
             del positions[code]
 
-        # ===== 步骤4：决定买入 =====
+        # --- 买入决策 ---
+        sold_today = set(sell_list)
         n_empty = MAX_POSITIONS - len(positions)
         if n_empty > 0 and len(top_candidates) > 0:
-            # 过滤掉已持仓的
-            buy_candidates = [c for c in top_candidates if c not in positions][:n_empty]
+            buy_candidates = [c for c in top_candidates
+                              if c not in positions and c not in sold_today][:n_empty]
 
             if buy_candidates:
-                # 计算当前可用资金
                 available_cash = cash
 
-                # 基于预测收益率分配仓位
-                buy_info = day_data[day_data['代码'].isin(buy_candidates)].copy()
-                buy_info = buy_info.sort_values('pred_return', ascending=False)
+                # 获取执行日的买入价格
+                exec_buy_info = exec_data[exec_data['代码'].isin(buy_candidates)].copy()
+                # 按决策日的pred_return排序
+                dec_info = decision_data[decision_data['代码'].isin(buy_candidates)][['代码', 'pred_return']]
+                exec_buy_info = exec_buy_info.merge(dec_info, on='代码', suffixes=('', '_dec'))
+                exec_buy_info = exec_buy_info.sort_values('pred_return_dec', ascending=False)
 
-                # 等权分配（简单且稳健）
-                n_buy = min(len(buy_info), n_empty)
-                per_stock_cash = available_cash / max(n_buy, 1) * 0.98  # 预留2%现金
+                n_buy = min(len(exec_buy_info), n_empty)
+                per_stock_cash = available_cash / max(n_buy, 1) * 0.98
 
-                for _, cand in buy_info.head(n_buy).iterrows():
+                for _, cand in exec_buy_info.head(n_buy).iterrows():
                     code = cand['代码']
-                    buy_price = cand['open']
+                    buy_price = cand['open']  # T+1日open
 
                     if buy_price <= 0:
                         continue
 
-                    # 计算可买股数（100股为单位）
                     shares = int(per_stock_cash / buy_price / 100) * 100
                     if shares < 100:
                         continue
@@ -288,13 +320,13 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                     positions[code] = {
                         'shares': shares,
                         'buy_price': buy_price,
-                        'buy_date': current_date,
+                        'buy_date': exec_date,
                         'current_price': buy_price,
                     }
                     locked_stocks.add(code)
 
                     trade_log.append({
-                        'date': current_date,
+                        'date': exec_date,  # 记录执行日
                         '代码': code,
                         '名称': cand['名称'],
                         'action': 'BUY',
@@ -306,29 +338,29 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                         'profit_pct': np.nan,
                     })
 
-        # ===== 步骤5：记录当日资产 =====
+        # ===== 步骤3：记录决策日资产（用决策日close估值） =====
         total_value = cash
         for code, pos in positions.items():
-            key = (current_date, code)
+            key = (decision_date, code)
             if key in date_stock_map:
-                current_price = date_stock_map[key]['close']  # 用收盘价估值
+                current_price = date_stock_map[key]['close']
                 pos['current_price'] = current_price
             else:
                 current_price = pos['current_price']
             total_value += pos['shares'] * current_price
 
         daily_records.append({
-            'date': current_date,
+            'date': decision_date,
             'cash': cash,
             'portfolio_value': total_value,
             'n_positions': len(positions),
-            'n_trades': sum(1 for t in trade_log if t['date'] == current_date),
+            'n_trades': sum(1 for t in trade_log if t['date'] == exec_date),
         })
 
         # 定期打印进度
         if day_idx % 100 == 0:
             ret = (total_value / INITIAL_CAPITAL - 1) * 100
-            print(f"  [{current_date.date()}] 资产: {total_value:,.0f}, "
+            print(f"  [{decision_date.date()}] 资产: {total_value:,.0f}, "
                   f"收益: {ret:+.2f}%, 持仓: {len(positions)}只")
 
     # ===== 转换为DataFrame =====

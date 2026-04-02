@@ -87,18 +87,25 @@ def plot_drawdown(daily_df: pd.DataFrame):
     print(f"  保存: {path}")
 
 
+MAX_POSITIONS = 5  # 最大持仓数量（对应100%仓位）
+
+
 def plot_positions(daily_df: pd.DataFrame):
-    """绘制每日持仓数量"""
+    """绘制每日仓位比例与交易次数"""
     print("绘制持仓数量曲线...")
     fig, axes = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
 
     dates = pd.to_datetime(daily_df['date'])
+    position_pct = daily_df['n_positions'] / MAX_POSITIONS * 100
 
-    # 持仓数量
-    axes[0].bar(dates, daily_df['n_positions'], color='#3498db', alpha=0.7, width=1)
-    axes[0].set_ylabel('持仓数量')
-    axes[0].set_title('每日持仓数量与交易次数', fontsize=14, fontweight='bold')
-    axes[0].set_ylim(0, 6)
+    # 仓位百分比
+    axes[0].bar(dates, position_pct, color='#3498db', alpha=0.7, width=1)
+    axes[0].set_ylabel('仓位比例 (%)')
+    axes[0].set_title('每日仓位比例与交易次数', fontsize=14, fontweight='bold')
+    axes[0].set_ylim(0, 110)
+    axes[0].axhline(y=100, color='#e74c3c', linestyle='--', alpha=0.6, linewidth=1, label='满仓(100%)')
+    axes[0].yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.0f}%'))
+    axes[0].legend(fontsize=9)
     axes[0].grid(True, alpha=0.3)
 
     # 交易次数
