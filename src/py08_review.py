@@ -2,34 +2,40 @@
 py08_review.py — 盘后决策评估模块
 ====================================
 职责：
-1. 解析今日盘前决策（output/today_strategy.md）
-2. 读取今日实际行情（最新月度CSV）
-3. 生成对比可视化图（output/today_review_YYYYMMDD.png）
+1. 基于T-1日预测结果生成T日决策（买入推荐TOP5 + 潜力TOP20）
+2. 读取T日实际行情（需先运行 py00 --update 更新数据）
+3. 评估T日买入推荐和TOP20的预测准确度
+4. 生成评估报告（Markdown）和可视化图（PNG）
+
+日期定义：
+  T-1日 = 决策基准日（预测数据来源日）
+  T日   = 评估日（以T日开盘买入，用T日收盘评估首日表现）
+  注意：T+1日策略报告由 py05_today.py 生成（today_strategy.md），
+        本模块输出独立文件（today_review_*.md / .png），不会覆盖。
 
 评估口径：
-  策略为"T+1开盘买入 → 持有5个交易日"
-  今日评估 = 买入价（今日开盘）→ 收盘价（浮动盈亏，持有中）
-  完整收益需持有期满才能确认
+  买入价 = T日开盘价
+  首日浮盈 = (T日收盘 - T日开盘) / T日开盘
+  完整收益 = 持有5天后开盘卖出（此处仅评估首日）
 
 用法：
-  python src/py08_review.py                        # 评估今日
-  python src/py08_review.py --force                # 跳过时间检查（调试用）
-  python src/py08_review.py --date 2025-03-15      # 评估指定历史日期（自动跳过时间检查）
+  python src/py08_review.py                        # 评估今日(T日)
+  python src/py08_review.py --force                # 跳过时间检查
+  python src/py08_review.py --date 2025-03-15      # 评估指定历史日期
 """
 
 import os
 import sys
-import glob
-import re
-from datetime import datetime, date, time as dtime
+import glob as _glob
+from datetime import datetime, date, timedelta
 
 import pandas as pd
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 
+matplotlib.use('Agg')
 matplotlib.rcParams['font.family'] = ['PingFang HK', 'Hiragino Sans GB', 'STHeiti',
                                        'Microsoft YaHei', 'SimHei', 'DejaVu Sans']
 matplotlib.rcParams['axes.unicode_minus'] = False
@@ -37,7 +43,12 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
 DATA_DIR = os.path.join(BASE_DIR, 'data')
-STRATEGY_MD = os.path.join(OUTPUT_DIR, 'today_strategy.md')
+PREDICT_PKL = os.path.join(BASE_DIR, 'data', 'predictions.pkl')
+FEATURE_PKL = os.path.join(BASE_DIR, 'data', 'features.pkl')
+
+# 策略参数（与 py04 一致）
+MIN_PRED_RETURN = 0.002
+MIN_CONFIDENCE = 0.5
 
 # 评估时间窗口：收盘(15:00) + 1小时 = 16:00
 REVIEW_HOUR = 16
@@ -55,116 +66,27 @@ def check_review_time(force: bool = False, eval_date: date = None) -> None:
         sys.exit("今日为周末，非交易日，无需评估。")
     if now.hour < REVIEW_HOUR:
         remain = REVIEW_HOUR - now.hour
-        sys.exit(f"当前时间 {now.strftime('%H:%M')}，请在 {REVIEW_HOUR}:00 之后运行评估（还需等待约 {remain} 小时）。")
+        sys.exit(f"当前时间 {now.strftime('%H:%M')}，请在 {REVIEW_HOUR}:00 之后运行评估"
+                 f"（还需等待约 {remain} 小时）。")
 
 
-# ── 解析盘前决策 ──────────────────────────────────────────────────
+# ── 数据加载 ─────────────────────────────────────────────────────
 
-def parse_strategy(md_path: str) -> tuple[date, date, list[dict], bool]:
-    """
-    解析 today_strategy.md，返回：
-    - strategy_date: 决策基准日（执行日前一天）
-    - exec_date: 决策应用日期（执行日）
-    - top5: 推荐买入TOP5列表（每项含代码、名称、预测收益率、建议仓位、收盘价）
-    - is_empty: 是否建议空仓
-
-    支持两种格式：
-    1. 新格式（TOP N 子标题 + 小表格）：
-       ### TOP 1 — 名称　`代码`
-       | 收盘价 | 预测收益率 | 置信度 | 建议仓位 |
-       | ¥36.01 | **+0.1659%** | 84.72% | 50% |
-
-    2. 旧格式（大表格）：
-       | 1 | sh.600053 | 九鼎投资 | 15.04 | +0.3247% | 0.9341 | 20.0% |
-    """
-    with open(md_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-    # 提取执行日（格式：**执行日**：YYYY-MM-DD）
-    m_exec = re.search(r'\*{0,2}执行日\*{0,2}[:：]\s*(\d{4}-\d{2}-\d{2})', content)
-    if not m_exec:
-        # 兼容旧格式
-        m_exec = re.search(r'\*{0,2}决策应用日期\*{0,2}[:：]\*{0,2}\s*(\d{4}-\d{2}-\d{2})', content)
-    if not m_exec:
-        raise ValueError("无法从策略文件中解析执行日期")
-    exec_date = datetime.strptime(m_exec.group(1), '%Y-%m-%d').date()
-
-    # 决策基准日 = 执行日前一天（简化处理，跳过周末）
-    from datetime import timedelta
-    strategy_date = exec_date - timedelta(days=1)
-    while strategy_date.weekday() >= 5:
-        strategy_date -= timedelta(days=1)
-
-    # 也尝试解析显式的决策基准日
-    m_base = re.search(r'\*{0,2}决策基准日\*{0,2}[:：]\*{0,2}\s*(\d{4}-\d{2}-\d{2})', content)
-    if m_base:
-        strategy_date = datetime.strptime(m_base.group(1), '%Y-%m-%d').date()
-
-    # 检查是否空仓
-    if '建议空仓' in content:
-        return strategy_date, exec_date, [], True
-
-    # 尝试新格式解析：### TOP N — 名称　`代码`
-    top5 = []
-    top_blocks = re.findall(
-        r'###\s+TOP\s+(\d+)\s*[—–-]\s*(\S+)\s+`([^`]+)`(.*?)(?=###|---|$)',
-        content, re.DOTALL
-    )
-
-    if top_blocks:
-        for rank_str, name, code, block in top_blocks:
-            # 解析小表格中的数据行
-            # | ¥36.01 | **+0.1659%** | 84.72% | 50% |
-            m = re.search(
-                r'\|\s*[¥￥]?([\d.]+)\s*\|\s*\*{0,2}([+-]?[\d.]+)%\*{0,2}\s*\|\s*([\d.]+)%\s*\|\s*([\d.]+)%\s*\|',
-                block
-            )
-            if m:
-                top5.append({
-                    'rank': int(rank_str),
-                    '代码': code,
-                    '名称': name,
-                    'pred_close': float(m.group(1)),
-                    'pred_return': float(m.group(2)) / 100,
-                    'confidence': float(m.group(3)) / 100,
-                    'weight': float(m.group(4)) / 100,
-                })
-            if len(top5) >= 5:
-                break
-    else:
-        # 旧格式解析
-        in_top5 = False
-        for line in content.splitlines():
-            if '推荐买入' in line and 'TOP 5' in line:
-                in_top5 = True
-                continue
-            if in_top5 and line.startswith('##') and '推荐买入' not in line:
-                break
-            if not in_top5:
-                continue
-            if '代码' in line or '----' in line or '排名' in line:
-                continue
-            m = re.match(
-                r'\|\s*(\d+)\s*\|\s*((?:sh|sz)\.\d{6})\s*\|\s*(\S+)\s*\|\s*([\d.]+)\s*\|\s*([+-]?[\d.]+)%\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)%\s*\|',
-                line
-            )
-            if m:
-                top5.append({
-                    'rank': int(m.group(1)),
-                    '代码': m.group(2),
-                    '名称': m.group(3),
-                    'pred_close': float(m.group(4)),
-                    'pred_return': float(m.group(5)) / 100,
-                    'confidence': float(m.group(6)),
-                    'weight': float(m.group(7)) / 100,
-                })
-            if len(top5) == 5:
-                break
-
-    return strategy_date, exec_date, top5, False
+def load_predictions() -> pd.DataFrame:
+    """加载预测结果"""
+    if not os.path.exists(PREDICT_PKL):
+        sys.exit(f"找不到预测文件: {PREDICT_PKL}，请先运行 py03_model.py")
+    return pd.read_pickle(PREDICT_PKL)
 
 
-# ── 读取今日实际行情 ──────────────────────────────────────────────
+def load_price_info(target_date) -> pd.DataFrame:
+    """从 features.pkl 加载指定日期的价格信息"""
+    if not os.path.exists(FEATURE_PKL):
+        sys.exit(f"找不到特征文件: {FEATURE_PKL}，请先运行 py02_features.py")
+    df = pd.read_pickle(FEATURE_PKL)
+    price_df = df[df['date'] == target_date][['代码', '名称', 'open', 'close']].copy()
+    return price_df
+
 
 def load_today_data(target_date: date) -> pd.DataFrame:
     """从月度CSV中读取指定日期的行情数据"""
@@ -172,9 +94,14 @@ def load_today_data(target_date: date) -> pd.DataFrame:
     csv_path = os.path.join(DATA_DIR, f'Stock_dailyK_{yyyymm}.csv')
 
     if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"找不到行情文件: {csv_path}，请先运行数据更新。")
+        raise FileNotFoundError(f"找不到行情文件: {csv_path}，请先运行 py00 --update")
 
     df = pd.read_csv(csv_path, encoding='utf-8-sig')
+    # 确保数值列正确
+    for col in ['open', 'high', 'low', 'close', 'volume', 'amount', 'pctChg']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
     df['date'] = pd.to_datetime(df['date']).dt.date
     today_df = df[df['date'] == target_date].copy()
 
@@ -184,40 +111,141 @@ def load_today_data(target_date: date) -> pd.DataFrame:
     return today_df
 
 
-# ── 合并决策与行情 ─────────────────────────────────────────────────
+def determine_eval_date(pred_df: pd.DataFrame, eval_date: date = None):
+    """
+    确定评估日(T日)和决策基准日(T-1日)。
 
-def merge_decision_with_actual(top5: list[dict], today_df: pd.DataFrame) -> pd.DataFrame:
-    """将盘前决策与今日实际行情合并，计算各项指标"""
+    Returns:
+        pred_date: T-1日（预测基准日）
+        eval_date: T日（评估日）
+    """
+    if eval_date is not None:
+        # 指定评估日：找 predictions.pkl 中 < eval_date 的最新预测日
+        ts = pd.Timestamp(eval_date)
+        candidates = pred_df[pred_df['date'] < ts]['date']
+        if candidates.empty:
+            sys.exit(f"predictions.pkl 中没有 {eval_date} 之前的预测数据。"
+                     f"请确认已运行过 py03 且预测日期正确。")
+        pred_date = candidates.max()
+        return pred_date, eval_date
+
+    # 自动检测：预测日 = predictions.pkl 中最新日期（T-1），T日 = 下一个交易日
+    pred_date = pred_df['date'].max()
+
+    # 从CSV中查找pred_date之后的最早日期作为T日
+    csv_files = sorted(_glob.glob(os.path.join(DATA_DIR, 'Stock_dailyK_*.csv')))
+    if csv_files:
+        # 从最后几个月度文件中查找
+        for f in reversed(csv_files[-3:]):
+            tmp = pd.read_csv(f, encoding='utf-8-sig', usecols=['date'])
+            tmp['date'] = pd.to_datetime(tmp['date'])
+            future_dates = tmp[tmp['date'] > pred_date]['date'].unique()
+            if len(future_dates) > 0:
+                eval_dt = pd.Timestamp(min(future_dates)).date()
+                return pred_date, eval_dt
+
+    # Fallback：pred_date后第一个工作日
+    next_d = pred_date.date() if hasattr(pred_date, 'date') else pred_date
+    next_d = next_d + timedelta(days=1)
+    while next_d.weekday() >= 5:
+        next_d += timedelta(days=1)
+    return pred_date, next_d
+
+
+# ── 决策生成 ─────────────────────────────────────────────────────
+
+def generate_decisions(pred_df: pd.DataFrame, pred_date, price_df: pd.DataFrame):
+    """
+    基于T-1日预测生成T日决策。
+
+    Returns:
+        top5: 买入推荐TOP5 DataFrame
+        top20: 潜力排名TOP20 DataFrame
+        all_pred: 所有预测（合并了价格信息）
+    """
+    latest_pred = pred_df[pred_df['date'] == pred_date].copy()
+    if latest_pred.empty:
+        sys.exit(f"predictions.pkl 中无 {pred_date} 的预测数据")
+
+    # 合并T-1日价格信息（收盘价用于展示）
+    if not price_df.empty:
+        latest_pred = latest_pred.merge(
+            price_df[['代码', '名称', 'close']].rename(columns={'close': 'prev_close'}),
+            on='代码', how='left'
+        )
+    else:
+        latest_pred['名称'] = ''
+        latest_pred['prev_close'] = np.nan
+
+    # 综合评分（与 py04/py05 一致）
+    latest_pred['score'] = (latest_pred['pred_return'] * 0.6 +
+                            latest_pred['confidence'] * latest_pred['pred_return'] * 0.4)
+
+    # TOP5: 满足阈值条件，按score排序
+    qualified = latest_pred[
+        (latest_pred['pred_return'] > MIN_PRED_RETURN) &
+        (latest_pred['confidence'] > MIN_CONFIDENCE)
+    ].copy()
+    top5 = qualified.sort_values('score', ascending=False).head(5).copy()
+    n_buy = len(top5)
+    if n_buy > 0:
+        top5['weight'] = 1.0 / n_buy
+
+    # TOP20: 全市场按pred_return排序
+    top20 = latest_pred.sort_values('pred_return', ascending=False).head(20).copy()
+
+    return top5, top20, latest_pred
+
+
+# ── 评估计算 ─────────────────────────────────────────────────────
+
+def evaluate_stocks(decision_df: pd.DataFrame, today_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    将决策与T日实际行情合并，计算评估指标。
+
+    对每只推荐股票：
+    - actual_open: T日开盘价（买入价）
+    - actual_close: T日收盘价
+    - intraday_return: (close - open) / open（开盘→收盘收益）
+    - actual_pctChg: T日涨跌幅
+    - status: 正常/涨停/跌停/停牌
+    """
     rows = []
-    for item in top5:
+    for _, item in decision_df.iterrows():
         code = item['代码']
         actual = today_df[today_df['代码'] == code]
-        row = item.copy()
+        row = item.to_dict()
 
         if actual.empty:
             row.update({
                 'actual_open': np.nan, 'actual_close': np.nan,
                 'actual_pctChg': np.nan, 'intraday_return': np.nan,
-                'weighted_return': np.nan, 'status': '停牌/无数据',
+                'status': '停牌/无数据',
             })
         else:
             r = actual.iloc[0]
             open_p = float(r['open'])
             close_p = float(r['close'])
-            pct_chg = float(r['pctChg'])       # 今日涨跌幅（%）
-            intraday = (close_p - open_p) / open_p  # 开盘→收盘内日收益
+            pct_chg = float(r['pctChg']) if pd.notna(r['pctChg']) else 0.0
 
-            # 判断涨跌停
-            limit_up = pct_chg >= 9.9
-            limit_down = pct_chg <= -9.9
-            status = '涨停' if limit_up else ('跌停' if limit_down else '正常')
+            if open_p > 0:
+                intraday = (close_p - open_p) / open_p
+            else:
+                intraday = np.nan
+
+            # 涨跌停判断
+            if pct_chg >= 9.9:
+                status = '涨停'
+            elif pct_chg <= -9.9:
+                status = '跌停'
+            else:
+                status = '正常'
 
             row.update({
                 'actual_open': open_p,
                 'actual_close': close_p,
-                'actual_pctChg': pct_chg / 100,    # 转为小数
+                'actual_pctChg': pct_chg / 100,
                 'intraday_return': intraday,
-                'weighted_return': intraday * item['weight'],
                 'status': status,
             })
         rows.append(row)
@@ -225,97 +253,232 @@ def merge_decision_with_actual(top5: list[dict], today_df: pd.DataFrame) -> pd.D
     return pd.DataFrame(rows)
 
 
-# ── 计算市场基准 ──────────────────────────────────────────────────
-
 def calc_market_stats(today_df: pd.DataFrame) -> dict:
-    """计算今日全市场统计"""
+    """计算T日全市场统计"""
     df = today_df.dropna(subset=['pctChg']).copy()
     df['pctChg'] = pd.to_numeric(df['pctChg'], errors='coerce')
     df = df.dropna(subset=['pctChg'])
+
+    total = len(df)
+    if total == 0:
+        return {'total': 0, 'up_count': 0, 'down_count': 0, 'flat_count': 0,
+                'mean_pct': 0, 'median_pct': 0}
+
     return {
-        'total': len(df),
-        'up_count': (df['pctChg'] > 0).sum(),
-        'down_count': (df['pctChg'] < 0).sum(),
-        'flat_count': (df['pctChg'] == 0).sum(),
+        'total': total,
+        'up_count': int((df['pctChg'] > 0).sum()),
+        'down_count': int((df['pctChg'] < 0).sum()),
+        'flat_count': int((df['pctChg'] == 0).sum()),
         'mean_pct': df['pctChg'].mean() / 100,
         'median_pct': df['pctChg'].median() / 100,
     }
 
 
+# ── Markdown 报告 ────────────────────────────────────────────────
+
+def _pct_fmt(v, nan_str="N/A") -> str:
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return nan_str
+    return f"{v:+.2%}"
+
+
+def generate_markdown_report(
+    pred_date, eval_date,
+    top5_eval: pd.DataFrame, top20_eval: pd.DataFrame,
+    market: dict,
+) -> str:
+    """生成评估 Markdown 报告"""
+    lines = []
+    pred_date_str = pred_date.date() if hasattr(pred_date, 'date') else pred_date
+    eval_date_str = eval_date
+
+    lines.append(f"# 盘后决策评估 — {eval_date_str}\n")
+    lines.append(f"> **决策基准日(T-1)**: {pred_date_str} | **评估日(T)**: {eval_date_str}\n")
+    lines.append("---\n")
+
+    # ── 一、买入推荐 TOP5 ──
+    lines.append("## 一、T日买入推荐 (TOP 5)\n")
+    lines.append(f"> 筛选条件: 预测收益率 > {MIN_PRED_RETURN:.1%}, 置信度 > {MIN_CONFIDENCE:.0%}\n")
+
+    if len(top5_eval) == 0:
+        lines.append("> **无股票满足买入条件**\n")
+    else:
+        lines.append("| # | 代码 | 名称 | 预测收益率 | 置信度 | T日开盘 | T日收盘 | 开→收 | 状态 |")
+        lines.append("|:-:|------|------|----------:|-------:|--------:|--------:|------:|:----:|")
+        for i, (_, r) in enumerate(top5_eval.iterrows()):
+            name = r.get('名称', 'N/A')
+            if pd.isna(name):
+                name = 'N/A'
+            lines.append(
+                f"| {i+1} | {r['代码']} | {name}"
+                f" | {_pct_fmt(r['pred_return'])}"
+                f" | {r.get('confidence', 0):.2%}"
+                f" | {r.get('actual_open', 0):.2f}"
+                f" | {r.get('actual_close', 0):.2f}"
+                f" | **{_pct_fmt(r.get('intraday_return', np.nan))}**"
+                f" | {r.get('status', 'N/A')} |"
+            )
+
+        # 组合统计
+        valid = top5_eval['intraday_return'].dropna()
+        if len(valid) > 0:
+            avg_intraday = valid.mean()
+            lines.append(f"\n**组合等权平均收益（开→收）: {_pct_fmt(avg_intraday)}**")
+            excess = avg_intraday - market['mean_pct']
+            lines.append(f"**超额收益（vs 市场均值）: {_pct_fmt(excess)}**\n")
+
+    lines.append("---\n")
+
+    # ── 二、潜力 TOP20 评估 ──
+    lines.append("## 二、潜力排名 TOP 20 评估\n")
+    lines.append("> 全市场按预测收益率排名，不限制阈值\n")
+    lines.append("| # | 代码 | 名称 | 预测收益率 | T日开盘 | T日收盘 | 开→收 | 命中 |")
+    lines.append("|:-:|------|------|----------:|--------:|--------:|------:|:----:|")
+
+    hit_count = 0
+    total_count = 0
+    for i, (_, r) in enumerate(top20_eval.iterrows()):
+        name = r.get('名称', 'N/A')
+        if pd.isna(name):
+            name = 'N/A'
+        intraday = r.get('intraday_return', np.nan)
+        pred_ret = r.get('pred_return', 0)
+
+        # 命中 = 预测方向与实际一致
+        if pd.notna(intraday):
+            total_count += 1
+            hit = (pred_ret > 0 and intraday > 0) or (pred_ret < 0 and intraday < 0)
+            if hit:
+                hit_count += 1
+            hit_str = 'O' if hit else 'X'
+        else:
+            hit_str = '-'
+
+        lines.append(
+            f"| {i+1} | {r['代码']} | {name}"
+            f" | {_pct_fmt(pred_ret)}"
+            f" | {r.get('actual_open', 0):.2f}"
+            f" | {r.get('actual_close', 0):.2f}"
+            f" | {_pct_fmt(intraday)}"
+            f" | {hit_str} |"
+        )
+
+    # TOP20 统计
+    if total_count > 0:
+        accuracy = hit_count / total_count
+        lines.append(f"\n**预测方向准确率: {hit_count}/{total_count} ({accuracy:.1%})**")
+
+        # 相关系数
+        valid_mask = top20_eval['intraday_return'].notna()
+        if valid_mask.sum() >= 3:
+            corr = top20_eval.loc[valid_mask, 'pred_return'].corr(
+                top20_eval.loc[valid_mask, 'intraday_return']
+            )
+            if pd.notna(corr):
+                lines.append(f"**预测-实际相关系数: {corr:.3f}**")
+
+        # TOP20平均收益
+        top20_avg = top20_eval['intraday_return'].dropna().mean()
+        lines.append(f"**TOP20平均开→收: {_pct_fmt(top20_avg)}**\n")
+
+    lines.append("---\n")
+
+    # ── 三、市场概况 ──
+    lines.append("## 三、T日市场概况\n")
+    lines.append("| 指标 | 数值 |")
+    lines.append("|------|-----:|")
+    lines.append(f"| 全市场股票数 | {market['total']:,} |")
+    lines.append(f"| 上涨 | {market['up_count']:,} ({market['up_count']/max(market['total'],1):.1%}) |")
+    lines.append(f"| 下跌 | {market['down_count']:,} ({market['down_count']/max(market['total'],1):.1%}) |")
+    lines.append(f"| 平盘 | {market['flat_count']:,} |")
+    lines.append(f"| 市场均值 | {_pct_fmt(market['mean_pct'])} |")
+    lines.append(f"| 市场中位数 | {_pct_fmt(market['median_pct'])} |")
+
+    lines.append("\n---\n")
+    lines.append("*仅评估首日（T日开→收）表现，完整收益需持有5天后确认。*")
+
+    return "\n".join(lines)
+
+
 # ── 可视化 ────────────────────────────────────────────────────────
 
-def _pct_fmt(v: float) -> str:
-    return f"{v:+.2%}" if not np.isnan(v) else "N/A"
-
 def _color(v: float, nan_color: str = '#888888') -> str:
-    if np.isnan(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
         return nan_color
     return '#E8423E' if v >= 0 else '#1DBB50'  # A股红涨绿跌
 
 
-def plot_review(result_df: pd.DataFrame, market: dict,
-                strategy_date: date, today: date, out_path: str) -> None:
+def plot_review(top5_eval: pd.DataFrame, top20_eval: pd.DataFrame,
+                market: dict, pred_date, eval_date, out_path: str) -> None:
     """生成盘后评估图"""
-    fig = plt.figure(figsize=(16, 10), facecolor='#1C1C1E')
+    pred_date_str = pred_date.date() if hasattr(pred_date, 'date') else pred_date
+
+    fig = plt.figure(figsize=(16, 12), facecolor='#1C1C1E')
     fig.patch.set_facecolor('#1C1C1E')
 
-    gs = GridSpec(2, 2, figure=fig, hspace=0.45, wspace=0.35,
-                  left=0.07, right=0.97, top=0.88, bottom=0.08)
-    ax1 = fig.add_subplot(gs[0, :])   # 主柱状图（跨两列）
+    gs = GridSpec(3, 2, figure=fig, hspace=0.50, wspace=0.35,
+                  left=0.07, right=0.97, top=0.90, bottom=0.05)
+    ax1 = fig.add_subplot(gs[0, :])   # TOP5 柱状图
     ax2 = fig.add_subplot(gs[1, 0])   # 市场环境
-    ax3 = fig.add_subplot(gs[1, 1])   # 详细数据表
+    ax3 = fig.add_subplot(gs[1, 1])   # TOP5 数据表
+    ax4 = fig.add_subplot(gs[2, :])   # TOP20 柱状图
 
     dark_bg = '#2C2C2E'
     text_color = '#F5F5F7'
     grid_color = '#3A3A3C'
 
-    for ax in [ax1, ax2, ax3]:
+    for ax in [ax1, ax2, ax3, ax4]:
         ax.set_facecolor(dark_bg)
         ax.tick_params(colors=text_color, labelsize=9)
         for spine in ax.spines.values():
             spine.set_edgecolor(grid_color)
 
-    # ── 图1：推荐 TOP 5 对比柱状图 ──────────────────────────────
-    n = len(result_df)
-    x = np.arange(n)
-    w = 0.28
+    # ── 图1：TOP 5 对比柱状图 ──
+    if len(top5_eval) > 0:
+        n = len(top5_eval)
+        x = np.arange(n)
+        w = 0.35
 
-    pred_vals = result_df['pred_return'].values
-    actual_vals = result_df['actual_pctChg'].fillna(0).values
-    intraday_vals = result_df['intraday_return'].fillna(0).values
+        pred_vals = top5_eval['pred_return'].values
+        intraday_vals = top5_eval['intraday_return'].fillna(0).values
 
-    bars1 = ax1.bar(x - w, pred_vals, w, label='盘前预测收益率',
-                    color='#5E81F4', alpha=0.9, zorder=3)
-    bars2 = ax1.bar(x, actual_vals, w, label='今日实际涨跌幅',
-                    color=[_color(v) for v in actual_vals], alpha=0.9, zorder=3)
-    bars3 = ax1.bar(x + w, intraday_vals, w, label='今日开盘→收盘',
-                    color=[_color(v, '#888888') for v in intraday_vals],
-                    alpha=0.7, zorder=3)
+        ax1.bar(x - w/2, pred_vals, w, label='T-1预测收益率',
+                color='#5E81F4', alpha=0.9, zorder=3)
+        bars2 = ax1.bar(x + w/2, intraday_vals, w, label='T日开→收',
+                        color=[_color(v) for v in intraday_vals], alpha=0.9, zorder=3)
 
-    # 柱顶标注数值
-    for bars, vals in [(bars1, pred_vals), (bars2, actual_vals), (bars3, intraday_vals)]:
-        for bar, val in zip(bars, vals):
-            if np.isnan(val):
-                continue
-            y_pos = bar.get_height() + (0.0003 if val >= 0 else -0.0008)
-            ax1.text(bar.get_x() + bar.get_width() / 2, y_pos,
-                     f"{val:+.2%}", ha='center', va='bottom' if val >= 0 else 'top',
-                     fontsize=8, color=text_color, fontweight='bold')
+        # 标注数值
+        for xi, (pv, iv) in enumerate(zip(pred_vals, intraday_vals)):
+            for val, offset in [(pv, -w/2), (iv, w/2)]:
+                if np.isnan(val):
+                    continue
+                y_pos = val + (0.0003 if val >= 0 else -0.0008)
+                ax1.text(xi + offset, y_pos, f"{val:+.2%}",
+                         ha='center', va='bottom' if val >= 0 else 'top',
+                         fontsize=8, color=text_color, fontweight='bold')
 
-    ax1.set_xticks(x)
-    labels = [f"{r['名称']}\n{r['代码'].split('.')[1]}" for _, r in result_df.iterrows()]
-    ax1.set_xticklabels(labels, color=text_color, fontsize=9)
+        labels = []
+        for _, r in top5_eval.iterrows():
+            name = r.get('名称', '')
+            if pd.isna(name):
+                name = ''
+            labels.append(f"{name}\n{r['代码'].split('.')[1]}")
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(labels, color=text_color, fontsize=9)
+    else:
+        ax1.text(0.5, 0.5, '无满足条件的买入推荐', transform=ax1.transAxes,
+                 ha='center', va='center', color=text_color, fontsize=12)
+
     ax1.axhline(0, color=grid_color, linewidth=0.8, zorder=2)
     ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.1%}"))
-    ax1.tick_params(axis='y', colors=text_color)
     ax1.set_ylabel('收益率', color=text_color, fontsize=9)
     ax1.legend(fontsize=8, labelcolor=text_color, facecolor=dark_bg,
                edgecolor=grid_color, loc='upper right')
-    ax1.set_title(f'推荐 TOP 5 — 盘前预测 vs 今日实际  ({today})',
+    ax1.set_title(f'买入推荐 TOP 5 — 预测 vs 实际  ({eval_date})',
                   color=text_color, fontsize=12, fontweight='bold', pad=10)
     ax1.grid(axis='y', color=grid_color, linewidth=0.5, zorder=1)
 
-    # ── 图2：市场环境对比 ────────────────────────────────────────
+    # ── 图2：市场环境 ──
     categories = ['上涨', '平盘', '下跌']
     counts = [market['up_count'], market['flat_count'], market['down_count']]
     colors_mkt = ['#E8423E', '#888888', '#1DBB50']
@@ -324,67 +487,87 @@ def plot_review(result_df: pd.DataFrame, market: dict,
         ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 5,
                  str(cnt), ha='center', va='bottom', color=text_color, fontsize=9)
 
-    # 叠加组合平均收益注释
-    portfolio_avg = result_df['actual_pctChg'].mean()
+    top5_avg = top5_eval['intraday_return'].dropna().mean() if len(top5_eval) > 0 else 0
     mkt_avg = market['mean_pct']
-    note = (f"组合均值: {_pct_fmt(portfolio_avg)}\n"
+    note = (f"TOP5均值: {_pct_fmt(top5_avg)}\n"
             f"市场均值: {_pct_fmt(mkt_avg)}\n"
-            f"上涨占比: {market['up_count']/market['total']:.1%}")
+            f"上涨占比: {market['up_count']/max(market['total'],1):.1%}")
     ax2.text(0.97, 0.97, note, transform=ax2.transAxes,
              ha='right', va='top', color=text_color, fontsize=8,
              bbox=dict(facecolor='#3A3A3C', edgecolor='none', alpha=0.8, pad=5))
-
-    ax2.set_title('今日市场概况', color=text_color, fontsize=10, fontweight='bold')
+    ax2.set_title('T日市场概况', color=text_color, fontsize=10, fontweight='bold')
     ax2.set_ylabel('股票数量', color=text_color, fontsize=9)
     ax2.grid(axis='y', color=grid_color, linewidth=0.5, zorder=1)
 
-    # ── 图3：详细数据表 ──────────────────────────────────────────
+    # ── 图3：TOP5 数据表 ──
     ax3.axis('off')
-    col_labels = ['代码', '名称', '盘前预测', '今日涨跌', '开→收', '仓位', '状态']
-    table_data = []
-    for _, r in result_df.iterrows():
-        table_data.append([
-            r['代码'].split('.')[1],
-            r['名称'],
-            _pct_fmt(r['pred_return']),
-            _pct_fmt(r['actual_pctChg']),
-            _pct_fmt(r['intraday_return']),
-            f"{r['weight']:.0%}",
-            r['status'],
-        ])
+    if len(top5_eval) > 0:
+        col_labels = ['代码', '名称', '预测', '开→收', '状态']
+        table_data = []
+        for _, r in top5_eval.iterrows():
+            name = r.get('名称', 'N/A')
+            if pd.isna(name):
+                name = 'N/A'
+            table_data.append([
+                r['代码'].split('.')[1],
+                name,
+                _pct_fmt(r['pred_return']),
+                _pct_fmt(r.get('intraday_return', np.nan)),
+                r.get('status', 'N/A'),
+            ])
+        # 汇总行
+        avg_intraday = top5_eval['intraday_return'].dropna().mean()
+        table_data.append(['—', '均值', '—', _pct_fmt(avg_intraday), ''])
 
-    # 加总行
-    total_weighted = result_df['weighted_return'].sum()
-    avg_actual = result_df['actual_pctChg'].mean()
-    table_data.append(['—', '组合汇总', '—', _pct_fmt(avg_actual),
-                       _pct_fmt(total_weighted), '100%', ''])
+        tbl = ax3.table(cellText=table_data, colLabels=col_labels,
+                        cellLoc='center', loc='center', bbox=[0, 0.05, 1, 0.92])
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(9)
+        for (row_idx, col_idx), cell in tbl.get_celld().items():
+            cell.set_facecolor(dark_bg if row_idx > 0 else '#3A3A3C')
+            cell.set_text_props(color=text_color)
+            cell.set_edgecolor(grid_color)
+            if row_idx == len(table_data):
+                cell.set_facecolor('#3A3A3C')
+    ax3.set_title('TOP 5 详细数据', color=text_color, fontsize=10, fontweight='bold', pad=12)
 
-    tbl = ax3.table(cellText=table_data, colLabels=col_labels,
-                    cellLoc='center', loc='center', bbox=[0, 0.05, 1, 0.92])
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(8)
+    # ── 图4：TOP 20 预测 vs 实际 ──
+    if len(top20_eval) > 0:
+        n20 = len(top20_eval)
+        x20 = np.arange(n20)
+        w20 = 0.35
+        pred20 = top20_eval['pred_return'].values
+        actual20 = top20_eval['intraday_return'].fillna(0).values
 
-    # 表格样式
-    header_color = '#3A3A3C'
-    for (row_idx, col_idx), cell in tbl.get_celld().items():
-        cell.set_facecolor(dark_bg if row_idx > 0 else header_color)
-        cell.set_text_props(color=text_color)
-        cell.set_edgecolor(grid_color)
-        # 最后一行（汇总）加深背景
-        if row_idx == len(table_data):
-            cell.set_facecolor('#3A3A3C')
+        ax4.bar(x20 - w20/2, pred20, w20, label='T-1预测', color='#5E81F4', alpha=0.9, zorder=3)
+        ax4.bar(x20 + w20/2, actual20, w20, label='T日开→收',
+                color=[_color(v) for v in actual20], alpha=0.9, zorder=3)
 
-    ax3.set_title('详细数据', color=text_color, fontsize=10, fontweight='bold', pad=12)
+        labels20 = []
+        for _, r in top20_eval.iterrows():
+            labels20.append(r['代码'].split('.')[1])
+        ax4.set_xticks(x20)
+        ax4.set_xticklabels(labels20, color=text_color, fontsize=7, rotation=45)
+    ax4.axhline(0, color=grid_color, linewidth=0.8, zorder=2)
+    ax4.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.1%}"))
+    ax4.set_ylabel('收益率', color=text_color, fontsize=9)
+    ax4.legend(fontsize=8, labelcolor=text_color, facecolor=dark_bg,
+               edgecolor=grid_color, loc='upper right')
+    ax4.set_title(f'潜力 TOP 20 — 预测 vs 实际',
+                  color=text_color, fontsize=12, fontweight='bold', pad=10)
+    ax4.grid(axis='y', color=grid_color, linewidth=0.5, zorder=1)
 
-    # ── 总标题 ────────────────────────────────────────────────────
-    portfolio_intraday = result_df['weighted_return'].sum()
-    verdict = "盈利" if portfolio_intraday > 0 else ("持平" if portfolio_intraday == 0 else "亏损")
-    verdict_color = _color(portfolio_intraday)
-    title_color = verdict_color if portfolio_intraday != 0 else text_color
+    # ── 总标题 ──
+    portfolio_avg = top5_eval['intraday_return'].dropna().mean() if len(top5_eval) > 0 else 0
+    if np.isnan(portfolio_avg):
+        portfolio_avg = 0
+    verdict = "盈利" if portfolio_avg > 0 else ("持平" if portfolio_avg == 0 else "亏损")
+    verdict_color = _color(portfolio_avg)
+    title_color = verdict_color if portfolio_avg != 0 else text_color
     fig.suptitle(
-        f"盘后决策评估  |  盘前日期: {strategy_date}  →  执行日: {today}"
-        f"  |  组合加权收益: {_pct_fmt(portfolio_intraday)}  [{verdict}]",
-        color=title_color, fontsize=13, fontweight='bold', y=0.95
+        f"盘后决策评估  |  T-1: {pred_date_str}  →  T: {eval_date}"
+        f"  |  TOP5均值: {_pct_fmt(portfolio_avg)}  [{verdict}]",
+        color=title_color, fontsize=13, fontweight='bold', y=0.96
     )
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -398,64 +581,95 @@ def plot_review(result_df: pd.DataFrame, market: dict,
 def run_review(force: bool = False, eval_date: date = None) -> None:
     check_review_time(force, eval_date)
 
-    if not os.path.exists(STRATEGY_MD):
-        sys.exit(f"找不到策略文件: {STRATEGY_MD}，请先运行盘前报告。")
+    # 1. 加载预测数据
+    pred_df = load_predictions()
 
-    strategy_date, exec_date, top5, is_empty = parse_strategy(STRATEGY_MD)
-    print(f"盘前决策日期: {strategy_date}")
-    print(f"决策应用日期: {exec_date}")
+    # 2. 确定T-1日和T日
+    pred_date, t_day = determine_eval_date(pred_df, eval_date)
+    pred_date_str = pred_date.date() if hasattr(pred_date, 'date') else pred_date
+    print(f"决策基准日(T-1): {pred_date_str}")
+    print(f"评估日(T):       {t_day}")
 
-    if is_empty:
-        print("今日盘前建议空仓，无需评估。")
-        return
+    # 3. 加载T-1价格信息
+    price_df = load_price_info(pred_date)
 
-    if not top5:
-        print("未解析到有效的推荐股票，请检查策略文件格式。")
-        return
+    # 4. 生成T日决策（基于T-1预测）
+    top5, top20, all_pred = generate_decisions(pred_df, pred_date, price_df)
+    print(f"买入推荐: {len(top5)} 只, 潜力TOP20: {len(top20)} 只")
+    if len(top5) > 0:
+        print(f"  TOP5: {top5['代码'].tolist()}")
 
-    print(f"共解析到 {len(top5)} 只推荐股票: {[s['代码'] for s in top5]}")
-
-    # 评估日 = 策略中的决策应用日期（执行日），而非当前系统日期
-    # --date 参数仅在显式指定时覆盖（用于历史回测场景）
-    today = eval_date if eval_date is not None else exec_date
-    print(f"评估日期（执行日）: {today}")
-
+    # 5. 加载T日实际行情
+    t_day_date = t_day if isinstance(t_day, date) else t_day.date()
     try:
-        today_df = load_today_data(today)
+        today_df = load_today_data(t_day_date)
     except (FileNotFoundError, ValueError) as e:
         sys.exit(
-            f"无法读取执行日 {today} 的行情数据: {e}\n"
-            f"评估需要执行日（决策应用日期）的实际行情数据，请确认:\n"
-            f"  1. 执行日 {today} 已收盘\n"
-            f"  2. 已运行数据更新（py00_fetch_stock_data.py --update）"
+            f"无法读取T日 {t_day} 的行情数据: {e}\n"
+            f"请确认:\n"
+            f"  1. T日 {t_day} 已收盘\n"
+            f"  2. 已运行数据更新（python src/py00_fetch_stock_data.py --update）"
         )
 
-    result_df = merge_decision_with_actual(top5, today_df)
+    # 6. 评估
+    top5_eval = evaluate_stocks(top5, today_df) if len(top5) > 0 else pd.DataFrame()
+    top20_eval = evaluate_stocks(top20, today_df)
     market = calc_market_stats(today_df)
 
-    # 打印摘要
-    print("\n" + "=" * 60)
-    print(f"{'代码':<14} {'名称':<8} {'预测':>8} {'今日涨跌':>9} {'状态'}")
-    print("-" * 60)
-    for _, r in result_df.iterrows():
-        print(f"{r['代码']:<14} {r['名称']:<8} "
-              f"{_pct_fmt(r['pred_return']):>8} "
-              f"{_pct_fmt(r['actual_pctChg']):>9}  {r['status']}")
-    print("-" * 60)
-    weighted_total = result_df['weighted_return'].sum()
-    print(f"组合加权收益（开→收）: {_pct_fmt(weighted_total)}")
-    print(f"市场均值: {_pct_fmt(market['mean_pct'])}  |  上涨比例: {market['up_count']/market['total']:.1%}")
-    print("=" * 60)
+    # 7. 控制台摘要
+    print(f"\n{'='*70}")
+    print(f"  T日决策评估  |  T-1: {pred_date_str}  →  T: {t_day}")
+    print(f"{'='*70}")
 
-    out_path = os.path.join(OUTPUT_DIR, f"today_review_{today.strftime('%Y%m%d')}.png")
-    plot_review(result_df, market, strategy_date, today, out_path)
+    if len(top5_eval) > 0:
+        print(f"\n{'─'*70}")
+        print(f"  {'代码':<14} {'名称':<8} {'预测':>8} {'开→收':>9} {'状态'}")
+        print(f"{'─'*70}")
+        for _, r in top5_eval.iterrows():
+            name = r.get('名称', 'N/A')
+            if pd.isna(name):
+                name = 'N/A'
+            print(f"  {r['代码']:<14} {name:<8} "
+                  f"{_pct_fmt(r['pred_return']):>8} "
+                  f"{_pct_fmt(r.get('intraday_return', np.nan)):>9}  "
+                  f"{r.get('status', 'N/A')}")
+        avg_ret = top5_eval['intraday_return'].dropna().mean()
+        print(f"{'─'*70}")
+        print(f"  TOP5等权平均（开→收）: {_pct_fmt(avg_ret)}")
+    else:
+        print("\n  无满足条件的买入推荐")
+
+    print(f"  市场均值: {_pct_fmt(market['mean_pct'])}  |  "
+          f"上涨: {market['up_count']}/{market['total']} "
+          f"({market['up_count']/max(market['total'],1):.1%})")
+
+    # TOP20 方向准确率
+    valid_top20 = top20_eval.dropna(subset=['intraday_return'])
+    if len(valid_top20) > 0:
+        hits = ((valid_top20['pred_return'] > 0) & (valid_top20['intraday_return'] > 0)).sum()
+        print(f"  TOP20方向准确率: {hits}/{len(valid_top20)} "
+              f"({hits/len(valid_top20):.1%})")
+    print(f"{'='*70}")
+
+    # 8. 生成 Markdown 报告
+    md_report = generate_markdown_report(pred_date, t_day, top5_eval, top20_eval, market)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    md_path = os.path.join(OUTPUT_DIR, f"today_review_{t_day_date.strftime('%Y%m%d')}.md")
+    with open(md_path, 'w', encoding='utf-8') as f:
+        f.write(md_report)
+    print(f"评估报告已保存: {md_path}")
+
+    # 9. 生成 PNG 图表
+    png_path = os.path.join(OUTPUT_DIR, f"today_review_{t_day_date.strftime('%Y%m%d')}.png")
+    plot_review(top5_eval, top20_eval, market, pred_date, t_day, png_path)
+
     print("\n评估完成。")
 
 
 if __name__ == '__main__':
-    force = '--force' in sys.argv
+    _force = '--force' in sys.argv
     _eval_date = None
     if '--date' in sys.argv:
         _idx = sys.argv.index('--date')
         _eval_date = datetime.strptime(sys.argv[_idx + 1], '%Y-%m-%d').date()
-    run_review(force, eval_date=_eval_date)
+    run_review(_force, eval_date=_eval_date)

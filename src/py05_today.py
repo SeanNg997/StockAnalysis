@@ -22,9 +22,24 @@ from datetime import date, timedelta
 warnings.filterwarnings('ignore')
 
 
-def next_trading_day(d: date) -> date:
-    """返回 d 之后的下一个交易日（跳过周六、周日；不处理节假日）"""
+def next_trading_day(d: date, known_trading_days=None) -> date:
+    """返回 d 之后的下一个交易日。
+
+    Args:
+        d: 基准日期
+        known_trading_days: 已知交易日的 set（date 类型）。
+                            提供时优先查表，可正确处理节假日；
+                            未提供时仅跳过周末（原有行为，作为 fallback）。
+    """
     next_d = d + timedelta(days=1)
+    if known_trading_days is not None:
+        # 优先从已知交易日中找（最多向后查找 30 个日历日）
+        for _ in range(30):
+            if next_d in known_trading_days:
+                return next_d
+            next_d += timedelta(days=1)
+        # 超出已知范围则 fallback
+        next_d = d + timedelta(days=1)
     while next_d.weekday() >= 5:  # 5=周六, 6=周日
         next_d += timedelta(days=1)
     return next_d
@@ -134,7 +149,8 @@ def generate_stock_report(stock_code, target_date=None):
     pred_df = pd.read_pickle(PREDICT_PKL)
     stock_history = pred_df[pred_df['代码'] == full_code].sort_values('date').tail(5)
 
-    exec_date = next_trading_day(latest_date.date())
+    known_days = set(pred_df['date'].dt.date.unique())
+    exec_date = next_trading_day(latest_date.date(), known_trading_days=known_days)
     lines = []
     lines.append(f"# 📊 {stock_name}（{full_code}）· 今日决策\n")
     lines.append(f"> **执行日**：{exec_date}（盘前集合竞价）\n")
@@ -145,7 +161,7 @@ def generate_stock_report(stock_code, target_date=None):
     lines.append("|------|:----:|")
     lines.append(f"| 收盘价 | ¥{close_price:.2f} |")
     lines.append(f"| 开盘价 | ¥{open_price:.2f} |")
-    lines.append(f"| 预测收益率（T+1→T+2） | **{pred_return:+.4%}** |")
+    lines.append(f"| 预测收益率（T+1开盘买入→T+6开盘卖出，持有5天） | **{pred_return:+.4%}** |")
     lines.append(f"| 置信度 | {confidence:.2%} |")
     lines.append(f"| 全市场排名 | {rank} / {total}（前 {pct:.1%}） |")
     lines.append(f"| 成交量 | {volume:,.0f} |")
@@ -206,7 +222,9 @@ def generate_today_strategy(target_date=None):
     else:
         qualified = qualified.head(0)
 
-    exec_date = next_trading_day(latest_date.date())
+    exec_date = next_trading_day(latest_date.date(), known_trading_days=set(
+        pd.read_pickle(PREDICT_PKL)['date'].dt.date.unique()
+    ))
 
     # ===== 构建Markdown报告 =====
     lines = []

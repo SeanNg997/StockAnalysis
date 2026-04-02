@@ -26,6 +26,9 @@ N_ENSEMBLE = 5          # Ensemble模型数量（不同随机种子）
 TRAIN_YEARS = 3         # 训练窗口年数
 RETRAIN_DAYS = 22       # 每22个交易日（约1个月）重新训练
 BACKTEST_START = '2023-01-01'  # 回测起始日期
+HOLD_DAYS = 5           # 持有天数（T+1买入 → T+6卖出），与 py02_features.py 保持一致
+                        # 训练集末尾 HOLD_DAYS 条的 label 依赖未来价格（卖出价 open[i+HOLD_DAYS+1]），
+                        # 必须从训练集中剔除，否则引入前视偏差
 
 LGB_PARAMS = {
     'objective': 'huber',          # Huber损失，对异常值更鲁棒
@@ -85,7 +88,10 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
         target_idx = all_dates.index(target_date)
         train_window = TRAIN_YEARS * 252
         train_start_idx = max(0, target_idx - train_window)
-        train_dates = all_dates[train_start_idx:target_idx]
+        # 修复前视偏差：训练集末尾 HOLD_DAYS 条的 label = open[i+HOLD_DAYS+1]/open[i+1]-1，
+        # 其中包含 target_date 及之后的未来开盘价，必须剔除。
+        safe_end_idx = max(0, target_idx - HOLD_DAYS)
+        train_dates = all_dates[train_start_idx:safe_end_idx]
 
         if len(train_dates) < 252:
             raise ValueError(f"训练数据不足（{len(train_dates)} 天 < 252 天），请使用更早的 BACKTEST_START 或更长的历史数据")
@@ -180,7 +186,11 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
         if day_idx - last_train_idx >= RETRAIN_DAYS or models is None:
             # 训练数据：当前日期之前的train_window个交易日
             train_start_idx = max(0, day_idx - train_window)
-            train_dates = all_dates[train_start_idx:day_idx]
+            # 修复前视偏差：label[i] = open[i+HOLD_DAYS+1]/open[i+1]-1，
+            # 训练集最后 HOLD_DAYS 天的 label 包含 current_date 及之后的未来开盘价，
+            # 必须剔除。
+            safe_end_idx = max(0, day_idx - HOLD_DAYS)
+            train_dates = all_dates[train_start_idx:safe_end_idx]
 
             if len(train_dates) < 252:  # 至少1年数据才训练
                 continue

@@ -20,8 +20,13 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-START_DATE = (datetime.now() - timedelta(days=365 * 10)).strftime("%Y-%m-%d")
-END_DATE = datetime.now().strftime("%Y-%m-%d")
+START_DATE = "2019-12-01"
+
+def get_end_date():
+    """获取今天日期（考虑可能需要的市场时间）"""
+    return datetime.now().strftime("%Y-%m-%d")
+
+END_DATE = get_end_date()
 
 SAVE_EVERY = 200  # 每下载200只股票保存一次
 
@@ -242,16 +247,16 @@ def main(limit: int = 0, update: bool = False):
                 last_date_map = existing_df.groupby("代码")["date"].max().to_dict()
             existing_df = None  # 释放内存，增量模式不再需要全量数据
 
-            # 增量模式：处理所有已有数据但最后日期不是最新的股票
-            # 注意：不依赖 completed 集合，直接检查 last_date_map，避免遗漏不完整的股票
-            # 与 END_DATE 前2天比较（留出非交易日余量），确保跨月时也能触发更新
-            threshold_date = (pd.to_datetime(END_DATE) - timedelta(days=2)).strftime("%Y-%m-%d")
+            # 增量模式：检查数据是否包含最新交易日
+            # 策略：如果最后日期 < 今天（END_DATE），就更新
+            # 这样无论是否是交易日，都能正确判断
+            today_str = get_end_date()
             codes_to_update = []
             for code, name in stock_list:
                 last_date = last_date_map.get(code)
                 if last_date is None:
                     continue  # 该股票在CSV中无数据，跳过（增量模式只更新已有数据的股票）
-                if last_date < threshold_date:
+                if last_date < today_str:
                     codes_to_update.append((code, name, last_date))
 
             if not codes_to_update:

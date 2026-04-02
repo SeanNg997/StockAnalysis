@@ -8,7 +8,7 @@ py02_features.py — 特征工程模块
 4. 基本面截面排名特征
 5. 波动率与风险特征
 6. 市场环境特征（截面）
-7. 生成标签：次日开盘买入→后日开盘卖出的收益率
+7. 生成标签：T+1日开盘买入 → T+HOLD_DAYS日开盘卖出的收益率（T日为决策日）
 
 严格避免未来信息泄露：所有特征仅使用T日及之前数据。
 """
@@ -225,16 +225,18 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     feats['upper_shadow'] = (high - np.maximum(close, open_)) / total_range
     feats['lower_shadow'] = (np.minimum(close, open_) - low) / total_range
 
-    # ===== 13. 标签：T+1开盘买入 → T+N开盘卖出 收益率 =====
-    HOLD_DAYS = 5  # 持有5个交易日
+    # ===== 13. 标签：T+1开盘买入 → 持有HOLD_DAYS天 → T+1+HOLD_DAYS开盘卖出 =====
+    HOLD_DAYS = 5  # 持有5个交易日（T+1买入 → T+6卖出）
+    sell_offset = HOLD_DAYS + 1  # 卖出价在 T+1+HOLD_DAYS = T+6 位置
+
     open_next1 = np.empty(n)
     open_next1[:-1] = open_[1:]
     open_next1[-1] = np.nan
 
     open_next_n = np.empty(n)
-    if n > HOLD_DAYS:
-        open_next_n[:n-HOLD_DAYS] = open_[HOLD_DAYS:]
-        open_next_n[n-HOLD_DAYS:] = np.nan
+    if n > sell_offset:
+        open_next_n[:n-sell_offset] = open_[sell_offset:]
+        open_next_n[n-sell_offset:] = np.nan
     else:
         open_next_n[:] = np.nan
 
@@ -243,8 +245,10 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     sell_cost = 1.0 - 0.000585
     raw_label = (open_next_n * sell_cost) / (open_next1 * buy_cost) - 1.0
 
-    # Winsorize极端标签值（截断到±10%）
-    raw_label = np.clip(raw_label, -0.10, 0.10)
+    # Winsorize极端标签值（截断到±30%）
+    # 主板5日复利极端收益约50%，±30%保留绝大多数信号同时抑制极端噪声。
+    # 原±10%过于保守，会压制高动量标的的训练信号。
+    raw_label = np.clip(raw_label, -0.30, 0.30)
     feats['label'] = raw_label
 
     # 将所有特征转为DataFrame
