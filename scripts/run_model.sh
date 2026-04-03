@@ -22,7 +22,7 @@ echo "=============================================="
 # Step 1: 增量更新数据
 echo ""
 echo "[Step 1/6] 增量更新数据..."
-python "$SRC_DIR/py00_fetch_stock_data.py" --update
+python "$SRC_DIR/py00_fetch_stock_data.py"
 
 # Step 2: 数据清洗（全量）
 echo ""

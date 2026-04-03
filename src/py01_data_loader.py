@@ -133,6 +133,17 @@ def run_pipeline(end_date=None) -> pd.DataFrame:
     Args:
         end_date: 数据截止日期（含），格式 'YYYY-MM-DD'。None 表示使用全部数据。
     """
+    # 缓存命中检查：若 pkl 已存在且最新日期与目标日期一致，直接复用
+    if end_date is not None and os.path.exists(CLEAN_PKL):
+        try:
+            cached = pd.read_pickle(CLEAN_PKL)
+            cached_max = cached['date'].max()
+            if pd.Timestamp(end_date) == cached_max:
+                print(f"✅ [缓存命中] mainboard_clean.pkl 已是 {end_date}，跳过重新生成")
+                return cached
+        except Exception:
+            pass  # 读取失败则继续正常流程
+
     df = load_raw_data()
     df = filter_mainboard(df)
     df = remove_st(df)

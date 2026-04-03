@@ -339,6 +339,18 @@ def run_pipeline(end_date=None):
     df = pd.read_pickle(FEATURE_PKL)
     print(f"数据: {df.shape[0]:,} 行, {df['代码'].nunique()} 只股票")
 
+    # 全量模式缓存命中检查：若 predictions.pkl 最新日期 == features.pkl 最新日期，直接跳过
+    if end_date is None and os.path.exists(PREDICT_PKL):
+        try:
+            feat_max = df['date'].max()
+            old_pred = pd.read_pickle(PREDICT_PKL)
+            pred_max = old_pred['date'].max()
+            if feat_max == pred_max:
+                print(f"✅ [缓存命中] predictions.pkl 已是最新 ({pred_max.date()})，跳过全量重训练")
+                return old_pred
+        except Exception:
+            pass  # 读取失败则继续正常流程
+
     # 替换inf为NaN（保留NaN让LightGBM原生处理，避免0值被误读为有意义信号）
     feature_cols = get_feature_columns(df)
     df[feature_cols] = df[feature_cols].replace([np.inf, -np.inf], np.nan)

@@ -25,15 +25,6 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLEAN_PKL = os.path.join(BASE_DIR, 'data', 'mainboard_clean.pkl')
 FEATURE_PKL = os.path.join(BASE_DIR, 'data', 'features.pkl')
 
-
-# ============ 辅助函数 ============
-
-def _ema(series: pd.Series, span: int) -> pd.Series:
-    """指数移动平均"""
-    return series.ewm(span=span, adjust=False).mean()
-
-
-
 # ============ 特征计算函数（全部在groupby内按股票计算） ============
 
 def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
@@ -344,6 +335,17 @@ def run_pipeline(end_date=None):
     Args:
         end_date: 数据截止日期（含），格式 'YYYY-MM-DD'。None 表示使用全部数据。
     """
+    # 缓存命中检查：若 pkl 已存在且最新日期与目标日期一致，直接复用
+    if end_date is not None and os.path.exists(FEATURE_PKL):
+        try:
+            cached = pd.read_pickle(FEATURE_PKL)
+            cached_max = cached['date'].max()
+            if pd.Timestamp(end_date) == cached_max:
+                print(f"✅ [缓存命中] features.pkl 已是 {end_date}，跳过重新计算")
+                return cached
+        except Exception:
+            pass  # 读取失败则继续正常流程
+
     df = pd.read_pickle(CLEAN_PKL)
 
     # 截断到指定日期（在特征计算前截断，确保不使用未来数据）

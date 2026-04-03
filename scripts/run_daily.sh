@@ -57,18 +57,50 @@ if [ "$DATE_ARG" != "$(date +%Y-%m-%d)" ]; then
     echo "[Step 1/4] 历史模式：跳过数据更新，使用现有 CSV 数据"
 else
     echo "[Step 1/4] 增量更新数据..."
-    python "$SRC_DIR/py00_fetch_stock_data.py" --update
+    python "$SRC_DIR/py00_fetch_stock_data.py"
 fi
+
+# 检查 pkl 缓存是否已是目标日期（用 Python 读取 max(date)）
+check_pkl_date() {
+    local pkl_path="$1"
+    local target_date="$2"
+    python - <<EOF
+import sys, pandas as pd, os
+pkl = "$pkl_path"
+if not os.path.exists(pkl):
+    print("miss")
+    sys.exit(0)
+try:
+    df = pd.read_pickle(pkl)
+    max_date = df['date'].max()
+    print("hit" if str(max_date.date()) == "$target_date" else "miss")
+except Exception:
+    print("miss")
+EOF
+}
+
+CLEAN_PKL="$PROJECT_DIR/data/mainboard_clean.pkl"
+FEATURE_PKL="$PROJECT_DIR/data/features.pkl"
 
 # Step 2: 数据清洗（截断到指定日期）
 echo ""
-echo "[Step 2/4] 数据清洗..."
-python "$SRC_DIR/py01_data_loader.py" --date "$DATE_ARG"
+CLEAN_CACHE=$(check_pkl_date "$CLEAN_PKL" "$DATE_ARG")
+if [ "$CLEAN_CACHE" = "hit" ]; then
+    echo "[Step 2/4] 数据清洗：缓存命中 ($DATE_ARG)，跳过"
+else
+    echo "[Step 2/4] 数据清洗..."
+    python "$SRC_DIR/py01_data_loader.py" --date "$DATE_ARG"
+fi
 
 # Step 3: 特征工程（截断到指定日期）
 echo ""
-echo "[Step 3/4] 特征工程..."
-python "$SRC_DIR/py02_features.py" --date "$DATE_ARG"
+FEATURE_CACHE=$(check_pkl_date "$FEATURE_PKL" "$DATE_ARG")
+if [ "$FEATURE_CACHE" = "hit" ]; then
+    echo "[Step 3/4] 特征工程：缓存命中 ($DATE_ARG)，跳过"
+else
+    echo "[Step 3/4] 特征工程..."
+    python "$SRC_DIR/py02_features.py" --date "$DATE_ARG"
+fi
 
 # Step 4: 单日快速预测（只预测指定日期，不做 walk-forward）
 echo ""

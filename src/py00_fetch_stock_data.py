@@ -30,9 +30,9 @@ END_DATE = get_end_date()
 
 SAVE_EVERY = 200  # 每下载200只股票保存一次
 
-# baostock 一般在收盘后、约 17:00 前完成当日数据入库
+# baostock 一般在收盘后、约 18:00 前完成当日数据入库
 # 早于此时间认为当日数据尚未就绪，预期最新数据仍为上一交易日
-MARKET_DATA_READY_HOUR = 17
+MARKET_DATA_READY_HOUR = 18
 
 
 def get_expected_latest_date() -> str:
@@ -41,8 +41,8 @@ def get_expected_latest_date() -> str:
     预期已入库的最新交易日期。
 
     规则：
-    - 当前时间 >= 17:00 且今天是交易日 → 预期最新 = 今天
-    - 当前时间 < 17:00，或今天是非交易日（周末/节假日） → 预期最新 = 上一个交易日
+    - 当前时间 >= 18:00 且今天是交易日 → 预期最新 = 今天
+    - 当前时间 < 18:00，或今天是非交易日（周末/节假日） → 预期最新 = 上一个交易日
 
     注意：调用前须已登录 baostock（bs.login()）。
     """
@@ -256,7 +256,7 @@ def is_complete(existing_df: pd.DataFrame, code: str, expected_date: str) -> boo
     return last_date >= expected_date
 
 
-def main(limit: int = 0, update: bool = False):
+def main(limit: int = 0, full: bool = False):
     lg = bs.login()
     if lg.error_code != "0":
         print(f"baostock 登录失败: {lg.error_msg}")
@@ -283,7 +283,8 @@ def main(limit: int = 0, update: bool = False):
         else:
             print("暂无已有数据，将从头开始下载")
 
-        if update:
+        # 默认模式：增量更新
+        if not full:
             print("=" * 50)
             print("  增量更新模式")
             print("=" * 50)
@@ -351,6 +352,9 @@ def main(limit: int = 0, update: bool = False):
             return
 
         # ── 全量下载 / 断点续传 ──
+        print("=" * 50)
+        print("  全量下载模式")
+        print("=" * 50)
         skip_count = 0
         pending = []
         for code, name in stock_list:
@@ -411,6 +415,6 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="A股日K数据下载")
     parser.add_argument("-n", "--limit", type=int, default=0, help="限制下载数量，0表示全部")
-    parser.add_argument("-u", "--update", action="store_true", help="增量更新模式，只下载缺失的最近数据")
+    parser.add_argument("-f", "--full", action="store_true", help="全量下载模式，重新下载所有股票数据")
     args = parser.parse_args()
-    main(limit=args.limit, update=args.update)
+    main(limit=args.limit, full=args.full)

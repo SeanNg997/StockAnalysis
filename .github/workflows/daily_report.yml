@@ -2,8 +2,8 @@ name: Daily Stock Strategy Report
 
 on:
   schedule:
-    # 每个交易日北京时间 19:03 (UTC 11:03) 盘后运行
-    - cron: '3 11 * * 1-5'  # UTC Mon-Fri 11:03 = 北京时间 Mon-Fri 19:03
+    # 每个交易日北京时间 19:30 (UTC 11:30) 盘后运行
+    - cron: '30 11 * * 1-5'  # UTC Mon-Fri 11:30 = 北京时间 Mon-Fri 19:30
   workflow_dispatch:  # 支持手动触发
 
 env:
