@@ -47,7 +47,7 @@ LGB_PARAMS = {
     'lambda_l2': 5.0,              # 更强L2正则 (1.0→5.0)
     'min_gain_to_split': 0.01,     # 分裂最小增益，防止无意义分裂
     'verbose': -1,
-    'n_jobs': -1,
+    'n_jobs': max(1, (os.cpu_count() or 4) // N_ENSEMBLE),
 }
 
 
@@ -73,9 +73,10 @@ def _train_single_model(seed, params, X_train, y_train, X_val, y_val):
         tuple: (seed, trained_model)
     """
     params_copy = params.copy()
-    params_copy['seed'] = seed * 42
-    params_copy['feature_fraction_seed'] = seed * 42
-    params_copy['bagging_seed'] = seed * 42
+    _PRIME_SEEDS = [7, 13, 31, 97, 127, 211, 307, 401, 503, 607]
+    params_copy['seed'] = _PRIME_SEEDS[seed % len(_PRIME_SEEDS)]
+    params_copy['feature_fraction_seed'] = _PRIME_SEEDS[(seed + 2) % len(_PRIME_SEEDS)]
+    params_copy['bagging_seed'] = _PRIME_SEEDS[(seed + 4) % len(_PRIME_SEEDS)]
 
     dtrain = lgb.Dataset(X_train, label=y_train)
     dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
@@ -133,6 +134,9 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
         val_start = min(val_split + HOLD_DAYS, len(train_dates))
         train_date_set = set(train_dates[:val_split])
         val_date_set = set(train_dates[val_start:])
+        # 若 purge gap 过大导致验证集过小，回退到无 gap 的最后10%
+        if len(val_date_set) < 10:
+            val_date_set = set(train_dates[val_split:])
 
         train_mask = df['date'].isin(train_date_set)
         val_mask = df['date'].isin(val_date_set)
@@ -149,12 +153,19 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
         print(f"单日预测模式: 目标日 {target_date.date()}")
         print(f"训练集: {len(X_train):,} 行, 验证集: {len(X_val):,} 行")
 
+        # 转为 numpy array，确保多线程共享读取安全
+        X_train_arr = X_train.values
+        y_train_arr = y_train.values
+        X_val_arr = X_val.values
+        y_val_arr = y_val.values
+        del X_train, y_train, X_val, y_val
+
         # 并行训练Ensemble模型
         models_dict = {}
         with ThreadPoolExecutor(max_workers=N_ENSEMBLE) as executor:
             futures = [
                 executor.submit(_train_single_model, seed, LGB_PARAMS,
-                               X_train, y_train, X_val, y_val)
+                               X_train_arr, y_train_arr, X_val_arr, y_val_arr)
                 for seed in range(N_ENSEMBLE)
             ]
             for future in futures:
@@ -163,8 +174,6 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
                 print(f"  模型 {seed+1}/{N_ENSEMBLE} 完成, best_iter={model.best_iteration}")
 
         models = [models_dict[seed] for seed in range(N_ENSEMBLE)]
-
-        del X_train, y_train, X_val, y_val
         gc.collect()
 
         day_mask = df['date'] == target_date
@@ -233,6 +242,9 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
             val_start = min(val_split + HOLD_DAYS, len(train_dates))
             train_date_set = set(train_dates[:val_split])
             val_date_set = set(train_dates[val_start:])
+            # 若 purge gap 过大导致验证集过小，回退到无 gap 的最后10%
+            if len(val_date_set) < 10:
+                val_date_set = set(train_dates[val_split:])
 
             train_mask = df['date'].isin(train_date_set)
             val_mask = df['date'].isin(val_date_set)
@@ -250,12 +262,18 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
             X_val = X_val[valid_val]
             y_val = y_val[valid_val]
 
+            # 转为 numpy array，确保多线程共享读取安全
+            X_train_arr = X_train.values
+            y_train_arr = y_train.values
+            X_val_arr = X_val.values
+            y_val_arr = y_val.values
+
             # 并行训练Ensemble模型
             models_dict = {}
             with ThreadPoolExecutor(max_workers=N_ENSEMBLE) as executor:
                 futures = [
                     executor.submit(_train_single_model, seed, LGB_PARAMS,
-                                   X_train, y_train, X_val, y_val)
+                                   X_train_arr, y_train_arr, X_val_arr, y_val_arr)
                     for seed in range(N_ENSEMBLE)
                 ]
                 for future in futures:

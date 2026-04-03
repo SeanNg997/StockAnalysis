@@ -93,7 +93,7 @@ def _load_latest_data(target_date=None):
     latest = latest_pred.merge(latest_price, on='代码', how='left')
     latest = latest.sort_values('pred_return', ascending=False)
 
-    return latest, latest_date
+    return latest, latest_date, pred_df
 
 
 def generate_stock_report(stock_code, target_date=None):
@@ -106,7 +106,7 @@ def generate_stock_report(stock_code, target_date=None):
     full_code = normalize_stock_code(stock_code)
     short_code = full_code.split('.')[1]  # 6位数字代码，用于文件名
     print(f"生成 {full_code} 的交易决策...")
-    latest, latest_date = _load_latest_data(target_date)
+    latest, latest_date, pred_df = _load_latest_data(target_date)
 
     stock = latest[latest['代码'] == full_code].copy()
     if stock.empty:
@@ -146,7 +146,6 @@ def generate_stock_report(stock_code, target_date=None):
         advice_detail = "预测收益为负，建议回避或减仓"
 
     # 获取历史趋势：最近几天的预测变化
-    pred_df = pd.read_pickle(PREDICT_PKL)
     stock_history = pred_df[pred_df['代码'] == full_code].sort_values('date').tail(5)
 
     known_days = set(pred_df['date'].dt.date.unique())
@@ -209,7 +208,7 @@ def generate_today_strategy(target_date=None):
         target_date: 目标日期 'YYYY-MM-DD'，None 表示最新日期
     """
     print("生成今日交易决策...")
-    latest, latest_date = _load_latest_data(target_date)
+    latest, latest_date, pred_df = _load_latest_data(target_date)
 
     # 过滤：预测收益率 > 0.2% 且 置信度 > 50%
     qualified = latest[
@@ -224,7 +223,7 @@ def generate_today_strategy(target_date=None):
         qualified = qualified.head(0)
 
     exec_date = next_trading_day(latest_date.date(), known_trading_days=set(
-        pd.read_pickle(PREDICT_PKL)['date'].dt.date.unique()
+        pred_df['date'].dt.date.unique()
     ))
 
     # ===== 构建Markdown报告 =====

@@ -33,10 +33,6 @@ def _ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 
-def _sma(series: pd.Series, window: int) -> pd.Series:
-    """简单移动平均"""
-    return series.rolling(window, min_periods=1).mean()
-
 
 # ============ 特征计算函数（全部在groupby内按股票计算） ============
 
@@ -94,29 +90,34 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     feats['macd_hist'] = macd_hist / (close + 1e-10)
 
     # ===== 4. RSI =====
+    # delta从第1天开始差分，第0位设为0（避免prepend污染EWM初始化）
+    _rsi_delta = np.zeros(n)
+    _rsi_delta[1:] = close[1:] - close[:-1]
+    _rsi_gain = np.where(_rsi_delta > 0, _rsi_delta, 0.0)
+    _rsi_loss = np.where(_rsi_delta < 0, -_rsi_delta, 0.0)
     for period in [6, 12, 24]:
-        delta = np.diff(close, prepend=close[0])
-        gain = np.where(delta > 0, delta, 0.0)
-        loss = np.where(delta < 0, -delta, 0.0)
-        avg_gain = pd.Series(gain).ewm(span=period, adjust=False).mean().values
-        avg_loss = pd.Series(loss).ewm(span=period, adjust=False).mean().values
+        avg_gain = pd.Series(_rsi_gain).ewm(span=period, adjust=False).mean().values
+        avg_loss = pd.Series(_rsi_loss).ewm(span=period, adjust=False).mean().values
         rs = avg_gain / (avg_loss + 1e-10)
         feats[f'rsi_{period}'] = 100.0 - 100.0 / (1.0 + rs)
 
     # ===== 5. 布林带 =====
     bb_period = 20
     bb_ma = pd.Series(close).rolling(bb_period, min_periods=1).mean().values
-    bb_std = pd.Series(close).rolling(bb_period, min_periods=1).std().values
+    bb_std = pd.Series(close).rolling(bb_period, min_periods=2).std().fillna(0).values
     bb_upper = bb_ma + 2 * bb_std
     bb_lower = bb_ma - 2 * bb_std
     feats['bb_pctb'] = (close - bb_lower) / (bb_upper - bb_lower + 1e-10)
     feats['bb_width'] = (bb_upper - bb_lower) / (bb_ma + 1e-10)
 
     # ===== 6. ATR =====
+    hl = high - low
     tr = np.empty(n)
-    tr[0] = high[0] - low[0]
-    for i in range(1, n):
-        tr[i] = max(high[i] - low[i], abs(high[i] - close[i-1]), abs(low[i] - close[i-1]))
+    tr[0] = hl[0]
+    tr[1:] = np.maximum(hl[1:], np.maximum(
+        np.abs(high[1:] - close[:-1]),
+        np.abs(low[1:] - close[:-1])
+    ))
     atr14 = pd.Series(tr).ewm(span=14, adjust=False).mean().values
     feats['atr14_ratio'] = atr14 / (close + 1e-10)
 
@@ -137,15 +138,9 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     vol_ma5 = vol_s.rolling(5, min_periods=1).mean().values
     feats['vol_ratio'] = volume / (vol_ma5 + 1e-10)
 
-    # OBV
-    obv = np.zeros(n)
-    for i in range(1, n):
-        if close[i] > close[i-1]:
-            obv[i] = obv[i-1] + volume[i]
-        elif close[i] < close[i-1]:
-            obv[i] = obv[i-1] - volume[i]
-        else:
-            obv[i] = obv[i-1]
+    # OBV（向量化：np.sign(diff)*volume 累加）
+    _obv_sign = np.sign(np.diff(close, prepend=close[0]))
+    obv = np.cumsum(_obv_sign * volume)
     obv_ma = pd.Series(obv).rolling(10, min_periods=1).mean().values
     feats['obv_diff'] = (obv - obv_ma) / (np.abs(obv_ma) + 1e-10)
 
@@ -192,13 +187,12 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
 
     # ===== 12. 额外alpha因子 =====
     # 反转因子：短期超跌反弹
-    if n >= 5:
-        ret_5d = feats['ret_5d']
-        vol_5d = feats['volatility_5d']
-        feats['reversal_5d'] = -ret_5d  # 短期反转
-        # 波动率调整动量
-        safe_vol = np.where(np.isnan(vol_5d) | (vol_5d < 1e-10), 1e-10, vol_5d)
-        feats['risk_adj_mom_20d'] = feats['ret_20d'] / safe_vol
+    ret_5d = feats['ret_5d']
+    vol_5d = feats['volatility_5d']
+    feats['reversal_5d'] = -ret_5d  # 短期反转
+    # 波动率调整动量
+    safe_vol = np.where(np.isnan(vol_5d) | (vol_5d < 1e-10), 1e-10, vol_5d)
+    feats['risk_adj_mom_20d'] = feats['ret_20d'] / safe_vol
 
     # 成交额变化趋势
     amt_5ma = pd.Series(amount).rolling(5, min_periods=1).mean().values

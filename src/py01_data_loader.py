@@ -51,7 +51,7 @@ def remove_st(df: pd.DataFrame) -> pd.DataFrame:
     print("[3/6] 剔除ST股票...")
     n_before = df['代码'].nunique()
     # ST标记在名称中：ST、*ST、S*ST等
-    st_mask = df['名称'].str.contains('ST', case=False, na=False)
+    st_mask = df['名称'].str.contains(r'\*?ST', case=True, regex=True, na=False)
     df = df[~st_mask].copy()
     n_after = df['代码'].nunique()
     print(f"  剔除含ST记录后: {n_after} 只股票 (移除了 {n_before - n_after} 只纯ST股)")

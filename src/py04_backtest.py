@@ -140,7 +140,7 @@ def run_backtest(merged: pd.DataFrame) -> dict:
     # 构建 (date, 代码) -> row 的映射（向量化构建，替代 iterrows）
     print("构建数据索引...")
     indexed = merged.set_index(['date', '代码'])
-    date_stock_map = {idx: row for idx, row in indexed.iterrows()}
+    date_stock_map = indexed.to_dict('index')
 
     # 预分组：每日数据（避免循环内重复过滤）
     date_grouped = {d: g for d, g in merged.groupby('date')}
@@ -352,9 +352,9 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                 ].copy()
 
                 if len(candidates) > 0:
-                    candidates['score'] = candidates.apply(
-                        lambda r: compute_composite_score(r['pred_return'], r['confidence']),
-                        axis=1
+                    candidates['score'] = (
+                        candidates['pred_return'] * 0.6
+                        + candidates['confidence'] * candidates['pred_return'] * 0.4
                     )
                     candidates = candidates.sort_values('score', ascending=False)
 
@@ -514,8 +514,9 @@ def compute_metrics(daily_df: pd.DataFrame) -> dict:
     daily_df['daily_return'] = daily_df['portfolio_value'].pct_change()
 
     total_days = len(daily_df)
+    total_trading_days = daily_df['date'].nunique()  # 去重，避免末日重复记录影响年化
     total_return = daily_df.iloc[-1]['portfolio_value'] / INITIAL_CAPITAL - 1
-    annual_return = (1 + total_return) ** (252 / max(total_days, 1)) - 1
+    annual_return = (1 + total_return) ** (252 / max(total_trading_days, 1)) - 1
 
     # 夏普比率（无风险利率2.5%）
     rf_daily = 0.025 / 252

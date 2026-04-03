@@ -38,8 +38,20 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
 matplotlib.use('Agg')
-matplotlib.rcParams['font.family'] = ['PingFang HK', 'Hiragino Sans GB', 'STHeiti',
-                                       'Microsoft YaHei', 'SimHei', 'DejaVu Sans']
+
+def _setup_chinese_font():
+    from matplotlib import font_manager
+    # 按优先级尝试中文字体
+    candidates = ['PingFang SC', 'PingFang HK', 'Heiti SC', 'Hiragino Sans GB',
+                  'STHeiti', 'Arial Unicode MS', 'Microsoft YaHei', 'SimHei']
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    for name in candidates:
+        if name in available:
+            matplotlib.rcParams['font.family'] = [name, 'DejaVu Sans']
+            return
+    matplotlib.rcParams['font.family'] = ['DejaVu Sans']
+
+_setup_chinese_font()
 matplotlib.rcParams['axes.unicode_minus'] = False
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -59,36 +71,27 @@ def is_trading_day(check_date: date) -> bool:
     return check_date.weekday() < 5
 
 
-def check_review_time(force: bool = False, exec_date_arg: date = None) -> None:
-    """检查当前时间是否满足评估条件。
-
-    允许条件：
-    1. 指定 --force 标志
-    2. 指定历史日期（exec_date_arg < 今日）
-    3. 当前时间在第二个交易日开盘前都可以（即从今天 15:00 到明天 09:30 前都行，
-       只要没有跨越到后一个交易日的 09:30 之后）
-    """
-    if force or (exec_date_arg is not None and exec_date_arg < datetime.now().date()):
-        return
-
+def _exec_date_closed(exec_day: date, force: bool = False) -> bool:
+    """判断执行日(T+1)是否已收盘（数据可用）"""
+    if force:
+        return True
     now = datetime.now()
+    today = now.date()
+    if exec_day < today:
+        return True
+    if exec_day == today:
+        close_time = datetime.combine(today, datetime.min.time().replace(hour=15, minute=0))
+        return now >= close_time
+    return False  # exec_day > today，还没到
 
-    # 计算第二个交易日开盘时间（09:30）
-    check_date = now.date()
-    days_offset = 1
-    next_trading_day = check_date
-    while days_offset <= 3:  # 最多向后查找3天
-        next_trading_day = check_date + timedelta(days=days_offset)
-        if is_trading_day(next_trading_day):
-            break
-        days_offset += 1
 
-    # 第二个交易日开盘时间（09:30）
-    next_open_time = datetime.combine(next_trading_day, datetime.min.time().replace(hour=9, minute=30))
-
-    if now >= next_open_time:
-        sys.exit(f"当前时间 {now.strftime('%Y-%m-%d %H:%M')} 已超过第二交易日开盘时间 {next_open_time.strftime('%Y-%m-%d %H:%M')}，"
-                 f"无法评估。请在下个评估周期进行。")
+def check_review_time(force: bool = False, exec_date_arg: date = None) -> None:
+    """时间检查：仅在 --date 指定未来日期时提示，其余情况由 determine_eval_date 自动回退。"""
+    if force or exec_date_arg is None:
+        return
+    today = datetime.now().date()
+    if exec_date_arg > today:
+        sys.exit(f"指定执行日 {exec_date_arg} 尚未到来（今日 {today}），无法评估。")
 
 
 # ── 数据加载 ─────────────────────────────────────────────────────
@@ -132,27 +135,21 @@ def load_today_data(target_date: date) -> pd.DataFrame:
     return today_df
 
 
-def determine_eval_date(pred_df: pd.DataFrame, exec_date_arg: date = None):
+def determine_eval_date(pred_df: pd.DataFrame, exec_date_arg: date = None, force: bool = False):
     """
     确定决策日(T)和执行日(T+1)。
 
-    逻辑：
-    - 决策日 T = predictions.pkl 中的日期（盘后选股）
-    - 执行日 T+1 = T 的下一个交易日（开盘买入、收盘评估）
-
-    参数：
-    - exec_date_arg: 用户通过 --date 指定的执行日。
-      - 若指定：找 predictions.pkl 中 < exec_date_arg 的最新日期作为决策日 T
-      - 若不指定：T = predictions.pkl 最新日期，从CSV中找 T 之后最近的交易日作为执行日
+    - exec_date_arg 指定时：直接用该日作为执行日，反推决策日
+    - 自动模式：从最新 T 往前遍历，找到 T+1 已收盘的那一组
+      （若最新 T+1 未收盘，自动回退到上一个已收盘的 T）
 
     Returns:
-        decision_date: T日（决策日，predictions.pkl 的日期）
+        decision_date: T日（决策日）
         exec_date: T+1日（执行日/评估日）
     """
     all_pred_dates = sorted(pred_df['date'].unique())
 
     if exec_date_arg is not None:
-        # 用户指定执行日 → 反推决策日
         ts = pd.Timestamp(exec_date_arg)
         candidates = [d for d in all_pred_dates if d < ts]
         if not candidates:
@@ -161,26 +158,38 @@ def determine_eval_date(pred_df: pd.DataFrame, exec_date_arg: date = None):
         decision_date = candidates[-1]
         return decision_date, exec_date_arg
 
-    # 自动模式：决策日 = 最新预测日
-    decision_date = all_pred_dates[-1]
-
-    # 从CSV中查找决策日之后最近的交易日作为执行日
+    # 自动模式：预加载 CSV 中所有可用交易日期，用于查找 T+1
     csv_files = sorted(_glob.glob(os.path.join(DATA_DIR, 'Stock_dailyK_*.csv')))
+    csv_trading_dates = set()
     if csv_files:
-        for f in reversed(csv_files[-3:]):
-            tmp = pd.read_csv(f, encoding='utf-8-sig', usecols=['date'])
-            tmp['date'] = pd.to_datetime(tmp['date'])
-            future_dates = tmp[tmp['date'] > decision_date]['date'].unique()
-            if len(future_dates) > 0:
-                exec_dt = pd.Timestamp(min(future_dates)).date()
-                return decision_date, exec_dt
+        for f in csv_files[-4:]:
+            try:
+                tmp = pd.read_csv(f, encoding='utf-8-sig', usecols=['date'])
+                tmp['date'] = pd.to_datetime(tmp['date'])
+                csv_trading_dates.update(tmp['date'].dt.date.unique())
+            except Exception:
+                pass
 
-    # Fallback：决策日后第一个工作日
-    next_d = decision_date.date() if hasattr(decision_date, 'date') else decision_date
-    next_d = next_d + timedelta(days=1)
-    while next_d.weekday() >= 5:
-        next_d += timedelta(days=1)
-    return decision_date, next_d
+    def find_exec_day(decision_date):
+        """找 decision_date 之后第一个有行情数据的交易日"""
+        d = decision_date.date() if hasattr(decision_date, 'date') else decision_date
+        if csv_trading_dates:
+            future = sorted(dt for dt in csv_trading_dates if dt > d)
+            if future:
+                return future[0]
+        # fallback：下一个工作日
+        nxt = d + timedelta(days=1)
+        while nxt.weekday() >= 5:
+            nxt += timedelta(days=1)
+        return nxt
+
+    # 从最新 T 往前找，直到 T+1 已收盘
+    for decision_date in reversed(all_pred_dates):
+        exec_day = find_exec_day(decision_date)
+        if _exec_date_closed(exec_day, force):
+            return decision_date, exec_day
+
+    sys.exit("找不到已收盘的执行日，无可用历史数据可评估。")
 
 
 # ── 决策生成 ─────────────────────────────────────────────────────
@@ -621,7 +630,7 @@ def run_review(force: bool = False, exec_date_arg: date = None) -> None:
     pred_df = load_predictions()
 
     # 2. 确定决策日(T)和执行日(T+1)
-    decision_date, exec_date = determine_eval_date(pred_df, exec_date_arg)
+    decision_date, exec_date = determine_eval_date(pred_df, exec_date_arg, force)
     decision_date_str = decision_date.date() if hasattr(decision_date, 'date') else decision_date
     print(f"决策日(T):   {decision_date_str}")
     print(f"执行日(T+1): {exec_date}")
