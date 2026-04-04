@@ -14,13 +14,13 @@
 ```bash
 pip install -r requirements.txt
 
-# 首次：全量下载数据（约30-60分钟）
+# 首次：全量下载数据（约数小时，下载本项目中的data文件夹后可以省去大部分时间）
 python src/py00_fetch_stock_data.py
 
 # 完整训练流水线（Walk-Forward + 回测 + 可视化）
 ./scripts/run_backtest.sh
 
-# 日常：增量更新 + 快速预测（约30秒）
+# 日常：增量更新 + 快速预测（约7分钟）
 ./scripts/run_strategy.sh
 ```
 
@@ -37,7 +37,7 @@ src/
 └── py06_report.py             可视化报告（净值、回撤、热力图）
 scripts/
 ├── run_strategy.sh            日常快速预测（增量更新 + 单日预测 + 策略报告）
-└── run_backtest.sh               完整重训练（Walk-Forward + 回测 + 可视化）
+└── run_backtest.sh            完整重训练（Walk-Forward + 回测 + 可视化）
 .github/workflows/
 └── daily_report.yml           每个交易日北京时间19:03盘后自动运行 + 邮件推送
 ```
