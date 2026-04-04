@@ -133,5 +133,5 @@ jobs:
           password: ${{ secrets.EMAIL_PASSWORD }}
           subject: '股票策略日报 - ${{ env.REPORT_DATE }}'
           to: ${{ secrets.EMAIL_RECIPIENT }}
-          from: ${{ secrets.EMAIL_USERNAME }}
+          from: ${{ secrets.EMAIL_SENDER_NAME && format('{0} <{1}>', secrets.EMAIL_SENDER_NAME, secrets.EMAIL_USERNAME) || secrets.EMAIL_USERNAME }}
           html_body: file://output/trading_strategy.html
