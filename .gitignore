@@ -31,4 +31,5 @@ Thumbs.db
 *~
 
 # output
-output/
+output/*
+!output/backtest/
