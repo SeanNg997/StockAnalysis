@@ -18,10 +18,10 @@ pip install -r requirements.txt
 python src/py00_fetch_stock_data.py
 
 # 完整训练流水线（Walk-Forward + 回测 + 可视化）
-./scripts/run_model.sh
+./scripts/run_backtest.sh
 
 # 日常：增量更新 + 快速预测（约30秒）
-./scripts/run_daily.sh
+./scripts/run_strategy.sh
 ```
 
 ## 项目结构
@@ -32,12 +32,12 @@ src/
 ├── py01_data_loader.py        数据清洗（主板过滤、ST剔除、流动性筛选）
 ├── py02_features.py           特征工程（60+技术/动量/截面特征）
 ├── py03_model.py              LightGBM Ensemble 训练与预测（并行训练）
-├── py04_backtest.py           回测引擎（T+1、涨跌停、止损止盈、交易成本）
-├── py05_today.py              今日交易决策（生成TOP5买入建议）
+├── py04_today.py              今日交易决策（生成TOP5买入建议）
+├── py05_backtest.py           回测引擎（T+1、涨跌停、止损止盈、交易成本）
 └── py06_report.py             可视化报告（净值、回撤、热力图）
 scripts/
-├── run_daily.sh               日常快速预测（增量更新 + 单日预测 + 策略报告）
-└── run_model.sh               完整重训练（Walk-Forward + 回测 + 可视化）
+├── run_strategy.sh            日常快速预测（增量更新 + 单日预测 + 策略报告）
+└── run_backtest.sh               完整重训练（Walk-Forward + 回测 + 可视化）
 .github/workflows/
 └── daily_report.yml           每个交易日北京时间19:03盘后自动运行 + 邮件推送
 ```
@@ -55,8 +55,7 @@ scripts/
 
 完整的模块说明、特征工程详解、模型设计、回测原理、常见问题等，请参阅：
 
-- **[docs/document.md](docs/document.md)** — 项目完整技术文档
-- **[docs/backtest.md](docs/backtest.md)** — 策略设计原始需求文档
+- **[document.md](document.md)** — 项目完整技术文档
 
 ## 风险提示
 

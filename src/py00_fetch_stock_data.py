@@ -13,14 +13,17 @@ import pandas as pd
 from tqdm import tqdm
 from datetime import datetime, timedelta
 import os
+import gc
 import time
 import glob
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+from config import CONFIG
+
+BASE_DIR = CONFIG['paths']['BASE_DIR']
+DATA_DIR = CONFIG['paths']['DATA_DIR']
 os.makedirs(DATA_DIR, exist_ok=True)
 
-START_DATE = "2019-12-01"
+START_DATE = CONFIG['data_fetch']['START_DATE']
 
 def get_end_date():
     """获取今天日期，用于 baostock API 的 end_date 参数"""
@@ -28,11 +31,11 @@ def get_end_date():
 
 END_DATE = get_end_date()
 
-SAVE_EVERY = 200  # 每下载200只股票保存一次
+SAVE_EVERY = CONFIG['data_fetch']['SAVE_EVERY']  # 每下载指定数量只股票保存一次
 
 # baostock 一般在收盘后、约 18:00 前完成当日数据入库
 # 早于此时间认为当日数据尚未就绪，预期最新数据仍为上一交易日
-MARKET_DATA_READY_HOUR = 18
+MARKET_DATA_READY_HOUR = CONFIG['data_fetch']['MARKET_DATA_READY_HOUR']
 
 
 def get_expected_latest_date() -> str:
@@ -129,8 +132,13 @@ def load_existing_csv() -> pd.DataFrame:
     files = list_monthly_files()
     if not files:
         return pd.DataFrame()
-    dfs = [pd.read_csv(f, encoding="utf-8-sig") for f in files]
-    return pd.concat(dfs, ignore_index=True)
+    df = pd.DataFrame()
+    for f in files:
+        temp_df = pd.read_csv(f, encoding="utf-8-sig")
+        df = pd.concat([df, temp_df], ignore_index=True)
+        del temp_df
+        gc.collect()
+    return df
 
 
 def save_to_csv(df: pd.DataFrame):
@@ -158,15 +166,12 @@ def save_incremental_months(new_df: pd.DataFrame):
         group = group.drop(columns=["_month"])
         monthly_file = get_monthly_file(month)
         if os.path.exists(monthly_file):
-            existing_month = pd.read_csv(monthly_file, encoding="utf-8-sig")
-            # 仅删除与新数据代码+日期完全重复的行，保留同股票其他日期的旧数据
-            new_keys = group[["代码", "date"]].drop_duplicates()
-            new_keys["_dup"] = True
-            existing_month = existing_month.merge(new_keys, on=["代码", "date"], how="left")
-            existing_month = existing_month[existing_month["_dup"] != True].drop(columns=["_dup"])
-            combined = pd.concat([existing_month, group], ignore_index=True)
-            combined = combined.sort_values(["代码", "date"]).reset_index(drop=True)
-            combined.to_csv(monthly_file, index=False, encoding="utf-8-sig")
+                existing_month = pd.read_csv(monthly_file, encoding="utf-8-sig")
+                # 使用更高效的去重方法
+                combined = pd.concat([existing_month, group], ignore_index=True)
+                combined = combined.drop_duplicates(subset=["代码", "date"], keep="last")
+                combined = combined.sort_values(["代码", "date"]).reset_index(drop=True)
+                combined.to_csv(monthly_file, index=False, encoding="utf-8-sig")
         else:
             group.sort_values(["代码", "date"]).reset_index(drop=True).to_csv(
                 monthly_file, index=False, encoding="utf-8-sig"
@@ -197,10 +202,12 @@ def _to_dataframe(rows, fields, symbol, name):
     df = pd.DataFrame(rows, columns=fields)
     df.insert(0, "名称", name)
     df.insert(0, "代码", symbol)
-    for col in ["open", "high", "low", "close", "volume", "amount", "turn",
-                 "pctChg", "peTTM", "pbMRQ", "psTTM", "pcfNcfTTM"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # 批量转换数值列
+    numeric_cols = ["open", "high", "low", "close", "volume", "amount", "turn",
+                    "pctChg", "peTTM", "pbMRQ", "psTTM", "pcfNcfTTM"]
+    numeric_cols = [col for col in numeric_cols if col in df.columns]
+    if numeric_cols:
+        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
     return df
 
 

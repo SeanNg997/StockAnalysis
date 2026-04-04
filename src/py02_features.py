@@ -19,11 +19,13 @@ import os
 import gc
 import warnings
 
+from config import CONFIG
+
 warnings.filterwarnings('ignore')
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLEAN_PKL = os.path.join(BASE_DIR, 'data', 'mainboard_clean.pkl')
-FEATURE_PKL = os.path.join(BASE_DIR, 'data', 'features.pkl')
+BASE_DIR = CONFIG['paths']['BASE_DIR']
+CLEAN_PKL = CONFIG['paths']['CLEAN_PKL']
+FEATURE_PKL = CONFIG['paths']['FEATURE_PKL']
 
 # ============ 特征计算函数（全部在groupby内按股票计算） ============
 
@@ -32,13 +34,13 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     对单只股票的DataFrame计算所有特征。
     输入g已按date升序排列。
     """
-    close = g['close'].values.astype(np.float64)
-    open_ = g['open'].values.astype(np.float64)
-    high = g['high'].values.astype(np.float64)
-    low = g['low'].values.astype(np.float64)
-    volume = g['volume'].values.astype(np.float64)
-    amount = g['amount'].values.astype(np.float64)
-    turn = g['turn'].values.astype(np.float64)
+    close = g['close'].values.astype(np.float32)
+    open_ = g['open'].values.astype(np.float32)
+    high = g['high'].values.astype(np.float32)
+    low = g['low'].values.astype(np.float32)
+    volume = g['volume'].values.astype(np.float32)
+    amount = g['amount'].values.astype(np.float32)
+    turn = g['turn'].values.astype(np.float32)
     n = len(g)
 
     feats = {}
@@ -57,9 +59,13 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     feats['log_ret_1d'] = log_ret
 
     # ===== 2. 均线系统 =====
-    close_s = pd.Series(close)
     for w in [5, 10, 20, 60]:
-        ma = close_s.rolling(w, min_periods=1).mean().values
+        # trailing MA：只使用当天及之前的数据，避免未来信息泄漏
+        _cs = np.cumsum(np.insert(close, 0, 0))
+        ma = np.empty(n)
+        for i in range(n):
+            start = max(0, i + 1 - w)
+            ma[i] = (_cs[i + 1] - _cs[start]) / (i + 1 - start)
         feats[f'ma_{w}'] = ma
         feats[f'ma_bias_{w}'] = (close - ma) / (ma + 1e-10)
 
@@ -71,10 +77,20 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     ) / 3.0
 
     # ===== 3. MACD =====
-    ema12 = pd.Series(close).ewm(span=12, adjust=False).mean().values
-    ema26 = pd.Series(close).ewm(span=26, adjust=False).mean().values
+    # NumPy实现EWMA
+    def ewma(x, span):
+        alpha = 2 / (span + 1)
+        n = len(x)
+        result = np.zeros(n)
+        result[0] = x[0]
+        for i in range(1, n):
+            result[i] = alpha * x[i] + (1 - alpha) * result[i-1]
+        return result
+
+    ema12 = ewma(close, 12)
+    ema26 = ewma(close, 26)
     dif = ema12 - ema26
-    dea = pd.Series(dif).ewm(span=9, adjust=False).mean().values
+    dea = ewma(dif, 9)
     macd_hist = 2.0 * (dif - dea)
     feats['macd_dif'] = dif / (close + 1e-10)  # 归一化
     feats['macd_dea'] = dea / (close + 1e-10)
@@ -86,9 +102,10 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     _rsi_delta[1:] = close[1:] - close[:-1]
     _rsi_gain = np.where(_rsi_delta > 0, _rsi_delta, 0.0)
     _rsi_loss = np.where(_rsi_delta < 0, -_rsi_delta, 0.0)
+
     for period in [6, 12, 24]:
-        avg_gain = pd.Series(_rsi_gain).ewm(span=period, adjust=False).mean().values
-        avg_loss = pd.Series(_rsi_loss).ewm(span=period, adjust=False).mean().values
+        avg_gain = ewma(_rsi_gain, period)
+        avg_loss = ewma(_rsi_loss, period)
         rs = avg_gain / (avg_loss + 1e-10)
         feats[f'rsi_{period}'] = 100.0 - 100.0 / (1.0 + rs)
 
@@ -132,7 +149,12 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     # OBV（向量化：np.sign(diff)*volume 累加）
     _obv_sign = np.sign(np.diff(close, prepend=close[0]))
     obv = np.cumsum(_obv_sign * volume)
-    obv_ma = pd.Series(obv).rolling(10, min_periods=1).mean().values
+    # trailing滚动平均（只使用当天及之前数据）
+    _obv_cs = np.cumsum(np.insert(obv, 0, 0))
+    obv_ma = np.empty(n)
+    for i in range(n):
+        start = max(0, i + 1 - 10)
+        obv_ma[i] = (_obv_cs[i + 1] - _obv_cs[start]) / (i + 1 - start)
     feats['obv_diff'] = (obv - obv_ma) / (np.abs(obv_ma) + 1e-10)
 
     # 换手率均值和突变
@@ -211,31 +233,31 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     feats['lower_shadow'] = (np.minimum(close, open_) - low) / total_range
 
     # ===== 13. 标签：T+1开盘买入 → 持有HOLD_DAYS天 → T+1+HOLD_DAYS开盘卖出 =====
-    HOLD_DAYS = 5  # 持有5个交易日（T+1买入 → T+6卖出）
-    sell_offset = HOLD_DAYS + 1  # 卖出价在 T+1+HOLD_DAYS = T+6 位置
+    HOLD_DAYS = CONFIG['features']['HOLD_DAYS']  # 持有交易日数（T+1买入 → T+1+HOLD_DAYS卖出）
+    sell_offset = HOLD_DAYS + 1  # 卖出价在 T+1+HOLD_DAYS 位置
 
-    open_next1 = np.empty(n)
-    open_next1[:-1] = open_[1:]
+    # 使用更高效的方式创建滞后/超前数组
+    open_next1 = np.roll(open_, -1)
     open_next1[-1] = np.nan
 
-    open_next_n = np.empty(n)
-    if n > sell_offset:
-        open_next_n[:n-sell_offset] = open_[sell_offset:]
-        open_next_n[n-sell_offset:] = np.nan
-    else:
+    open_next_n = np.roll(open_, -sell_offset)
+    open_next_n[-sell_offset:] = np.nan
+    if n <= sell_offset:
         open_next_n[:] = np.nan
 
-    # 扣除交易成本: 买入佣金0.0085%, 卖出佣金0.0085%+印花税0.05%
+    # 扣除交易成本
     # 注意：最低佣金1元在标签计算中无法体现（不知道交易金额），
     # 但由于每笔交易通常数万元，比例费率的影响更大
-    buy_cost = 1.0 + 0.000085
-    sell_cost = 1.0 - 0.000585
+    buy_cost = CONFIG['features']['BUY_COST']
+    sell_cost = CONFIG['features']['SELL_COST']
     raw_label = (open_next_n * sell_cost) / (open_next1 * buy_cost) - 1.0
 
-    # Winsorize极端标签值（截断到±30%）
+    # Winsorize极端标签值
     # 主板5日复利极端收益约50%，±30%保留绝大多数信号同时抑制极端噪声。
     # 原±10%过于保守，会压制高动量标的的训练信号。
-    raw_label = np.clip(raw_label, -0.30, 0.30)
+    label_min = CONFIG['features']['LABEL_WINSORIZE_MIN']
+    label_max = CONFIG['features']['LABEL_WINSORIZE_MAX']
+    raw_label = np.clip(raw_label, label_min, label_max)
     feats['label'] = raw_label
 
     # 将所有特征转为DataFrame
@@ -248,34 +270,27 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
     print("开始特征工程...")
     df = df.sort_values(['代码', 'date']).reset_index(drop=True)
 
-    # 分组计算（使用高效的apply）
+    # 向量化计算所有股票技术指标
     print("  计算个股技术指标...")
 
-    # 分批处理避免内存问题
-    stocks = df['代码'].unique()
-    n_stocks = len(stocks)
-    batch_size = 100
+    # 按股票分组处理
+    stock_groups = df.groupby('代码')
     feat_cols_initialized = False
 
-    for i in range(0, n_stocks, batch_size):
-        batch_stocks = stocks[i:i+batch_size]
-        batch_df = df[df['代码'].isin(batch_stocks)]
-        batch_feats = batch_df.groupby('代码', group_keys=False).apply(
-            compute_features_for_stock
-        )
-
+    for stock_code, group in stock_groups:
+        # 计算特征
+        stock_feats = compute_features_for_stock(group)
+        
         # 首批时初始化特征列
         if not feat_cols_initialized:
-            for col in batch_feats.columns:
+            for col in stock_feats.columns:
                 df[col] = np.nan
             feat_cols_initialized = True
+        
+        # 直接写入原 DataFrame
+        df.loc[stock_feats.index, stock_feats.columns] = stock_feats
 
-        # 直接写入原 DataFrame，避免 concat 双倍内存
-        df.loc[batch_feats.index, batch_feats.columns] = batch_feats
-
-        del batch_df, batch_feats
-        gc.collect()
-        print(f"  进度: {min(i+batch_size, n_stocks)}/{n_stocks} 只股票")
+    print(f"  完成所有 {len(stock_groups)} 只股票的特征计算")
 
     # ===== 截面特征（市场环境） =====
     print("  计算截面特征...")
@@ -312,9 +327,10 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # 特征列转 float32 节省内存
     feat_cols = get_feature_columns(df)
-    for col in feat_cols:
-        if df[col].dtype == np.float64:
-            df[col] = df[col].astype(np.float32)
+    # 批量转换所有浮点列
+    float_cols = [col for col in feat_cols if df[col].dtype == np.float64]
+    if float_cols:
+        df[float_cols] = df[float_cols].astype(np.float32)
     gc.collect()
 
     print(f"✅ 特征工程完成! {df.shape[0]:,} 行, {df.shape[1]} 列")
@@ -335,15 +351,29 @@ def run_pipeline(end_date=None):
     Args:
         end_date: 数据截止日期（含），格式 'YYYY-MM-DD'。None 表示使用全部数据。
     """
-    # 缓存命中检查：若 pkl 已存在且最新日期与目标日期一致，直接复用
-    if end_date is not None and os.path.exists(FEATURE_PKL):
+    # 缓存命中检查
+    # 1. 若指定了 end_date，检查 pkl 最新日期是否等于 end_date
+    # 2. 若未指定 end_date，检查 pkl 最新日期是否与清洗后数据一致
+    if os.path.exists(FEATURE_PKL):
         try:
             cached = pd.read_pickle(FEATURE_PKL)
             cached_max = cached['date'].max()
-            if pd.Timestamp(end_date) == cached_max:
-                print(f"✅ [缓存命中] features.pkl 已是 {end_date}，跳过重新计算")
-                return cached
-        except Exception:
+            
+            if end_date is not None:
+                # 指定了截止日期：检查缓存是否已包含该日期
+                if pd.Timestamp(end_date) == cached_max:
+                    print(f"✅ [缓存命中] features.pkl 已是 {end_date}，跳过重新计算")
+                    return cached
+            else:
+                # 未指定截止日期：检查缓存是否与清洗后数据一致
+                if os.path.exists(CLEAN_PKL):
+                    clean_df = pd.read_pickle(CLEAN_PKL)
+                    clean_max = clean_df['date'].max()
+                    if cached_max == clean_max:
+                        print(f"✅ [缓存命中] features.pkl 已是最新 ({cached_max.date()})，跳过重新计算")
+                        return cached
+        except Exception as e:
+            print(f"  [缓存读取失败: {e}]，继续重新计算...")
             pass  # 读取失败则继续正常流程
 
     df = pd.read_pickle(CLEAN_PKL)
@@ -356,6 +386,7 @@ def run_pipeline(end_date=None):
     df = compute_all_features(df)
 
     # 保存
+    os.makedirs(os.path.dirname(FEATURE_PKL), exist_ok=True)
     df.to_pickle(FEATURE_PKL)
     print(f"保存至 {FEATURE_PKL}")
     print(f"特征列数: {len(get_feature_columns(df))}")

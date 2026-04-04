@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
-# run_daily.sh — A股量化策略每日预测脚本（快速单日预测，不含回测）
+# run_strategy.sh — A股量化策略每日预测脚本（快速单日预测，不含回测）
 #
 # 用法:
-#   ./scripts/run_daily.sh                         # 最新日期全市场策略
-#   ./scripts/run_daily.sh --date 2025-03-14       # 指定日期全市场策略
-#   ./scripts/run_daily.sh 600000                  # 最新日期单股票策略报告
-#   ./scripts/run_daily.sh --date 2025-03-14 600000  # 指定日期单股票策略报告
+#   ./scripts/run_strategy.sh                         # 最新日期全市场策略
+#   ./scripts/run_strategy.sh --date 2025-03-14       # 指定日期全市场策略
 #
 # 注：此脚本仅用于预测指定日期的决策，速度快（~30秒）
-#    若需要完整的 walk-forward 训练和回测，请运行 ./scripts/run_model.sh
+#    若需要完整的 walk-forward 训练和回测，请运行 ./scripts/run_backtest.sh
 #
 set -e
 
@@ -17,10 +15,10 @@ export TZ=Asia/Shanghai
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SRC_DIR="$PROJECT_DIR/src"
+START_TIME=$(date +%s)
 
-# 解析参数：--date YYYY-MM-DD、以及可选的股票代码
+# 解析参数：--date YYYY-MM-DD
 DATE_ARG=""
-STOCK_CODE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -29,7 +27,6 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         *)
-            STOCK_CODE="$1"
             shift
             ;;
     esac
@@ -45,9 +42,6 @@ echo "=============================================="
 echo "  A股量化策略 — 每日预测 $DISPLAY_DATE"
 if [ -n "$DATE_ARG" ]; then
     echo "  [历史回溯模式] 数据截止: $DATE_ARG"
-fi
-if [ -n "$STOCK_CODE" ]; then
-    echo "  目标股票: $STOCK_CODE"
 fi
 echo "=============================================="
 
@@ -110,18 +104,14 @@ python "$SRC_DIR/py03_model.py" --date "$DATE_ARG"
 # Step 5: 生成策略报告
 echo ""
 echo "[Step 5] 生成策略报告..."
-if [ -n "$STOCK_CODE" ]; then
-    python "$SRC_DIR/py05_today.py" --date "$DATE_ARG" "$STOCK_CODE"
-else
-    python "$SRC_DIR/py05_today.py" --date "$DATE_ARG"
-fi
+python "$SRC_DIR/py04_today.py" --date "$DATE_ARG"
 
 echo ""
 echo "=============================================="
-if [ -n "$STOCK_CODE" ]; then
-    SHORT_CODE=$(echo "$STOCK_CODE" | grep -oE '[0-9]{6}')
-    echo "  完成! 策略报告: output/today_strategy_${SHORT_CODE}.md"
-else
-    echo "  完成! 策略报告: output/today_strategy.md"
-fi
+echo "  完成! 策略报告: output/trading_strategy.md"
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+MINUTES=$((ELAPSED / 60))
+SECONDS=$((ELAPSED % 60))
+echo "  总耗时: ${MINUTES} 分 ${SECONDS} 秒"
 echo "=============================================="

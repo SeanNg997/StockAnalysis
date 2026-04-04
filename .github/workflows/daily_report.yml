@@ -91,7 +91,7 @@ jobs:
           python src/py03_model.py --date $(date +%Y-%m-%d)
 
           echo "===== Step 5: Generate strategy ====="
-          python src/py05_today.py
+          python src/py04_today.py
 
       # 将 Markdown 策略报告转为 HTML（供邮件发送）
       - name: Convert strategy report to HTML
@@ -100,7 +100,7 @@ jobs:
           pip install markdown
           python - <<'PYEOF'
           import markdown, pathlib
-          md_text = pathlib.Path("output/today_strategy.md").read_text(encoding="utf-8")
+          md_text = pathlib.Path("output/trading_strategy.md").read_text(encoding="utf-8")
           html_body = markdown.markdown(md_text, extensions=["tables", "sane_lists"])
           full_html = f"""<!DOCTYPE html>
           <html><head><meta charset="utf-8"><style>
@@ -116,8 +116,8 @@ jobs:
           em {{ color: #888; }}
           strong {{ color: #222; }}
           </style></head><body>{html_body}</body></html>"""
-          pathlib.Path("output/today_strategy.html").write_text(full_html, encoding="utf-8")
-          print("✓ HTML email generated: output/today_strategy.html")
+          pathlib.Path("output/trading_strategy.html").write_text(full_html, encoding="utf-8")
+          print("✓ HTML email generated: output/trading_strategy.html")
           PYEOF
 
       # 邮件推送报告（支持多个收件人，用逗号分隔）
@@ -134,4 +134,4 @@ jobs:
           subject: '股票策略日报 - ${{ env.REPORT_DATE }}'
           to: ${{ secrets.EMAIL_RECIPIENT }}
           from: ${{ secrets.EMAIL_USERNAME }}
-          html_body: file://output/today_strategy.html
+          html_body: file://output/trading_strategy.html

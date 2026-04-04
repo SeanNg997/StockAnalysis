@@ -13,8 +13,8 @@
    - [py01 — 数据清洗](#py01--数据清洗)
    - [py02 — 特征工程](#py02--特征工程)
    - [py03 — 模型训练](#py03--模型训练)
-   - [py04 — 回测引擎](#py04--回测引擎)
-   - [py05 — 今日决策](#py05--今日决策)
+   - [py04 — 今日决策](#py04--今日决策)
+   - [py05 — 回测引擎](#py05--回测引擎)
    - [py06 — 可视化报告](#py06--可视化报告)
 4. [Shell 脚本](#4-shell-脚本)
 5. [GitHub Actions 自动化](#5-github-actions-自动化)
@@ -37,12 +37,12 @@ StockAnalysis/
 │   ├── py01_data_loader.py                 #   数据清洗与过滤
 │   ├── py02_features.py                    #   特征工程（60+特征）
 │   ├── py03_model.py                       #   LightGBM 训练与预测（并行）
-│   ├── py04_backtest.py                    #   回测引擎
-│   ├── py05_today.py                       #   今日交易决策
+│   ├── py04_today.py                       #   今日交易决策
+│   ├── py05_backtest.py                    #   回测引擎
 │   └── py06_report.py                      #   可视化报告
 ├── scripts/
-│   ├── run_daily.sh                        #   日常快速预测脚本
-│   └── run_model.sh                        #   完整重训练脚本
+│   └── run_strategy.sh                        #   日常快速预测脚本
+│   └── run_backtest.sh                        #   完整重训练脚本
 ├── data/                                   # 数据目录（.gitignore，通过 Actions cache 持久化）
 │   ├── Stock_dailyK_YYYYMM.csv            #   月度K线数据（~140个文件）
 │   ├── mainboard_clean.pkl                 #   清洗后的主板数据
@@ -51,20 +51,18 @@ StockAnalysis/
 │   ├── .last_date.txt                      #   最后更新日期
 │   └── .download_status.txt               #   下载进度追踪
 ├── output/                                 # 输出目录
-│   ├── today_strategy.md                   #   当日策略报告
-│   ├── today_strategy.html                 #   当日策略报告（HTML，供邮件使用）
-│   ├── backtest_daily.csv                  #   每日回测结果
-│   ├── trade_log.csv                       #   交易流水
-│   ├── backtest_metrics.txt                #   回测绩效指标
+│   ├── trading_strategy.md                   #   当日策略报告
+│   ├── trading_strategy.html                 #   当日策略报告（HTML，供邮件使用）
+│   ├── backtest/                           #   回测输出目录
+│   │   ├── backtest_daily.csv              #     每日回测结果
+│   │   ├── trade_log.csv                   #     交易流水
+│   │   └── backtest_metrics.md             #     回测绩效指标
 │   ├── equity_curve.png                    #   净值曲线图
 │   ├── drawdown_curve.png                  #   最大回撤图
 │   ├── daily_positions.png                 #   每日持仓图
 │   ├── monthly_returns.png                 #   月度收益热力图
 │   ├── feature_importance.png              #   特征重要性图
 │   └── history/                            #   历史策略存档
-├── docs/
-│   ├── backtest.md                         #   策略设计原始需求文档
-│   └── document.md                         #   本文件（项目详细文档）
 ├── .github/workflows/
 │   └── daily_report.yml                    #   GitHub Actions 自动化工作流
 ├── requirements.txt                        #   Python 依赖
@@ -106,12 +104,12 @@ StockAnalysis/
 │    ├─ 模型：LightGBM Ensemble（5个不同随机种子并行训练）              │
 │    └─ 输出：data/predictions.pkl（含pred_return、pred_std、confidence）│
 │                          ↓                    ↓                     │
-│  py04_backtest.py                   py05_today.py                  │
-│    ├─ 模拟真实交易                    ├─ 读取最新预测结果              │
-│    ├─ T+1执行、涨跌停检测              ├─ 过滤：pred_return>0.2%       │
-│    ├─ 止损-5%、止盈+8%               │   且confidence>0.5            │
-│    ├─ 最多5只持仓，每日限购2只         ├─ 输出TOP5买入建议              │
-│    └─ 输出回测报告+交易流水            └─ 输出today_strategy.md       │
+│  py04_today.py                      py05_backtest.py                │
+│    ├─ 读取最新预测结果                ├─ 模拟真实交易                  │
+│    ├─ 过滤：pred_return>0.2%         ├─ T+1执行、涨跌停检测            │
+│    │   且confidence>0.5              ├─ 止损-5%、止盈+8%               │
+│    ├─ 输出TOP5买入建议                ├─ 最多5只持仓，每日限购2只        │
+│    └─ 输出trading_strategy.md          └─ 输出回测报告+交易流水           │
 │                          ↓                                          │
 │  py06_report.py                                                     │
 │    └─ 生成可视化图表（净值、回撤、持仓、热力图、特征重要性）            │
@@ -282,42 +280,9 @@ python src/py03_model.py --date 2025-03-14
 
 ---
 
-### py04 — 回测引擎
+### py04 — 今日决策
 
-**文件**：`src/py04_backtest.py`
-
-详细设计见[第8节 回测设计详解](#8-回测设计详解)。
-
-**策略参数**：
-
-| 参数                | 值         | 说明                         |
-| ------------------- | ---------- | ---------------------------- |
-| `INITIAL_CAPITAL` | 100,000 元 | 初始资金 10 万               |
-| `MAX_POSITIONS`   | 5          | 最大持仓股票数               |
-| `MAX_DAILY_BUY`   | 2          | 每天最多买入只数（分批建仓） |
-| `HOLD_DAYS`       | 5          | 目标持有天数                 |
-| `MIN_PRED_RETURN` | 0.2%       | 最低预测收益率门槛           |
-| `MIN_CONFIDENCE`  | 0.5        | 最低置信度门槛               |
-| `STOP_LOSS`       | -5%        | 止损线                       |
-| `TAKE_PROFIT`     | +8%        | 止盈线                       |
-
-**运行方式**：
-
-```bash
-python src/py04_backtest.py
-```
-
-**输出文件**：
-
-- `output/backtest_daily.csv` — 每日投资组合净值、现金、持仓数量、交易次数
-- `output/trade_log.csv` — 完整交易流水（买入/卖出价格、数量、手续费、P&L）
-- `output/backtest_metrics.txt` — 回测绩效摘要
-
----
-
-### py05 — 今日决策
-
-**文件**：`src/py05_today.py`
+**文件**：`src/py04_today.py`
 
 **核心功能**：
 
@@ -347,23 +312,56 @@ python src/py04_backtest.py
 
 ```bash
 # 全市场报告
-python src/py05_today.py
+python src/py04_today.py
 
 # 单只股票报告
-python src/py05_today.py 600000
+python src/py04_today.py 600000
 
 # 指定历史日期
-python src/py05_today.py --date 2025-03-14
+python src/py04_today.py --date 2025-03-14
 
 # 历史日期 + 单只股票
-python src/py05_today.py --date 2025-03-14 600000
+python src/py04_today.py --date 2025-03-14 600000
 ```
 
 **输出**：
 
-- `output/today_strategy.md` — 全市场策略报告（Markdown 格式）
-- `output/today_strategy_{code}.md` — 单股报告
+- `output/trading_strategy.md` — 全市场策略报告（Markdown 格式）
+- `output/trading_strategy_{code}.md` — 单股报告
 - `output/history/strategy_{date}.md` — 历史策略自动存档
+
+---
+
+### py05 — 回测引擎
+
+**文件**：`src/py05_backtest.py`
+
+详细设计见[第8节 回测设计详解](#8-回测设计详解)。
+
+**策略参数**：
+
+| 参数                | 值         | 说明                         |
+| ------------------- | ---------- | ---------------------------- |
+| `INITIAL_CAPITAL` | 100,000 元 | 初始资金 10 万               |
+| `MAX_POSITIONS`   | 5          | 最大持仓股票数               |
+| `MAX_DAILY_BUY`   | 2          | 每天最多买入只数（分批建仓） |
+| `HOLD_DAYS`       | 5          | 目标持有天数                 |
+| `MIN_PRED_RETURN` | 0.2%       | 最低预测收益率门槛           |
+| `MIN_CONFIDENCE`  | 0.5        | 最低置信度门槛               |
+| `STOP_LOSS`       | -5%        | 止损线                       |
+| `TAKE_PROFIT`     | +8%        | 止盈线                       |
+
+**运行方式**：
+
+```bash
+python src/py05_backtest.py
+```
+
+**输出文件**：
+
+- `output/backtest/backtest_daily.csv` — 每日投资组合净值、现金、持仓数量、交易次数
+- `output/backtest/trade_log.csv` — 完整交易流水（买入/卖出价格、数量、手续费、P&L）
+- `output/backtest/backtest_metrics.md` — 回测绩效摘要
 
 ---
 
@@ -391,15 +389,13 @@ python src/py06_report.py
 
 ## 4. Shell 脚本
 
-### `scripts/run_daily.sh` — 日常快速预测
+### `scripts/run_strategy.sh` — 日常快速预测
 
 **典型耗时**：约30秒至3分钟
 
 ```bash
-./scripts/run_daily.sh                            # 当日全市场报告
-./scripts/run_daily.sh --date 2025-03-14          # 历史日期报告
-./scripts/run_daily.sh 600000                     # 当日单股报告
-./scripts/run_daily.sh --date 2025-03-14 600000   # 历史日期单股报告
+./scripts/run_strategy.sh                            # 当日全市场报告
+./scripts/run_strategy.sh --date 2025-03-14          # 历史日期报告
 ```
 
 **内部流程**：
@@ -416,12 +412,12 @@ Step 5: 生成策略报告
 
 ---
 
-### `scripts/run_model.sh` — 完整重训练
+### `scripts/run_backtest.sh` — 完整重训练
 
 **典型耗时**：约5-30分钟（Walk-Forward 全量训练）
 
 ```bash
-./scripts/run_model.sh
+./scripts/run_backtest.sh
 ```
 
 **内部流程**：
@@ -445,7 +441,7 @@ Step 6: 生成可视化图表
 
 ### 触发时间
 
-- **定时**：UTC 11:30（北京时间 19:30），`cron: '3 11 * * 1-5'`（周一至周五）
+- **定时**：UTC 11:30（北京时间 19:30），`cron: '30 11 * * 1-5'`（周一至周五）
 - **手动**：支持 `workflow_dispatch` 在任意时间手动触发
 
 ### 超时
@@ -713,7 +709,7 @@ confidence = 1.0 / (1.0 + pred_std * 100)
 - 标准差越大 → 模型分歧越大 → 置信度越低
 - 范围：约 0.01（极低）到 0.99（极高）
 
-### 选股过滤条件（py05_today.py）
+### 选股过滤条件（py04_today.py）
 
 ```python
 pred_return > 0.002          # 预测净收益率 > 0.2%
@@ -808,18 +804,18 @@ confidence > 0.5             # 置信度大于 0.5
 
 | 文件                                  | 更新频率 | 说明                     |
 | ------------------------------------- | -------- | ------------------------ |
-| `output/today_strategy.md`          | 每日     | 当日全市场 TOP5 买入建议 |
-| `output/today_strategy.html`        | 每日     | HTML 格式，供邮件推送    |
-| `output/today_strategy_{code}.md`   | 按需     | 单只股票详细分析报告     |
+| `output/trading_strategy.md`          | 每日     | 当日全市场 TOP5 买入建议 |
+| `output/trading_strategy.html`        | 每日     | HTML 格式，供邮件推送    |
+| `output/trading_strategy_{code}.md`   | 按需     | 单只股票详细分析报告     |
 | `output/history/strategy_{date}.md` | 每日     | 历史策略自动存档         |
 
 ### 回测输出
 
-| 文件                            | 说明                                  |
-| ------------------------------- | ------------------------------------- |
-| `output/backtest_daily.csv`   | 每日净值、现金、持仓数、交易次数      |
-| `output/trade_log.csv`        | 完整交易流水（价格、数量、成本、P&L） |
-| `output/backtest_metrics.txt` | 绩效指标摘要文字报告                  |
+| 文件                                     | 说明                                  |
+| ---------------------------------------- | ------------------------------------- |
+| `output/backtest/backtest_daily.csv`   | 每日净值、现金、持仓数、交易次数      |
+| `output/backtest/trade_log.csv`        | 完整交易流水（价格、数量、成本、P&L） |
+| `output/backtest/backtest_metrics.md`  | 绩效指标摘要文字报告                  |
 
 ### 图表输出
 
@@ -893,7 +889,7 @@ pip install -r requirements.txt
 
 ```bash
 rm data/predictions.pkl data/features.pkl
-./scripts/run_model.sh   # 重新生成
+./scripts/run_backtest.sh   # 重新生成
 ```
 
 ---
@@ -938,7 +934,7 @@ python src/py00_fetch_stock_data.py
 
 ## 附录：项目设计原始需求
 
-详见 `docs/backtest.md`。该文件记录了系统的初始设计要求，包括：
+详见项目初始设计文档（原 `docs/backtest.md`）。该文件记录了系统的初始设计要求，包括：
 
 - 交易规则约束（主板选股、集合竞价、T+1、5只上限、手续费）
 - 模型设计理念（ML/DL 优先、不确定性量化、丰富特征工程）

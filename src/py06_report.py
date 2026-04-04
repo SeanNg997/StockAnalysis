@@ -18,17 +18,20 @@ import matplotlib.dates as mdates
 import os
 import warnings
 
+from config import CONFIG
+
 warnings.filterwarnings('ignore')
 
 # 中文字体配置
 plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'Heiti TC']
 plt.rcParams['axes.unicode_minus'] = False
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
-FEATURE_PKL = os.path.join(BASE_DIR, 'data', 'features.pkl')
+BASE_DIR = CONFIG['paths']['BASE_DIR']
+OUTPUT_DIR = CONFIG['paths']['OUTPUT_DIR']
+BACKTEST_OUTPUT_DIR = CONFIG['paths']['BACKTEST_OUTPUT_DIR']
+FEATURE_PKL = CONFIG['paths']['FEATURE_PKL']
 
-INITIAL_CAPITAL = 100_000
+INITIAL_CAPITAL = CONFIG['backtest']['INITIAL_CAPITAL']
 
 
 def plot_equity_curve(daily_df: pd.DataFrame):
@@ -92,7 +95,7 @@ def plot_drawdown(daily_df: pd.DataFrame):
     print(f"  保存: {path}")
 
 
-MAX_POSITIONS = 5  # 最大持仓数量（对应100%仓位）
+MAX_POSITIONS = CONFIG['backtest']['MAX_POSITIONS']  # 最大持仓数量（对应100%仓位）
 
 
 def plot_positions(daily_df: pd.DataFrame):
@@ -132,14 +135,13 @@ def plot_positions(daily_df: pd.DataFrame):
 def plot_monthly_returns(daily_df: pd.DataFrame):
     """绘制月度收益热力图"""
     print("绘制月度收益热力图...")
+    # 避免不必要的复制
     daily = daily_df.copy()
     daily['date'] = pd.to_datetime(daily['date'])
     daily['daily_return'] = daily['portfolio_value'].pct_change()
-    daily['year'] = daily['date'].dt.year
-    daily['month'] = daily['date'].dt.month
-
+    
     # 月度收益率
-    monthly = daily.groupby(['year', 'month'])['daily_return'].apply(
+    monthly = daily.groupby([daily['date'].dt.year, daily['date'].dt.month])['daily_return'].apply(
         lambda x: (1 + x).prod() - 1
     ).unstack(fill_value=0)
 
@@ -229,9 +231,9 @@ def generate_all_reports():
     """生成所有报告和图表"""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    daily_path = os.path.join(OUTPUT_DIR, 'backtest_daily.csv')
+    daily_path = os.path.join(BACKTEST_OUTPUT_DIR, 'backtest_daily.csv')
     if not os.path.exists(daily_path):
-        print("错误: 未找到回测结果文件，请先运行 py04_backtest.py")
+        print("错误: 未找到回测结果文件，请先运行 py05_backtest.py")
         return
 
     daily_df = pd.read_csv(daily_path)

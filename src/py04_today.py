@@ -1,5 +1,5 @@
 """
-py05_today.py — 今日实盘决策模块
+py04_today.py — 今日实盘决策模块
 ==================================
 职责：
 1. 使用最新模型对当前所有可交易主板股票打分
@@ -7,8 +7,8 @@ py05_today.py — 今日实盘决策模块
 3. 输出今日（下一个交易日）的操作建议（Markdown格式）
 
 支持：
-- 全市场报告：生成 today_strategy.md
-- 单股票报告：python py05_today.py 600000 → 生成 today_strategy_600000.md
+- 全市场报告：生成 trading_strategy.md
+- 单股票报告：python py04_today.py 600000 → 生成 trading_strategy_600000.md
   （支持输入 600000 或 sh.600000，自动识别前缀）
 """
 
@@ -19,7 +19,10 @@ import sys
 import warnings
 from datetime import date, timedelta
 
+from config import CONFIG
+
 warnings.filterwarnings('ignore')
+
 
 
 def next_trading_day(d: date, known_trading_days=None) -> date:
@@ -44,10 +47,10 @@ def next_trading_day(d: date, known_trading_days=None) -> date:
         next_d += timedelta(days=1)
     return next_d
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PREDICT_PKL = os.path.join(BASE_DIR, 'data', 'predictions.pkl')
-FEATURE_PKL = os.path.join(BASE_DIR, 'data', 'features.pkl')
-OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
+BASE_DIR = CONFIG['paths']['BASE_DIR']
+PREDICT_PKL = CONFIG['paths']['PREDICT_PKL']
+FEATURE_PKL = CONFIG['paths']['FEATURE_PKL']
+OUTPUT_DIR = CONFIG['paths']['OUTPUT_DIR']
 
 
 def normalize_stock_code(code):
@@ -72,9 +75,9 @@ def _load_latest_data(target_date=None):
     Args:
         target_date: 目标日期字符串 'YYYY-MM-DD'，None 表示取最新日期
     """
+    # 只加载需要的列
     pred_df = pd.read_pickle(PREDICT_PKL)
-    df = pd.read_pickle(FEATURE_PKL)
-
+    
     if target_date is not None:
         ts = pd.Timestamp(target_date)
         available = pred_df[pred_df['date'] <= ts]['date']
@@ -89,7 +92,11 @@ def _load_latest_data(target_date=None):
     print(f"最新数据日期: {latest_date.date()}")
 
     latest_pred = pred_df[pred_df['date'] == latest_date].copy()
+    
+    # 只加载需要的日期和列
+    df = pd.read_pickle(FEATURE_PKL)
     latest_price = df[df['date'] == latest_date][['代码', '名称', 'open', 'close', 'volume', 'amount']].copy()
+    
     latest = latest_pred.merge(latest_price, on='代码', how='left')
     latest = latest.sort_values('pred_return', ascending=False)
 
@@ -129,12 +136,16 @@ def generate_stock_report(stock_code, target_date=None):
     pct = 1 - (rank - 1) / total
 
     # 判断建议
+    min_pred_return = CONFIG['backtest']['MIN_PRED_RETURN']
+    min_confidence = CONFIG['backtest']['MIN_CONFIDENCE']
+    hold_days = CONFIG['backtest']['HOLD_DAYS']
+    
     if pred_return > 0.005 and confidence > 0.6:
         advice = "强烈推荐买入"
-        advice_detail = "预测收益率较高且置信度强，建议积极关注（持有5个交易日）"
-    elif pred_return > 0.002 and confidence > 0.5:
+        advice_detail = f"预测收益率较高且置信度强，建议积极关注（持有{hold_days}个交易日）"
+    elif pred_return > min_pred_return and confidence > min_confidence:
         advice = "建议买入"
-        advice_detail = "预测有正向收益且置信度高于阈值（持有5个交易日）"
+        advice_detail = f"预测有正向收益且置信度高于阈值（持有{hold_days}个交易日）"
     elif pred_return > 0:
         advice = "谨慎关注"
         advice_detail = "预测有正向收益但信号较弱，可少量仓位试探"
@@ -161,7 +172,7 @@ def generate_stock_report(stock_code, target_date=None):
     lines.append("|------|:----:|")
     lines.append(f"| 收盘价 | ¥{close_price:.2f} |")
     lines.append(f"| 开盘价 | ¥{open_price:.2f} |")
-    lines.append(f"| 预测收益率（T+1开盘买入→T+6开盘卖出，持有5天） | **{pred_return:+.4%}** |")
+    lines.append(f"| 预测收益率（T+1开盘买入→T+{hold_days+1}开盘卖出，持有{hold_days}天） | **{pred_return:+.4%}** |")
     lines.append(f"| 置信度 | {confidence:.2%} |")
     lines.append(f"| 全市场排名 | {rank} / {total}（前 {pct:.1%}） |")
     lines.append(f"| 成交量 | {volume:,.0f} |")
@@ -192,7 +203,7 @@ def generate_stock_report(stock_code, target_date=None):
 
     report = "\n".join(lines)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    report_path = os.path.join(OUTPUT_DIR, f'today_strategy_{short_code}.md')
+    report_path = os.path.join(OUTPUT_DIR, f'trading_strategy_{short_code}.md')
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write(report)
 
@@ -210,10 +221,14 @@ def generate_today_strategy(target_date=None):
     print("生成今日交易决策...")
     latest, latest_date, pred_df = _load_latest_data(target_date)
 
-    # 过滤：预测收益率 > 0.2% 且 置信度 > 50%
+    # 过滤：使用配置文件中的阈值
+    min_pred_return = CONFIG['backtest']['MIN_PRED_RETURN']
+    min_confidence = CONFIG['backtest']['MIN_CONFIDENCE']
+    hold_days = CONFIG['backtest']['HOLD_DAYS']
+    
     qualified = latest[
-        (latest['pred_return'] > 0.002) &
-        (latest['confidence'] > 0.5)
+        (latest['pred_return'] > min_pred_return) &
+        (latest['confidence'] > min_confidence)
     ].copy()
     if len(qualified) > 0:
         qualified['score'] = qualified['pred_return'] * 0.6 + \
@@ -263,9 +278,9 @@ def generate_today_strategy(target_date=None):
     n_buy = len(top5)
 
     if n_buy == 0:
-        lines.append("> **建议空仓**：当前无股票满足买入条件（预测收益率 > 0.2% 且置信度 > 50%）\n")
+        lines.append(f"> **建议空仓**：当前无股票满足买入条件（预测收益率 > {min_pred_return:.2%} 且置信度 > {min_confidence:.0%}）\n")
     else:
-        lines.append(f"> 共 **{n_buy}** 只股票满足买入条件，建议各 **{1/n_buy:.0%}** 仓位，持有 5 个交易日\n")
+        lines.append(f"> 共 **{n_buy}** 只股票满足买入条件，建议各 **{1/n_buy:.0%}** 仓位，持有 {hold_days} 个交易日\n")
         lines.append("| # | 名称 | 代码 | 收盘价 | 预测收益率 | 置信度 | 建议仓位 |")
         lines.append("|:-:|:----:|:----:|-------:|-----------:|-------:|:--------:|")
         for i, (_, row) in enumerate(top5.iterrows()):
@@ -303,7 +318,7 @@ def generate_today_strategy(target_date=None):
 
     # 保存
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    report_path = os.path.join(OUTPUT_DIR, 'today_strategy.md')
+    report_path = os.path.join(OUTPUT_DIR, 'trading_strategy.md')
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write(report)
 

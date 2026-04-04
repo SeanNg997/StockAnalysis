@@ -1,5 +1,5 @@
 """
-py04_backtest.py — 回测引擎模块（优化版）
+py05_backtest.py — 回测引擎模块（优化版）
 ===========================================
 职责：
 1. 基于模型预测结果执行完整回测
@@ -22,17 +22,19 @@ import numpy as np
 import os
 import warnings
 
+from config import CONFIG
+
 warnings.filterwarnings('ignore')
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FEATURE_PKL = os.path.join(BASE_DIR, 'data', 'features.pkl')
-PREDICT_PKL = os.path.join(BASE_DIR, 'data', 'predictions.pkl')
-OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
+BASE_DIR = CONFIG['paths']['BASE_DIR']
+FEATURE_PKL = CONFIG['paths']['FEATURE_PKL']
+PREDICT_PKL = CONFIG['paths']['PREDICT_PKL']
+OUTPUT_DIR = CONFIG['paths']['BACKTEST_OUTPUT_DIR']
 
 # ============ 交易成本 ============
-COMMISSION_RATE = 0.000085   # 手续费费率 0.0085%
-MIN_COMMISSION = 1.0         # 每笔最低佣金 1 元
-STAMP_TAX = 0.0005           # 印花税 0.05%（卖出时收取）
+COMMISSION_RATE = CONFIG['backtest']['COMMISSION_RATE']   # 手续费费率
+MIN_COMMISSION = CONFIG['backtest']['MIN_COMMISSION']         # 每笔最低佣金
+STAMP_TAX = CONFIG['backtest']['STAMP_TAX']           # 印花税（卖出时收取）
 
 
 def calc_buy_cost(amount: float) -> float:
@@ -45,27 +47,27 @@ def calc_sell_cost(amount: float) -> float:
     return max(amount * COMMISSION_RATE, MIN_COMMISSION) + amount * STAMP_TAX
 
 # ============ 策略参数 ============
-MAX_POSITIONS = 5            # 最大持仓数
-MIN_PRED_RETURN = 0.002      # 最低预测收益率阈值（0.2%，提高门槛）
-MIN_CONFIDENCE = 0.5         # 最低置信度阈值
-HOLD_DAYS = 5                # 目标持有天数
-STOP_LOSS = -0.05            # 止损线 -5%
-TAKE_PROFIT = 0.08           # 止盈线 +8%
-INITIAL_CAPITAL = 100_000  # 初始资金10万
-MAX_DAILY_BUY = 2            # 每天最多买入2只（分批建仓）
+MAX_POSITIONS = CONFIG['backtest']['MAX_POSITIONS']            # 最大持仓数
+MIN_PRED_RETURN = CONFIG['backtest']['MIN_PRED_RETURN']      # 最低预测收益率阈值
+MIN_CONFIDENCE = CONFIG['backtest']['MIN_CONFIDENCE']         # 最低置信度阈值
+HOLD_DAYS = CONFIG['backtest']['HOLD_DAYS']                # 目标持有天数
+STOP_LOSS = CONFIG['backtest']['STOP_LOSS']            # 止损线
+TAKE_PROFIT = CONFIG['backtest']['TAKE_PROFIT']           # 止盈线
+INITIAL_CAPITAL = CONFIG['backtest']['INITIAL_CAPITAL']  # 初始资金
+MAX_DAILY_BUY = CONFIG['backtest']['MAX_DAILY_BUY']            # 每天最多买入数量
 
 
 def load_data():
     """加载特征数据和预测结果"""
     print("加载数据...")
+    # 只加载需要的列
     df = pd.read_pickle(FEATURE_PKL)
-    pred_df = pd.read_pickle(PREDICT_PKL)
-
-    # 合并预测结果到主数据
     price_cols = ['代码', '名称', 'date', 'open', 'high', 'low', 'close',
                   'volume', 'amount', 'pctChg']
     price_df = df[price_cols].copy()
-
+    del df  # 释放内存
+    
+    pred_df = pd.read_pickle(PREDICT_PKL)
     # 合并预测
     pred_merge = pred_df[['date', '代码', 'pred_return', 'pred_std', 'confidence']].copy()
     merged = price_df.merge(pred_merge, on=['date', '代码'], how='inner')
@@ -90,16 +92,42 @@ def get_limit_price(prev_close: float, code: str) -> tuple:
     return limit_up, limit_down
 
 
-def compute_composite_score(pred_return, confidence):
-    """综合评分 = 预测收益率权重 * 0.6 + 置信度权重 * 0.4"""
-    return pred_return * 0.6 + confidence * pred_return * 0.4
+def compute_composite_score(pred_return, confidence, method='return_only'):
+    """计算综合评分
+    
+    Args:
+        pred_return: 预测收益率
+        confidence: 置信度
+        method: 权重方法，可选值：
+            'default': 原始方法，pred_return * (0.6 + 0.4 * confidence)
+            'return_only': 仅按预测收益率排序
+            'confidence_weighted': 预测收益率 * 置信度
+            'volatility_adjusted': 预测收益率 / (1 + pred_std)
+            'sharpe_like': 预测收益率 / (pred_std + 1e-10)
+    """
+    if method == 'default':
+        return pred_return * (0.6 + 0.4 * confidence)
+    elif method == 'return_only':
+        return pred_return
+    elif method == 'confidence_weighted':
+        return pred_return * confidence
+    elif method == 'volatility_adjusted':
+        # 假设pred_std可以通过confidence计算：confidence = 1/(1+std*100) → std = (1/confidence - 1)/100
+        pred_std = (1.0 / (confidence + 1e-10) - 1.0) / 100.0
+        return pred_return / (1.0 + pred_std)
+    elif method == 'sharpe_like':
+        pred_std = (1.0 / (confidence + 1e-10) - 1.0) / 100.0
+        return pred_return / (pred_std + 1e-10)
+    else:
+        return pred_return * (0.6 + 0.4 * confidence)
 
 
-def check_market_regime(daily_mkt_ret: pd.Series, current_date, lookback=10):
+def check_market_regime(daily_mkt_ret: pd.Series, current_date):
     """
     市场择时：检查近期市场环境（使用预计算的每日市场平均收益率）
     返回仓位系数 0.0~1.0
     """
+    lookback = CONFIG['backtest']['MARKET_REGIME_LOOKBACK']
     recent = daily_mkt_ret[daily_mkt_ret.index <= current_date].tail(lookback)
 
     if len(recent) < 5:
@@ -121,7 +149,7 @@ def check_market_regime(daily_mkt_ret: pd.Series, current_date, lookback=10):
         return 1.0
 
 
-def run_backtest(merged: pd.DataFrame) -> dict:
+def run_backtest(merged: pd.DataFrame, scoring_method='return_only') -> dict:
     """
     执行回测（优化版）
 
@@ -137,13 +165,12 @@ def run_backtest(merged: pd.DataFrame) -> dict:
     all_dates = sorted(merged['date'].unique())
     print(f"回测期间: {all_dates[0].date()} ~ {all_dates[-1].date()}, 共 {len(all_dates)} 个交易日")
 
-    # 构建 (date, 代码) -> row 的映射（向量化构建，替代 iterrows）
+    # 构建 MultiIndex 以便快速查询
     print("构建数据索引...")
     indexed = merged.set_index(['date', '代码'])
-    date_stock_map = indexed.to_dict('index')
 
     # 预分组：每日数据（避免循环内重复过滤）
-    date_grouped = {d: g for d, g in merged.groupby('date')}
+    date_grouped = merged.groupby('date')
 
     # 构建日期索引映射
     next_date_map = {}
@@ -157,39 +184,47 @@ def run_backtest(merged: pd.DataFrame) -> dict:
     cash = INITIAL_CAPITAL
     positions = {}  # {股票代码: {'shares', 'buy_price', 'buy_cost', 'buy_date', 'current_price', 'hold_days'}}
 
-    # 记录（插入初始资本记录，确保首日收益率不丢失）
-    daily_records = [{
+    # 记录（不插入初始记录，避免重复）
+    daily_records = []
+    trade_log = []
+    position_log = []  # 每日持仓快照
+    n_trades_today = 0  # 当日交易计数
+
+    # 先添加第一天的初始记录
+    daily_records.append({
         'date': all_dates[0],
         'cash': INITIAL_CAPITAL,
         'portfolio_value': INITIAL_CAPITAL,
         'n_positions': 0,
         'n_trades': 0,
-    }]
-    trade_log = []
-    position_log = []  # 每日持仓快照
-    n_trades_today = 0  # 当日交易计数
+    })
 
     for day_idx in range(len(all_dates)):
         decision_date = all_dates[day_idx]
         exec_date = next_date_map.get(decision_date)
 
         # 获取决策日数据（使用预分组）
-        decision_data = date_grouped.get(decision_date, pd.DataFrame())
+        try:
+            decision_data = date_grouped.get_group(decision_date)
+        except KeyError:
+            decision_data = pd.DataFrame()
 
         if exec_date is None:
             # 最后一个交易日：无后续执行，仅记录资产和持仓快照
             total_value = cash
             for code, pos in positions.items():
-                key = (decision_date, code)
-                if key in date_stock_map:
-                    current_price = date_stock_map[key]['close']
+                try:
+                    current_price = indexed.loc[(decision_date, code), 'close']
                     pos['current_price'] = current_price
-                else:
+                except KeyError:
                     current_price = pos['current_price']
                 total_value += pos['shares'] * current_price
 
                 # 持仓快照
-                row_info = date_stock_map.get((decision_date, code))
+                try:
+                    row_info = indexed.loc[(decision_date, code)]
+                except KeyError:
+                    row_info = None
                 position_log.append({
                     'date': decision_date,
                     '代码': code,
@@ -204,16 +239,22 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                     'float_profit_pct': (pos['current_price'] - pos['buy_price']) / pos['buy_price'],
                 })
 
-            daily_records.append({
-                'date': decision_date,
-                'cash': cash,
-                'portfolio_value': total_value,
-                'n_positions': len(positions),
-                'n_trades': 0,
-            })
+            # 注意：第一天的初始记录已经添加，最后一天只需要追加一次
+            # 检查是否已经是最后一天且不是第一天（避免重复）
+            if len(daily_records) == 0 or daily_records[-1]['date'] != decision_date:
+                daily_records.append({
+                    'date': decision_date,
+                    'cash': cash,
+                    'portfolio_value': total_value,
+                    'n_positions': len(positions),
+                    'n_trades': 0,
+                })
             continue
 
-        exec_data = date_grouped.get(exec_date, pd.DataFrame())
+        try:
+            exec_data = date_grouped.get_group(exec_date)
+        except KeyError:
+            exec_data = pd.DataFrame()
 
         # ===== 步骤1：更新持有天数 =====
         for code in positions:
@@ -280,11 +321,11 @@ def run_backtest(merged: pd.DataFrame) -> dict:
             stock_name = exec_info.iloc[0]['名称']
 
             # 用T日收盘价计算T+1日跌停价，判断是否跌停封板
-            t_day_row = date_stock_map.get((decision_date, code))
-            if t_day_row is not None:
+            try:
+                t_day_row = indexed.loc[(decision_date, code)]
                 _, limit_down_price = get_limit_price(t_day_row['close'], code)
                 is_limit_down = t1_open <= limit_down_price + 0.001
-            else:
+            except KeyError:
                 is_limit_down = False
 
             if is_limit_down:
@@ -352,28 +393,37 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                 ].copy()
 
                 if len(candidates) > 0:
-                    candidates['score'] = (
-                        candidates['pred_return'] * 0.6
-                        + candidates['confidence'] * candidates['pred_return'] * 0.4
-                    )
+                    # 向量化计算综合评分
+                    if scoring_method == 'default':
+                        candidates['score'] = candidates['pred_return'] * (0.6 + 0.4 * candidates['confidence'])
+                    elif scoring_method == 'return_only':
+                        candidates['score'] = candidates['pred_return']
+                    elif scoring_method == 'confidence_weighted':
+                        candidates['score'] = candidates['pred_return'] * candidates['confidence']
+                    elif scoring_method == 'volatility_adjusted':
+                        # 从confidence计算pred_std
+                        pred_std = (1.0 / (candidates['confidence'] + 1e-10) - 1.0) / 100.0
+                        candidates['score'] = candidates['pred_return'] / (1.0 + pred_std)
+                    elif scoring_method == 'sharpe_like':
+                        pred_std = (1.0 / (candidates['confidence'] + 1e-10) - 1.0) / 100.0
+                        candidates['score'] = candidates['pred_return'] / (pred_std + 1e-10)
+                    else:
+                        candidates['score'] = candidates['pred_return'] * (0.6 + 0.4 * candidates['confidence'])
                     candidates = candidates.sort_values('score', ascending=False)
 
                     # 过滤已持仓和当日成功卖出的
-                    buy_candidates = []
-                    for _, cand in candidates.iterrows():
-                        code = cand['代码']
-                        if code in positions or code in actually_sold:
-                            continue
-                        buy_candidates.append(code)
-                        if len(buy_candidates) >= n_empty:
-                            break
+                    available_candidates = candidates[~candidates['代码'].isin(positions.keys()) & ~candidates['代码'].isin(actually_sold)]
+                    buy_candidates = available_candidates['代码'].head(n_empty).tolist()
 
                     # ===== 步骤5：执行买入（T+1日，检查T+1日涨停） =====
                     if buy_candidates:
                         available_cash = cash * 0.95  # 保留5%现金
-                        per_stock_cash = available_cash / max(n_empty, 1)
-
+                        remaining_buy_slots = len(buy_candidates)  # 剩余可买入的股票数量
+                        
                         for code in buy_candidates:
+                            if remaining_buy_slots <= 0:
+                                break
+                                
                             exec_info = exec_data[exec_data['代码'] == code]
                             if len(exec_info) == 0:
                                 continue
@@ -385,11 +435,11 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                                 continue
 
                             # 用T日收盘价计算T+1日涨停价，判断是否涨停封板
-                            t_day_row = date_stock_map.get((decision_date, code))
-                            if t_day_row is not None:
+                            try:
+                                t_day_row = indexed.loc[(decision_date, code)]
                                 limit_up_price, _ = get_limit_price(t_day_row['close'], code)
                                 is_limit_up = t1_open >= limit_up_price - 0.001
-                            else:
+                            except KeyError:
                                 is_limit_up = False
 
                             if is_limit_up:
@@ -410,17 +460,23 @@ def run_backtest(merged: pd.DataFrame) -> dict:
                                 })
                                 continue  # 不重新选股补位
 
+                            # 计算这只股票可以使用的现金：剩余可用现金 / 剩余买入槽位
+                            per_stock_cash = available_cash / remaining_buy_slots
+                            
                             shares = int(per_stock_cash / t1_open / 100) * 100
                             if shares < 100:
                                 continue
 
                             buy_amount = shares * t1_open
                             buy_cost = calc_buy_cost(buy_amount)
+                            total_cost = buy_amount + buy_cost
 
-                            if buy_amount + buy_cost > cash:
+                            if total_cost > cash:
                                 continue
 
-                            cash -= buy_amount + buy_cost
+                            cash -= total_cost
+                            available_cash -= total_cost  # 从可用现金中扣除已花费的部分
+                            remaining_buy_slots -= 1  # 减少剩余买入槽位
 
                             positions[code] = {
                                 'shares': shares,
@@ -452,21 +508,25 @@ def run_backtest(merged: pd.DataFrame) -> dict:
         total_value = cash
         for code, pos in positions.items():
             # 优先用执行日 close 估值（操作已在 exec_date 发生）
-            key_exec = (exec_date, code)
-            key_dec = (decision_date, code)
-            if key_exec in date_stock_map:
-                current_price = date_stock_map[key_exec]['close']
+            try:
+                current_price = indexed.loc[(exec_date, code), 'close']
                 pos['current_price'] = current_price
-            elif key_dec in date_stock_map:
-                current_price = date_stock_map[key_dec]['close']
-                pos['current_price'] = current_price
-            else:
-                current_price = pos['current_price']
+            except KeyError:
+                try:
+                    current_price = indexed.loc[(decision_date, code), 'close']
+                    pos['current_price'] = current_price
+                except KeyError:
+                    current_price = pos['current_price']
             total_value += pos['shares'] * current_price
 
             # 持仓快照
-            _r = date_stock_map.get(key_exec)
-            row_info = _r if _r is not None else date_stock_map.get(key_dec)
+            try:
+                row_info = indexed.loc[(exec_date, code)]
+            except KeyError:
+                try:
+                    row_info = indexed.loc[(decision_date, code)]
+                except KeyError:
+                    row_info = None
             position_log.append({
                 'date': exec_date,
                 '代码': code,
@@ -614,10 +674,19 @@ def compute_trade_metrics(trade_df: pd.DataFrame) -> dict:
     }
 
 
-def run_pipeline():
-    """执行回测流水线"""
+def run_pipeline(scoring_method='return_only'):
+    """执行回测流水线
+    
+    Args:
+        scoring_method: 选股加权方法，可选值：
+            'default': 原始方法，pred_return * (0.6 + 0.4 * confidence)
+            'return_only': 仅按预测收益率排序
+            'confidence_weighted': 预测收益率 * 置信度
+            'volatility_adjusted': 预测收益率 / (1 + pred_std)
+            'sharpe_like': 预测收益率 / (pred_std + 1e-10)
+    """
     merged = load_data()
-    results = run_backtest(merged)
+    results = run_backtest(merged, scoring_method=scoring_method)
 
     daily_df = results['daily']
     trade_df = results['trades']

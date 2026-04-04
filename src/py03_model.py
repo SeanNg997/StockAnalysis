@@ -16,39 +16,25 @@ import warnings
 import gc
 from concurrent.futures import ThreadPoolExecutor
 
+from config import CONFIG
+
 warnings.filterwarnings('ignore')
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FEATURE_PKL = os.path.join(BASE_DIR, 'data', 'features.pkl')
-PREDICT_PKL = os.path.join(BASE_DIR, 'data', 'predictions.pkl')
+BASE_DIR = CONFIG['paths']['BASE_DIR']
+FEATURE_PKL = CONFIG['paths']['FEATURE_PKL']
+PREDICT_PKL = CONFIG['paths']['PREDICT_PKL']
 
 # ============ 配置 ============
-N_ENSEMBLE = 5          # Ensemble模型数量（不同随机种子）
-TRAIN_YEARS = 3         # 训练窗口年数
-RETRAIN_DAYS = 22       # 每22个交易日（约1个月）重新训练
-BACKTEST_START = '2023-01-01'  # 回测起始日期
-HOLD_DAYS = 5           # 持有天数（T+1买入 → T+6卖出），与 py02_features.py 保持一致
+N_ENSEMBLE = CONFIG['model']['N_ENSEMBLE']          # Ensemble模型数量（不同随机种子）
+TRAIN_YEARS = CONFIG['model']['TRAIN_YEARS']         # 训练窗口年数
+RETRAIN_DAYS = CONFIG['model']['RETRAIN_DAYS']       # 每指定交易日重新训练
+BACKTEST_YEARS = CONFIG['model']['BACKTEST_YEARS']  # 回测窗口年数（从最新数据往前推）
+HOLD_DAYS = CONFIG['model']['HOLD_DAYS']           # 持有天数（T+1买入 → T+1+HOLD_DAYS卖出），与 py02_features.py 保持一致
                         # 训练集末尾 HOLD_DAYS 条的 label 依赖未来价格（卖出价 open[i+HOLD_DAYS+1]），
                         # 必须从训练集中剔除，否则引入前视偏差
 
-LGB_PARAMS = {
-    'objective': 'huber',          # Huber损失，对异常值更鲁棒
-    'alpha': 0.9,                  # Huber delta参数
-    'metric': 'mae',
-    'boosting_type': 'gbdt',
-    'num_leaves': 31,              # 降低复杂度防过拟合 (63→31)
-    'max_depth': 5,                # 限制树深度 (7→5)
-    'learning_rate': 0.03,         # 更小学习率，更稳定 (0.05→0.03)
-    'feature_fraction': 0.6,       # 更强随机性 (0.7→0.6)
-    'bagging_fraction': 0.7,       # 更强随机性 (0.8→0.7)
-    'bagging_freq': 5,
-    'min_child_samples': 200,      # 更保守的叶节点 (100→200)
-    'lambda_l1': 1.0,              # 更强L1正则 (0.1→1.0)
-    'lambda_l2': 5.0,              # 更强L2正则 (1.0→5.0)
-    'min_gain_to_split': 0.01,     # 分裂最小增益，防止无意义分裂
-    'verbose': -1,
-    'n_jobs': max(1, (os.cpu_count() or 4) // N_ENSEMBLE),
-}
+LGB_PARAMS = CONFIG['model']['LGB_PARAMS'].copy()
+LGB_PARAMS['n_jobs'] = max(1, (os.cpu_count() or 4) // N_ENSEMBLE)
 
 
 def get_feature_columns(df: pd.DataFrame) -> list:
@@ -73,6 +59,7 @@ def _train_single_model(seed, params, X_train, y_train, X_val, y_val):
         tuple: (seed, trained_model)
     """
     params_copy = params.copy()
+    num_boost_round = params_copy.pop('num_boost_round', 800)
     _PRIME_SEEDS = [7, 13, 31, 97, 127, 211, 307, 401, 503, 607]
     params_copy['seed'] = _PRIME_SEEDS[seed % len(_PRIME_SEEDS)]
     params_copy['feature_fraction_seed'] = _PRIME_SEEDS[(seed + 2) % len(_PRIME_SEEDS)]
@@ -84,9 +71,9 @@ def _train_single_model(seed, params, X_train, y_train, X_val, y_val):
     model = lgb.train(
         params_copy,
         dtrain,
-        num_boost_round=800,
+        num_boost_round=num_boost_round,
         valid_sets=[dval],
-        callbacks=[lgb.early_stopping(50, verbose=False)],
+        callbacks=[lgb.early_stopping(200, verbose=False)],
     )
     return seed, model
 
@@ -98,7 +85,7 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
 
     Args:
         df: 特征数据（已截断到 end_date）
-        end_date: 若指定，则只预测该日（单日快速模式）；否则从 BACKTEST_START 全量预测
+        end_date: 若指定，则只预测该日（单日快速模式）；否则回测最近 BACKTEST_YEARS 年全量 walk-forward
     """
     feature_cols = get_feature_columns(df)
     print(f"使用 {len(feature_cols)} 个特征: {feature_cols[:10]}...")
@@ -199,7 +186,7 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
         return pd.DataFrame(pred_records)
 
     # 全量 walk-forward 模式
-    bt_start = pd.Timestamp(BACKTEST_START)
+    bt_start = max(all_dates) - pd.DateOffset(years=BACKTEST_YEARS)
 
     # 找到回测起始日期在all_dates中的位置
     bt_start_idx = 0
@@ -332,7 +319,7 @@ def run_pipeline(end_date=None):
 
     Args:
         end_date: 预测截止日期（含），格式 'YYYY-MM-DD'。
-                  None 表示从 BACKTEST_START 到最新日期全量 walk-forward。
+                  None 表示回测最近 BACKTEST_YEARS 年全量 walk-forward。
                   指定日期时只预测该日（用该日之前 TRAIN_YEARS 年数据训练）。
     """
     print("加载特征数据...")
@@ -369,6 +356,7 @@ def run_pipeline(end_date=None):
         old_pred = old_pred[~old_pred['date'].isin(pred_df['date'].unique())]
         pred_df = pd.concat([old_pred, pred_df], ignore_index=True)
         pred_df = pred_df.sort_values(['date', '代码']).reset_index(drop=True)
+    os.makedirs(os.path.dirname(PREDICT_PKL), exist_ok=True)
     pred_df.to_pickle(PREDICT_PKL)
     print(f"保存至 {PREDICT_PKL}")
 

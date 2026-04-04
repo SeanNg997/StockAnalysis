@@ -14,13 +14,16 @@ import pandas as pd
 import numpy as np
 import os
 import warnings
+import gc
+
+from config import CONFIG
 
 warnings.filterwarnings('ignore')
 
 # ============ 路径配置 ============
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, 'data')
-CLEAN_PKL = os.path.join(BASE_DIR, 'data', 'mainboard_clean.pkl')
+BASE_DIR = CONFIG['paths']['BASE_DIR']
+DATA_DIR = CONFIG['paths']['DATA_DIR']
+CLEAN_PKL = CONFIG['paths']['CLEAN_PKL']
 
 
 def load_raw_data() -> pd.DataFrame:
@@ -30,8 +33,15 @@ def load_raw_data() -> pd.DataFrame:
     files = sorted(_glob.glob(os.path.join(DATA_DIR, 'Stock_dailyK_*.csv')))
     if not files:
         raise FileNotFoundError(f"未找到月度CSV文件 (Stock_dailyK_*.csv) in {DATA_DIR}")
-    dfs = [pd.read_csv(f, encoding='utf-8-sig') for f in files]
-    df = pd.concat(dfs, ignore_index=True)
+    
+    # 逐文件加载并合并，减少内存峰值
+    df = pd.DataFrame()
+    for f in files:
+        temp_df = pd.read_csv(f, encoding='utf-8-sig')
+        df = pd.concat([df, temp_df], ignore_index=True)
+        del temp_df
+        gc.collect()
+    
     print(f"  读取 {len(files)} 个月度文件，原始数据: {df.shape[0]:,} 行, {df['代码'].nunique()} 只股票")
     print(f"  日期范围: {df['date'].min()} ~ {df['date'].max()}")
     return df
@@ -87,11 +97,9 @@ def handle_missing(df: pd.DataFrame) -> pd.DataFrame:
     numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount',
                     'turn', 'pctChg', 'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM']
 
-    # 组内前值填充
+    # 组内前值填充 - 更高效的方式
     df = df.sort_values(['代码', 'date'])
-    for col in numeric_cols:
-        if df[col].isna().any():
-            df[col] = df.groupby('代码')[col].ffill()
+    df[numeric_cols] = df.groupby('代码')[numeric_cols].transform(lambda x: x.ffill())
 
     # 仍然缺失的用0填充（主要是基本面指标）
     df[numeric_cols] = df[numeric_cols].fillna(0)
@@ -101,26 +109,29 @@ def handle_missing(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def filter_liquidity(df: pd.DataFrame, min_avg_amount: float = 500e4) -> pd.DataFrame:
+def filter_liquidity(df: pd.DataFrame) -> pd.DataFrame:
     """
     过滤流动性不足的股票
-    标准：20日平均成交额 < min_avg_amount (默认500万元)
+    标准：20日平均成交额 < 配置的最小平均成交额
     """
     print("[6/6] 流动性过滤...")
     df = df.sort_values(['代码', 'date'])
 
-    # 计算20日滚动平均成交额
-    df['avg_amount_20'] = df.groupby('代码')['amount'].transform(
-        lambda x: x.rolling(20, min_periods=10).mean()
-    )
+    # 计算20日滚动平均成交额 - 使用更高效的方式
+    def rolling_mean(x):
+        return x.rolling(20, min_periods=10).mean()
+    
+    df['avg_amount_20'] = df.groupby('代码')['amount'].transform(rolling_mean)
 
+    min_avg_amount = CONFIG['data_loader']['MIN_AVG_AMOUNT']
     n_before = len(df)
     df = df[df['avg_amount_20'] >= min_avg_amount].copy()
     df = df.drop(columns=['avg_amount_20'])
 
-    # 过滤后确保每只股票至少有120个交易日
+    # 过滤后确保每只股票至少有配置的最小交易日数
+    min_trading_days = CONFIG['data_loader']['MIN_TRADING_DAYS']
     stock_counts = df.groupby('代码').size()
-    valid_stocks = stock_counts[stock_counts >= 120].index
+    valid_stocks = stock_counts[stock_counts >= min_trading_days].index
     df = df[df['代码'].isin(valid_stocks)].copy()
 
     print(f"  流动性过滤后: {df['代码'].nunique()} 只股票, {len(df):,} 行")
@@ -133,15 +144,32 @@ def run_pipeline(end_date=None) -> pd.DataFrame:
     Args:
         end_date: 数据截止日期（含），格式 'YYYY-MM-DD'。None 表示使用全部数据。
     """
-    # 缓存命中检查：若 pkl 已存在且最新日期与目标日期一致，直接复用
-    if end_date is not None and os.path.exists(CLEAN_PKL):
+    # 缓存命中检查
+    # 1. 若指定了 end_date，检查 pkl 最新日期是否等于 end_date
+    # 2. 若未指定 end_date，检查 pkl 最新日期是否等于原始CSV数据的最新日期
+    if os.path.exists(CLEAN_PKL):
         try:
             cached = pd.read_pickle(CLEAN_PKL)
             cached_max = cached['date'].max()
-            if pd.Timestamp(end_date) == cached_max:
-                print(f"✅ [缓存命中] mainboard_clean.pkl 已是 {end_date}，跳过重新生成")
-                return cached
-        except Exception:
+            
+            if end_date is not None:
+                # 指定了截止日期：检查缓存是否已包含该日期
+                if pd.Timestamp(end_date) == cached_max:
+                    print(f"✅ [缓存命中] mainboard_clean.pkl 已是 {end_date}，跳过重新生成")
+                    return cached
+            else:
+                # 未指定截止日期：检查缓存是否已是最新（与原始CSV数据最新日期一致）
+                import glob as _glob
+                csv_files = sorted(_glob.glob(os.path.join(DATA_DIR, 'Stock_dailyK_*.csv')))
+                if csv_files:
+                    # 读取最新一个月的CSV文件获取最新日期
+                    latest_csv = pd.read_csv(csv_files[-1], encoding='utf-8-sig')
+                    csv_max_date = pd.to_datetime(latest_csv['date'].max())
+                    if cached_max == csv_max_date:
+                        print(f"✅ [缓存命中] mainboard_clean.pkl 已是最新 ({cached_max.date()})，跳过重新生成")
+                        return cached
+        except Exception as e:
+            print(f"  [缓存读取失败: {e}]，继续重新生成...")
             pass  # 读取失败则继续正常流程
 
     df = load_raw_data()
@@ -163,6 +191,7 @@ def run_pipeline(end_date=None) -> pd.DataFrame:
         print(f"  [date filter] 数据截断至 {end_date}")
 
     # 保存pickle
+    os.makedirs(os.path.dirname(CLEAN_PKL), exist_ok=True)
     df.to_pickle(CLEAN_PKL)
     print(f"\n✅ 清洗完成! 保存至 {CLEAN_PKL}")
     print(f"  最终数据: {df.shape[0]:,} 行, {df['代码'].nunique()} 只股票")
