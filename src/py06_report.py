@@ -27,7 +27,6 @@ plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'Heiti TC']
 plt.rcParams['axes.unicode_minus'] = False
 
 BASE_DIR = CONFIG['paths']['BASE_DIR']
-OUTPUT_DIR = CONFIG['paths']['OUTPUT_DIR']
 BACKTEST_OUTPUT_DIR = CONFIG['paths']['BACKTEST_OUTPUT_DIR']
 FEATURE_PKL = CONFIG['paths']['FEATURE_PKL']
 
@@ -62,7 +61,7 @@ def plot_equity_curve(daily_df: pd.DataFrame):
     plt.xticks(rotation=45)
     plt.tight_layout()
 
-    path = os.path.join(OUTPUT_DIR, 'equity_curve.png')
+    path = os.path.join(BACKTEST_OUTPUT_DIR, 'equity_curve.png')
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  保存: {path}")
@@ -89,7 +88,7 @@ def plot_drawdown(daily_df: pd.DataFrame):
     plt.xticks(rotation=45)
     plt.tight_layout()
 
-    path = os.path.join(OUTPUT_DIR, 'drawdown_curve.png')
+    path = os.path.join(BACKTEST_OUTPUT_DIR, 'drawdown_curve.png')
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  保存: {path}")
@@ -126,7 +125,7 @@ def plot_positions(daily_df: pd.DataFrame):
     plt.xticks(rotation=45)
     plt.tight_layout()
 
-    path = os.path.join(OUTPUT_DIR, 'daily_positions.png')
+    path = os.path.join(BACKTEST_OUTPUT_DIR, 'daily_positions.png')
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  保存: {path}")
@@ -166,7 +165,7 @@ def plot_monthly_returns(daily_df: pd.DataFrame):
     ax.set_title('月度收益率热力图', fontsize=14, fontweight='bold')
     plt.tight_layout()
 
-    path = os.path.join(OUTPUT_DIR, 'monthly_returns.png')
+    path = os.path.join(BACKTEST_OUTPUT_DIR, 'monthly_returns.png')
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  保存: {path}")
@@ -219,7 +218,7 @@ def plot_feature_importance(model_path=None):
         ax.set_xlabel('重要性 (Gain)')
         plt.tight_layout()
 
-        path = os.path.join(OUTPUT_DIR, 'feature_importance.png')
+        path = os.path.join(BACKTEST_OUTPUT_DIR, 'feature_importance.png')
         fig.savefig(path, dpi=150)
         plt.close(fig)
         print(f"  保存: {path}")
@@ -229,7 +228,7 @@ def plot_feature_importance(model_path=None):
 
 def generate_all_reports():
     """生成所有报告和图表"""
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(BACKTEST_OUTPUT_DIR, exist_ok=True)
 
     daily_path = os.path.join(BACKTEST_OUTPUT_DIR, 'backtest_daily.csv')
     if not os.path.exists(daily_path):
@@ -245,7 +244,7 @@ def generate_all_reports():
     plot_monthly_returns(daily_df)
     plot_feature_importance()
 
-    print(f"\n✅ 所有图表已保存至 {OUTPUT_DIR}/")
+    print(f"\n✅ 所有图表已保存至 {BACKTEST_OUTPUT_DIR}/")
 
 
 if __name__ == '__main__':

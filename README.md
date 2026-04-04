@@ -2,14 +2,14 @@
 
 基于 LightGBM Ensemble + Walk-Forward 滚动训练的 A 股量化选股系统，支持每日自动化运行和 GitHub Actions 定时推送。
 
-## 策略特性
+## 1 策略特性
 
 - **模型**：LightGBM Ensemble（5个不同随机种子并行训练），Huber 损失函数
 - **持有周期**：T+1 买入，持有5个交易日后卖出（T+6 开盘）
 - **选股范围**：沪深主板（sh.60* / sz.00*），剔除 ST、停牌、新股、低流动性
 - **风控**：止损 -5%，止盈 +8%，每日最多建仓2只，最大持仓5只
 
-## 快速开始
+## 2 快速开始
 
 ```bash
 pip install -r requirements.txt
@@ -24,7 +24,7 @@ python src/py00_fetch_stock_data.py
 ./scripts/run_strategy.sh
 ```
 
-## 项目结构
+## 3 项目结构
 
 ```
 src/
@@ -42,7 +42,7 @@ scripts/
 └── daily_report.yml           每个交易日北京时间19:03盘后自动运行 + 邮件推送
 ```
 
-## GitHub Actions
+## 4 GitHub Actions配置
 
 仓库已配置定时工作流，**每个交易日北京时间 19:30（盘后）自动运行**，完成数据更新 → 特征 → 预测 → 策略报告 → 邮件推送全流程。
 
@@ -51,7 +51,31 @@ scripts/
 
 首次启用：在 GitHub Actions 页面手动触发一次 workflow 即可（自动全量初始化）。
 
-## 详细文档
+## 5 回测结果
+
+> 回测期间：**2023-04-03 ~ 2026-04-03**（约3年，727个交易日）
+>
+> 初始资金 10 万元，期末资产 **40.3 万元**，总回报率 **+302.7%**，年化收益率 **62.1%**，最大回撤 **-28.3%**，夏普比率 **1.46**。
+
+### A. 净值曲线
+
+![净值曲线](output/backtest/equity_curve.png)
+
+### B. 回撤曲线
+
+![回撤曲线](output/backtest/drawdown_curve.png)
+
+### C. 每日仓位与交易次数
+
+![每日持仓](output/backtest/daily_positions.png)
+
+### D. 月度收益热力图
+
+![月度收益热力图](output/backtest/monthly_returns.png)
+
+---
+
+
 
 完整的模块说明、特征工程详解、模型设计、回测原理、常见问题等，请参阅：
 

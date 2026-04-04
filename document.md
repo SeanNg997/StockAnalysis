@@ -56,12 +56,12 @@ StockAnalysis/
 │   ├── backtest/                           #   回测输出目录
 │   │   ├── backtest_daily.csv              #     每日回测结果
 │   │   ├── trade_log.csv                   #     交易流水
-│   │   └── backtest_metrics.md             #     回测绩效指标
-│   ├── equity_curve.png                    #   净值曲线图
-│   ├── drawdown_curve.png                  #   最大回撤图
-│   ├── daily_positions.png                 #   每日持仓图
-│   ├── monthly_returns.png                 #   月度收益热力图
-│   ├── feature_importance.png              #   特征重要性图
+│   │   ├── backtest_metrics.md             #     回测绩效指标
+│   │   ├── equity_curve.png                #     净值曲线图
+│   │   ├── drawdown_curve.png              #     最大回撤图
+│   │   ├── daily_positions.png             #     每日持仓图
+│   │   ├── monthly_returns.png             #     月度收益热力图
+│   │   └── feature_importance.png          #     特征重要性图
 │   └── history/                            #   历史策略存档
 ├── .github/workflows/
 │   └── daily_report.yml                    #   GitHub Actions 自动化工作流
@@ -371,13 +371,13 @@ python src/py05_backtest.py
 
 **生成的图表**：
 
-| 图表       | 文件名                     | 说明                               |
-| ---------- | -------------------------- | ---------------------------------- |
-| 净值曲线   | `equity_curve.png`       | 策略净值 vs 基准（持有现金）对比   |
-| 最大回撤   | `drawdown_curve.png`     | 从历史高点的回撤百分比             |
-| 每日持仓   | `daily_positions.png`    | 持仓数量 + 每日买卖笔数            |
-| 月度热力图 | `monthly_returns.png`    | 按月/年分布的收益率（RdYlGn 色系） |
-| 特征重要性 | `feature_importance.png` | LightGBM Gain 排名，TOP25 特征     |
+| 图表       | 文件名                                    | 说明                               |
+| ---------- | ----------------------------------------- | ---------------------------------- |
+| 净值曲线   | `output/backtest/equity_curve.png`      | 策略净值 vs 基准（持有现金）对比   |
+| 最大回撤   | `output/backtest/drawdown_curve.png`    | 从历史高点的回撤百分比             |
+| 每日持仓   | `output/backtest/daily_positions.png`   | 持仓数量 + 每日买卖笔数            |
+| 月度热力图 | `output/backtest/monthly_returns.png`   | 按月/年分布的收益率（RdYlGn 色系） |
+| 特征重要性 | `output/backtest/feature_importance.png` | LightGBM Gain 排名，TOP25 特征     |
 
 **运行方式**：
 
@@ -819,13 +819,13 @@ confidence > 0.5             # 置信度大于 0.5
 
 ### 图表输出
 
-| 文件                              | 说明                        |
-| --------------------------------- | --------------------------- |
-| `output/equity_curve.png`       | 净值曲线（含基准对比）      |
-| `output/drawdown_curve.png`     | 最大回撤曲线                |
-| `output/daily_positions.png`    | 每日持仓数量 + 买卖笔数     |
-| `output/monthly_returns.png`    | 月度收益热力图              |
-| `output/feature_importance.png` | LightGBM 特征重要性（Gain） |
+| 文件                                         | 说明                        |
+| -------------------------------------------- | --------------------------- |
+| `output/backtest/equity_curve.png`         | 净值曲线（含基准对比）      |
+| `output/backtest/drawdown_curve.png`       | 最大回撤曲线                |
+| `output/backtest/daily_positions.png`      | 每日持仓数量 + 买卖笔数     |
+| `output/backtest/monthly_returns.png`      | 月度收益热力图              |
+| `output/backtest/feature_importance.png`   | LightGBM 特征重要性（Gain） |
 
 ---
 
