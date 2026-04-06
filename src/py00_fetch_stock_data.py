@@ -75,21 +75,6 @@ def get_expected_latest_date() -> str:
         prev_days = [d for d in trading_days if d < today_str]
         return prev_days[-1] if prev_days else trading_days[-1]
 
-# 测试用的10只股票
-TEST_STOCKS = [
-    ("sh.600000", "浦发银行"),
-    ("sh.600036", "招商银行"),
-    ("sh.601318", "中国平安"),
-    ("sz.000001", "平安银行"),
-    ("sz.000002", "万科A"),
-    ("sh.600519", "贵州茅台"),
-    ("sz.000858", "五粮液"),
-    ("sh.600887", "伊利股份"),
-    ("sz.000333", "美的集团"),
-    ("sh.601398", "工商银行"),
-]
-
-
 # ── 月度文件管理 ──────────────────────────────────────────────
 
 def get_monthly_file(yyyymm: str) -> str:
@@ -263,7 +248,7 @@ def is_complete(existing_df: pd.DataFrame, code: str, expected_date: str) -> boo
     return last_date >= expected_date
 
 
-def main(limit: int = 0, full: bool = False):
+def main(full: bool = False):
     lg = bs.login()
     if lg.error_code != "0":
         print(f"baostock 登录失败: {lg.error_msg}")
@@ -275,11 +260,7 @@ def main(limit: int = 0, full: bool = False):
         print(f"当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}, "
               f"预期最新数据日期: {expected_latest_date}")
         # 获取股票列表
-        if limit > 0 and limit <= len(TEST_STOCKS):
-            stock_list = TEST_STOCKS[:limit]
-            print(f"测试模式: 下载前 {limit} 只股票")
-        else:
-            stock_list = get_stock_list()
+        stock_list = get_stock_list()
 
         # 加载已有数据与完成状态
         existing_df = load_existing_csv()
@@ -421,7 +402,6 @@ def main(limit: int = 0, full: bool = False):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="A股日K数据下载")
-    parser.add_argument("-n", "--limit", type=int, default=0, help="限制下载数量，0表示全部")
     parser.add_argument("-f", "--full", action="store_true", help="全量下载模式，重新下载所有股票数据")
     args = parser.parse_args()
-    main(limit=args.limit, full=args.full)
+    main(full=args.full)

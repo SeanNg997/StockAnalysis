@@ -237,8 +237,8 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     sell_offset = HOLD_DAYS + 1  # 卖出价在 T+1+HOLD_DAYS 位置
 
     # 使用更高效的方式创建滞后/超前数组
-    open_next1 = np.roll(open_, -1)
-    open_next1[-1] = np.nan
+    open_next_1 = np.roll(open_, -1)
+    open_next_1[-1] = np.nan
 
     open_next_n = np.roll(open_, -sell_offset)
     open_next_n[-sell_offset:] = np.nan
@@ -250,7 +250,7 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     # 但由于每笔交易通常数万元，比例费率的影响更大
     buy_cost = CONFIG['features']['BUY_COST']
     sell_cost = CONFIG['features']['SELL_COST']
-    raw_label = (open_next_n * sell_cost) / (open_next1 * buy_cost) - 1.0
+    raw_label = (open_next_n * sell_cost) / (open_next_1 * buy_cost) - 1.0
 
     # Winsorize极端标签值
     # 主板5日复利极端收益约50%，±30%保留绝大多数信号同时抑制极端噪声。
