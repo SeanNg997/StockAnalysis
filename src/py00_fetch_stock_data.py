@@ -31,6 +31,7 @@ def get_end_date():
 
 END_DATE = get_end_date()
 
+ADJUST_FLAG = CONFIG['data_fetch']['ADJUST_FLAG']  # 调整标志位（1：后复权；2：前复权；3：不复权）
 SAVE_EVERY = CONFIG['data_fetch']['SAVE_EVERY']  # 每下载指定数量只股票保存一次
 
 # baostock 一般在收盘后、约 18:00 前完成当日数据入库
@@ -204,7 +205,7 @@ def fetch_daily_full(symbol: str, name: str) -> pd.DataFrame | None:
         start_date=START_DATE,
         end_date=END_DATE,
         frequency="d",
-        adjustflag="2",
+        adjustflag=ADJUST_FLAG
     )
     rows = []
     while rs.next():
@@ -222,7 +223,7 @@ def fetch_daily_increment(symbol: str, name: str, from_date: str) -> pd.DataFram
         start_date=from_date,
         end_date=END_DATE,
         frequency="d",
-        adjustflag="2",
+        adjustflag=ADJUST_FLAG
     )
     rows = []
     while rs.next():
@@ -265,7 +266,6 @@ def main(full: bool = False):
         # 加载已有数据与完成状态
         existing_df = load_existing_csv()
         completed = load_completed()
-
         if not existing_df.empty:
             print(f"已有数据: {len(existing_df):,} 条, 已完成 {len(completed)} 只股票")
         else:

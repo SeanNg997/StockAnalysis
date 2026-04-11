@@ -15,6 +15,7 @@ CONFIG = {
         'START_DATE': '2019-12-01',  # 数据开始日期
         'SAVE_EVERY': 200,  # 每下载多少只股票保存一次
         'MARKET_DATA_READY_HOUR': 18,  # 市场数据就绪时间（小时）
+        'ADJUST_FLAG': '2',
     },
     
     # 数据清洗配置

@@ -101,7 +101,7 @@ StockAnalysis/
 │  py03_model.py                                                      │
 │    ├─ Walk-Forward 滚动训练（每22个交易日重训一次）                   │
 │    ├─ 或 单日快速预测（以指定日期前3年数据训练，预测当天）              │
-│    ├─ 模型：LightGBM Ensemble（5个不同随机种子并行训练）              │
+│    ├─ 模型：LightGBM Ensemble（6个不同随机种子并行训练）              │
 │    └─ 输出：data/predictions.pkl（含pred_return、pred_std、confidence）│
 │                          ↓                    ↓                     │
 │  py04_today.py                      py05_backtest.py                │
@@ -275,7 +275,7 @@ python src/py03_model.py --date 2025-03-14
 | `date`        | 预测日期                              |
 | `代码`        | 股票代码                              |
 | `pred_return` | 预测 T+1→T+6 净收益率                |
-| `pred_std`    | 5模型预测标准差（不确定性）           |
+| `pred_std`    | 6模型预测标准差（不确定性）           |
 | `confidence`  | 置信度分数（1 / (1 + pred_std×100)） |
 
 ---
@@ -371,12 +371,12 @@ python src/py05_backtest.py
 
 **生成的图表**：
 
-| 图表       | 文件名                                    | 说明                               |
-| ---------- | ----------------------------------------- | ---------------------------------- |
-| 净值曲线   | `output/backtest/equity_curve.png`      | 策略净值 vs 基准（持有现金）对比   |
-| 最大回撤   | `output/backtest/drawdown_curve.png`    | 从历史高点的回撤百分比             |
-| 每日持仓   | `output/backtest/daily_positions.png`   | 持仓数量 + 每日买卖笔数            |
-| 月度热力图 | `output/backtest/monthly_returns.png`   | 按月/年分布的收益率（RdYlGn 色系） |
+| 图表       | 文件名                                     | 说明                               |
+| ---------- | ------------------------------------------ | ---------------------------------- |
+| 净值曲线   | `output/backtest/equity_curve.png`       | 策略净值 vs 基准（持有现金）对比   |
+| 最大回撤   | `output/backtest/drawdown_curve.png`     | 从历史高点的回撤百分比             |
+| 每日持仓   | `output/backtest/daily_positions.png`    | 持仓数量 + 每日买卖笔数            |
+| 月度热力图 | `output/backtest/monthly_returns.png`    | 按月/年分布的收益率（RdYlGn 色系） |
 | 特征重要性 | `output/backtest/feature_importance.png` | LightGBM Gain 排名，TOP25 特征     |
 
 **运行方式**：
@@ -804,28 +804,28 @@ confidence > 0.5             # 置信度大于 0.5
 
 | 文件                                  | 更新频率 | 说明                     |
 | ------------------------------------- | -------- | ------------------------ |
-| `output/trading_strategy.md`          | 每日     | 当日全市场 TOP5 买入建议 |
-| `output/trading_strategy.html`        | 每日     | HTML 格式，供邮件推送    |
-| `output/trading_strategy_{code}.md`   | 按需     | 单只股票详细分析报告     |
+| `output/trading_strategy.md`        | 每日     | 当日全市场 TOP5 买入建议 |
+| `output/trading_strategy.html`      | 每日     | HTML 格式，供邮件推送    |
+| `output/trading_strategy_{code}.md` | 按需     | 单只股票详细分析报告     |
 | `output/history/strategy_{date}.md` | 每日     | 历史策略自动存档         |
 
 ### 回测输出
 
-| 文件                                     | 说明                                  |
-| ---------------------------------------- | ------------------------------------- |
-| `output/backtest/backtest_daily.csv`   | 每日净值、现金、持仓数、交易次数      |
-| `output/backtest/trade_log.csv`        | 完整交易流水（价格、数量、成本、P&L） |
-| `output/backtest/backtest_metrics.md`  | 绩效指标摘要文字报告                  |
+| 文件                                    | 说明                                  |
+| --------------------------------------- | ------------------------------------- |
+| `output/backtest/backtest_daily.csv`  | 每日净值、现金、持仓数、交易次数      |
+| `output/backtest/trade_log.csv`       | 完整交易流水（价格、数量、成本、P&L） |
+| `output/backtest/backtest_metrics.md` | 绩效指标摘要文字报告                  |
 
 ### 图表输出
 
-| 文件                                         | 说明                        |
-| -------------------------------------------- | --------------------------- |
-| `output/backtest/equity_curve.png`         | 净值曲线（含基准对比）      |
-| `output/backtest/drawdown_curve.png`       | 最大回撤曲线                |
-| `output/backtest/daily_positions.png`      | 每日持仓数量 + 买卖笔数     |
-| `output/backtest/monthly_returns.png`      | 月度收益热力图              |
-| `output/backtest/feature_importance.png`   | LightGBM 特征重要性（Gain） |
+| 文件                                       | 说明                        |
+| ------------------------------------------ | --------------------------- |
+| `output/backtest/equity_curve.png`       | 净值曲线（含基准对比）      |
+| `output/backtest/drawdown_curve.png`     | 最大回撤曲线                |
+| `output/backtest/daily_positions.png`    | 每日持仓数量 + 买卖笔数     |
+| `output/backtest/monthly_returns.png`    | 月度收益热力图              |
+| `output/backtest/feature_importance.png` | LightGBM 特征重要性（Gain） |
 
 ---
 
