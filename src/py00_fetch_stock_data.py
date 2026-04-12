@@ -308,7 +308,7 @@ def main(full: bool = False):
                 last_date = last_date_map.get(code)
                 if last_date is None:
                     codes_to_fetch_full.append((code, name))
-                if last_date < expected_latest_date:
+                elif last_date < expected_latest_date:
                     codes_to_update.append((code, name, last_date, is_delisted))
 
             if not codes_to_update and not codes_to_fetch_full:
