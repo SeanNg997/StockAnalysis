@@ -6,8 +6,6 @@
   - 全量下载 / 断点续传 / 增量更新
   - 数据按月拆分存储，文件名格式: Stock_dailyK_YYYYMM.csv
   - 每200只股票自动保存，防止中断丢失
-  - 支持退市股数据爬取
-  - 新增 isST（是否ST）、isTrading（是否交易）字段
 """
 
 import baostock as bs
@@ -143,8 +141,6 @@ def save_incremental_months(new_df: pd.DataFrame):
     增量更新专用：仅重写 new_df 中涉及的月度文件。
     对每个月：先剔除该月文件中与新数据重复的行（按代码+日期去重），再追加新行。
     保留该月文件中已有的其他日期数据，避免丢失。
-
-    注意：去重时 keep="last"，即新数据优先于旧数据（通常新数据更完整）。
     """
     if new_df.empty:
         return
@@ -155,6 +151,7 @@ def save_incremental_months(new_df: pd.DataFrame):
         monthly_file = get_monthly_file(month)
         if os.path.exists(monthly_file):
                 existing_month = pd.read_csv(monthly_file, encoding="utf-8-sig")
+                # 使用更高效的去重方法
                 combined = pd.concat([existing_month, group], ignore_index=True)
                 combined = combined.drop_duplicates(subset=["代码", "date"], keep="last")
                 combined = combined.sort_values(["代码", "date"]).reset_index(drop=True)
@@ -168,20 +165,19 @@ def save_incremental_months(new_df: pd.DataFrame):
 # ── 数据源 ──────────────────────────────────────────────
 
 def get_stock_list():
-    """获取沪深主板A股股票列表（包含退市股）"""
+    """获取沪深主板A股股票列表（sh.60开头或sz.00开头）"""
     print("正在获取沪深主板股票列表...")
     rs = bs.query_stock_basic()
     stock_list = []
     while rs.next():
         row = rs.get_row_data()
-        # row[0] 是股票代码，row[4] 是上市状态（1=上市，0=退市），row[5] 是板块标志（1=主板）
-        # 返回格式：(code, name, is_delisted)
-        if row[5] == "1":
+        # row[0] 是股票代码，row[4] 和 row[5] 是上市状态
+        # 筛选条件：上市状态=1 且 仅保留主板（sh.60* 或 sz.00*）
+        if row[4] == "1" and row[5] == "1":
             code = row[0]
             if code.startswith('sh.60') or code.startswith('sz.00'):
-                is_delisted = (row[4] != "1")  # row[4] != "1" 表示已退市
-                stock_list.append((code, row[1], is_delisted))
-    print(f"共获取 {len(stock_list)} 只主板股票（含退市股）")
+                stock_list.append((code, row[1]))
+    print(f"共获取 {len(stock_list)} 只主板上市股票")
     return stock_list
 
 
@@ -192,14 +188,10 @@ def _to_dataframe(rows, fields, symbol, name):
     df.insert(0, "代码", symbol)
     # 批量转换数值列
     numeric_cols = ["open", "high", "low", "close", "volume", "amount", "turn",
-                    "pctChg", "isST", "tradestatus", "peTTM", "pbMRQ", "psTTM", "pcfNcfTTM"]
+                    "pctChg", "peTTM", "pbMRQ", "psTTM", "pcfNcfTTM"]
     numeric_cols = [col for col in numeric_cols if col in df.columns]
     if numeric_cols:
         df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
-    # 新增 isTrading 列，基于 tradestatus 字段
-    if "tradestatus" in df.columns:
-        df["isTrading"] = df["tradestatus"].apply(lambda x: 1 if x == 1 or x == "1" else 0)
-        df = df.drop(columns=["tradestatus"])
     return df
 
 
@@ -207,7 +199,7 @@ def fetch_daily_full(symbol: str, name: str) -> pd.DataFrame | None:
     """获取单只股票完整日K线"""
     rs = bs.query_history_k_data_plus(
         symbol,
-        "date,open,high,low,close,volume,amount,turn,pctChg,isST,tradestatus,peTTM,pbMRQ,psTTM,pcfNcfTTM",
+        "date,open,high,low,close,volume,amount,turn,pctChg,peTTM,pbMRQ,psTTM,pcfNcfTTM",
         start_date=START_DATE,
         end_date=END_DATE,
         frequency="d",
@@ -225,7 +217,7 @@ def fetch_daily_increment(symbol: str, name: str, from_date: str) -> pd.DataFram
     """获取单只股票从 from_date 到 END_DATE 的增量日K线"""
     rs = bs.query_history_k_data_plus(
         symbol,
-        "date,open,high,low,close,volume,amount,turn,pctChg,isST,tradestatus,peTTM,pbMRQ,psTTM,pcfNcfTTM",
+        "date,open,high,low,close,volume,amount,turn,pctChg,peTTM,pbMRQ,psTTM,pcfNcfTTM",
         start_date=from_date,
         end_date=END_DATE,
         frequency="d",
@@ -241,21 +233,16 @@ def fetch_daily_increment(symbol: str, name: str, from_date: str) -> pd.DataFram
 
 # ── 核心逻辑 ──────────────────────────────────────────────
 
-def is_complete(existing_df: pd.DataFrame, code: str, expected_date: str, is_delisted: bool = False) -> bool:
+def is_complete(existing_df: pd.DataFrame, code: str, expected_date: str) -> bool:
     """
-    判断某只股票在已有数据中是否已完成下载。
+    判断某只股票在已有数据中是否已包含 expected_date 的数据。
 
     Args:
-        existing_df: 已有数据DataFrame
-        code: 股票代码
         expected_date: 由 get_expected_latest_date() 确定的预期最新交易日（字符串）
-        is_delisted: 是否为退市股（退市股无需更新日期检查，只要有条数据即视为完成）
     """
     stock_data = existing_df[existing_df["代码"] == code]
     if stock_data.empty:
         return False
-    if is_delisted:
-        return True
     last_date = stock_data["date"].max()
     return last_date >= expected_date
 
@@ -299,28 +286,24 @@ def main(full: bool = False):
             # - 盘前运行时 expected_latest_date = 上一交易日，数据已是最新 → 无需更新
             # - 盘后运行时 expected_latest_date = 今天，有新数据 → 触发更新
             # - 周末/节假日 expected_latest_date = 上一交易日，同盘前逻辑
-            # - 新股票（CSV中无数据）：全量下载一次
             codes_to_update = []
-            codes_to_fetch_full = []
-            for code, name, is_delisted in stock_list:
+            for code, name in stock_list:
                 last_date = last_date_map.get(code)
                 if last_date is None:
-                    if not is_delisted:
-                        codes_to_fetch_full.append((code, name))
-                    continue
+                    continue  # 该股票在CSV中无数据，跳过（增量模式只更新已有数据的股票）
                 if last_date < expected_latest_date:
-                    codes_to_update.append((code, name, last_date, is_delisted))
+                    codes_to_update.append((code, name, last_date))
 
-            if not codes_to_update and not codes_to_fetch_full:
+            if not codes_to_update:
                 print(f"所有股票数据已是最新（{expected_latest_date}），无需更新")
                 return
 
-            print(f"需要更新 {len(codes_to_update)} 只股票, 新增 {len(codes_to_fetch_full)} 只")
+            print(f"需要更新 {len(codes_to_update)} 只股票")
 
             update_count = 0
             max_new_date = None
             new_chunks = []
-            for idx, (code, name, last_date, is_delisted) in enumerate(tqdm(codes_to_update, desc="增量更新中", ncols=80)):
+            for idx, (code, name, last_date) in enumerate(tqdm(codes_to_update, desc="增量更新中", ncols=80)):
                 from_date = (pd.to_datetime(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
                 new_df = fetch_daily_increment(code, name, from_date)
                 if new_df is not None and not new_df.empty:
@@ -346,39 +329,12 @@ def main(full: bool = False):
                 else:
                     max_new_date = max(max_new_date, batch["date"].max())
 
-            new_count = 0
-            if codes_to_fetch_full:
-                for idx, (code, name) in enumerate(tqdm(codes_to_fetch_full, desc="新增股票中", ncols=80)):
-                    new_df = fetch_daily_full(code, name)
-                    if new_df is not None and not new_df.empty:
-                        new_chunks.append(new_df)
-                        new_count += 1
-                    time.sleep(0.1)
-
-                    if (idx + 1) % SAVE_EVERY == 0 and new_chunks:
-                        batch = pd.concat(new_chunks, ignore_index=True)
-                        save_incremental_months(batch)
-                        if max_new_date is None:
-                            max_new_date = batch["date"].max()
-                        else:
-                            max_new_date = max(max_new_date, batch["date"].max())
-                        new_chunks = []
-                        print(f"  已自动保存 (新增 {idx + 1}/{len(codes_to_fetch_full)})")
-
-                if new_chunks:
-                    batch = pd.concat(new_chunks, ignore_index=True)
-                    save_incremental_months(batch)
-                    if max_new_date is None:
-                        max_new_date = batch["date"].max()
-                    else:
-                        max_new_date = max(max_new_date, batch["date"].max())
-
             if max_new_date:
                 with open(os.path.join(DATA_DIR, ".last_date.txt"), "w") as f:
                     f.write(str(max_new_date))
 
             files = list_monthly_files()
-            print(f"\n增量更新完成! 成功更新 {update_count} 只, 新增 {new_count} 只, 月度文件共 {len(files)} 个")
+            print(f"\n增量更新完成! 成功更新 {update_count} 只, 月度文件共 {len(files)} 个")
             return
 
         # ── 全量下载 / 断点续传 ──
@@ -387,11 +343,11 @@ def main(full: bool = False):
         print("=" * 50)
         skip_count = 0
         pending = []
-        for code, name, is_delisted in stock_list:
-            if code in completed and not existing_df.empty and is_complete(existing_df, code, expected_latest_date, is_delisted):
+        for code, name in stock_list:
+            if code in completed and not existing_df.empty and is_complete(existing_df, code, expected_latest_date):
                 skip_count += 1
             else:
-                pending.append((code, name, is_delisted))
+                pending.append((code, name))
 
         if skip_count > 0:
             print(f"跳过已完成: {skip_count} 只, 待下载/补全: {len(pending)} 只")
@@ -403,7 +359,7 @@ def main(full: bool = False):
         success_count = skip_count
         fail_count = 0
 
-        for idx, (code, name, _) in enumerate(tqdm(pending, desc="正在下载日K数据", ncols=80)):
+        for idx, (code, name) in enumerate(tqdm(pending, desc="正在下载日K数据", ncols=80)):
             df = fetch_daily_full(code, name)
             if df is not None and not df.empty:
                 if not existing_df.empty and code in existing_df["代码"].values:
