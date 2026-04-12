@@ -42,7 +42,7 @@ def load_raw_data() -> pd.DataFrame:
         del temp_df
         gc.collect()
     
-    print(f"  读取 {len(files)} 个月度文件，原始数据: {df.shape[0]:,} 行, {df['代码'].nunique()} 只股票")
+    print(f"  读取 {len(files)} 个月度文件，原始数据: {df.shape[0]:,} 行, {df['code'].nunique()} 只股票")
     print(f"  日期范围: {df['date'].min()} ~ {df['date'].max()}")
     return df
 
@@ -50,20 +50,20 @@ def load_raw_data() -> pd.DataFrame:
 def filter_mainboard(df: pd.DataFrame) -> pd.DataFrame:
     """仅保留沪深主板股票（sh.60开头或sz.00开头）"""
     print("[2/6] 过滤主板股票...")
-    mask = df['代码'].str.startswith('sh.60') | df['代码'].str.startswith('sz.00')
+    mask = df['code'].str.startswith('sh.60') | df['code'].str.startswith('sz.00')
     df = df[mask].copy()
-    print(f"  主板股票: {df['代码'].nunique()} 只, {df.shape[0]:,} 行")
+    print(f"  主板股票: {df['code'].nunique()} 只, {df.shape[0]:,} 行")
     return df
 
 
 def remove_st(df: pd.DataFrame) -> pd.DataFrame:
     """剔除ST/*ST股票（基于名称列）"""
     print("[3/6] 剔除ST股票...")
-    n_before = df['代码'].nunique()
+    n_before = df['code'].nunique()
     # ST标记在名称中：ST、*ST、S*ST等
-    st_mask = df['名称'].str.contains(r'\*?ST', case=True, regex=True, na=False)
+    st_mask = df['name'].str.contains(r'\*?ST', case=True, regex=True, na=False)
     df = df[~st_mask].copy()
-    n_after = df['代码'].nunique()
+    n_after = df['code'].nunique()
     print(f"  剔除含ST记录后: {n_after} 只股票 (移除了 {n_before - n_after} 只纯ST股)")
     return df
 
@@ -83,8 +83,8 @@ def remove_suspended_and_new(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=['pctChg'])
 
     # 按股票排序，剔除每只股票最早的5个交易日（新股效应）
-    df = df.sort_values(['代码', 'date']).reset_index(drop=True)
-    df['_rank'] = df.groupby('代码').cumcount()
+    df = df.sort_values(['code', 'date']).reset_index(drop=True)
+    df['_rank'] = df.groupby('code').cumcount()
     df = df[df['_rank'] >= 5].drop(columns=['_rank'])
 
     print(f"  剔除后: {len(df):,} 行 (移除 {n_before - len(df):,} 行)")
@@ -98,8 +98,8 @@ def handle_missing(df: pd.DataFrame) -> pd.DataFrame:
                     'turn', 'pctChg', 'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM']
 
     # 组内前值填充 - 更高效的方式
-    df = df.sort_values(['代码', 'date'])
-    df[numeric_cols] = df.groupby('代码')[numeric_cols].transform(lambda x: x.ffill())
+    df = df.sort_values(['code', 'date'])
+    df[numeric_cols] = df.groupby('code')[numeric_cols].transform(lambda x: x.ffill())
 
     # 仍然缺失的用0填充（主要是基本面指标）
     df[numeric_cols] = df[numeric_cols].fillna(0)
@@ -115,13 +115,13 @@ def filter_liquidity(df: pd.DataFrame) -> pd.DataFrame:
     标准：20日平均成交额 < 配置的最小平均成交额
     """
     print("[6/6] 流动性过滤...")
-    df = df.sort_values(['代码', 'date'])
+    df = df.sort_values(['code', 'date'])
 
     # 计算20日滚动平均成交额 - 使用更高效的方式
     def rolling_mean(x):
         return x.rolling(20, min_periods=10).mean()
     
-    df['avg_amount_20'] = df.groupby('代码')['amount'].transform(rolling_mean)
+    df['avg_amount_20'] = df.groupby('code')['amount'].transform(rolling_mean)
 
     min_avg_amount = CONFIG['data_loader']['MIN_AVG_AMOUNT']
     n_before = len(df)
@@ -130,11 +130,11 @@ def filter_liquidity(df: pd.DataFrame) -> pd.DataFrame:
 
     # 过滤后确保每只股票至少有配置的最小交易日数
     min_trading_days = CONFIG['data_loader']['MIN_TRADING_DAYS']
-    stock_counts = df.groupby('代码').size()
+    stock_counts = df.groupby('code').size()
     valid_stocks = stock_counts[stock_counts >= min_trading_days].index
-    df = df[df['代码'].isin(valid_stocks)].copy()
+    df = df[df['code'].isin(valid_stocks)].copy()
 
-    print(f"  流动性过滤后: {df['代码'].nunique()} 只股票, {len(df):,} 行")
+    print(f"  流动性过滤后: {df['code'].nunique()} 只股票, {len(df):,} 行")
     return df
 
 
@@ -180,7 +180,7 @@ def run_pipeline(end_date=None) -> pd.DataFrame:
     df = filter_liquidity(df)
 
     # 最终排序与索引重置
-    df = df.sort_values(['date', '代码']).reset_index(drop=True)
+    df = df.sort_values(['date', 'code']).reset_index(drop=True)
 
     # 日期转换
     df['date'] = pd.to_datetime(df['date'])
@@ -194,7 +194,7 @@ def run_pipeline(end_date=None) -> pd.DataFrame:
     os.makedirs(os.path.dirname(CLEAN_PKL), exist_ok=True)
     df.to_pickle(CLEAN_PKL)
     print(f"\n✅ 清洗完成! 保存至 {CLEAN_PKL}")
-    print(f"  最终数据: {df.shape[0]:,} 行, {df['代码'].nunique()} 只股票")
+    print(f"  最终数据: {df.shape[0]:,} 行, {df['code'].nunique()} 只股票")
     print(f"  日期范围: {df['date'].min().date()} ~ {df['date'].max().date()}")
 
     return df
