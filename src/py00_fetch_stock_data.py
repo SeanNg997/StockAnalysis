@@ -174,13 +174,15 @@ def get_stock_list():
     stock_list = []
     while rs.next():
         row = rs.get_row_data()
-        # row[0] 是股票代码，row[4] 是上市状态（1=上市，0=退市），row[5] 是板块标志（1=主板）
+        # row[0-5]分别是证券代码、证券名称、上市日期、退市日期、证券类型、上市状态
         # 返回格式：(code, name, is_delisted)
-        if row[5] == "1":
+        if row[4] == "1":
             code = row[0]
             if code.startswith('sh.60') or code.startswith('sz.00'):
-                is_delisted = (row[4] != "1")  # row[4] != "1" 表示已退市
-                stock_list.append((code, row[1], is_delisted))
+                isDelisted = (row[5] != "1")  # row[5] != "1" 表示已退市
+                stock_list.append((code, row[1], isDelisted))
+    stock_list_df = pd.DataFrame(stock_list, columns=["code", "name", "isDelisted"])
+    stock_list_df.to_csv(os.path.join(DATA_DIR, "stock_list.csv"), index=False, encoding="utf-8-sig")
     print(f"共获取 {len(stock_list)} 只主板股票（含退市股）")
     return stock_list
 
