@@ -307,9 +307,7 @@ def main(full: bool = False):
             for code, name, is_delisted in stock_list:
                 last_date = last_date_map.get(code)
                 if last_date is None:
-                    if not is_delisted:
-                        codes_to_fetch_full.append((code, name))
-                    continue
+                    codes_to_fetch_full.append((code, name))
                 if last_date < expected_latest_date:
                     codes_to_update.append((code, name, last_date, is_delisted))
 
