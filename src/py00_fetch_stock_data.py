@@ -262,12 +262,12 @@ def main(full: bool = False):
         existing_df = load_existing_csv()
         if existing_df.empty:
             full = True
-            print("  未检测到已存在数据，将切换为全量下载模式")
+            print("未检测到已存在数据，将切换为全量下载模式")
 
         # 默认模式：增量更新
         if not full:
             print("=" * 50)
-            print("  增量更新模式")
+            print("增量更新模式")
             print("=" * 50)
             # 预先计算每只股票的最后日期
             print("正在分析已有数据...")
@@ -303,7 +303,7 @@ def main(full: bool = False):
             update_count = 0
             max_new_date = None
             new_chunks = []
-            for idx, (code, name, last_date) in enumerate(tqdm(pending_update, desc="增量更新中", ncols=50)):
+            for idx, (code, name, last_date) in enumerate(tqdm(pending_update, desc="增量更新中", ncols=80)):
                 from_date = (pd.to_datetime(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
                 new_df = fetch_dailyK(code, name, from_date)
                 if new_df is not None and not new_df.empty:
@@ -325,7 +325,7 @@ def main(full: bool = False):
             new_count = 0
             new_chunks = []
             if pending_full:
-                for idx, (code, name) in enumerate(tqdm(pending_full, desc="新增股票中", ncols=50)):
+                for idx, (code, name) in enumerate(tqdm(pending_full, desc="新增股票中", ncols=80)):
                     new_df = fetch_dailyK(code, name)
                     if new_df is not None and not new_df.empty:
                         new_chunks.append(new_df)
@@ -352,7 +352,7 @@ def main(full: bool = False):
 
         # ── 全量下载 / 断点续传 ──
         print("=" * 50)
-        print("  全量下载模式")
+        print("全量下载模式")
         print("=" * 50)
 
         # 加载完成状态
@@ -380,7 +380,7 @@ def main(full: bool = False):
         success_count = skip_count
         fail_count = 0
 
-        for idx, (code, name, _) in enumerate(tqdm(pending, desc="正在下载日K数据", ncols=50)):
+        for idx, (code, name, _) in enumerate(tqdm(pending, desc="正在下载日K数据", ncols=80)):
             df = fetch_dailyK(code, name)
             if df is not None and not df.empty:
                 if not existing_df.empty and code in existing_df["code"].values:
@@ -396,7 +396,7 @@ def main(full: bool = False):
                 save_completed(completed)
                 print(f"  已自动保存 (进度 {skip_count + idx + 1}/{len(stock_list)})")
 
-        # 最终保存
+        # 最终保存所有数据
         save_to_csv(existing_df)
         save_completed(completed)
 
