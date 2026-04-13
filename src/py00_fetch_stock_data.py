@@ -253,8 +253,8 @@ def main(full: bool = False):
     try:
         # 登录后立即确定预期最新数据日期（考虑交易日历和当前时间）
         expected_latest_date = get_expected_latest_date()
-        print(f"当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}, "
-              f"预期 BaoStock 数据库的最新交易日期: {expected_latest_date}")
+        print(f"当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+              f"数据库最新日期: {expected_latest_date}")
         # 获取沪深主板A股股票列表
         stock_list = get_stock_list()
 
@@ -359,8 +359,6 @@ def main(full: bool = False):
         completed = load_completed()
         if not existing_df.empty:
             print(f"已有数据: {len(existing_df):,} 条, 已完成 {len(completed)} 只股票")
-        else:
-            print("暂无已有数据，将进行全量下载")
 
         skip_count = 0
         pending = []

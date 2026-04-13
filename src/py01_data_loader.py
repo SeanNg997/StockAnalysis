@@ -4,18 +4,16 @@ py01_data_loader.py — 数据加载与清洗模块
 职责：
 1. 加载原始CSV日K数据
 2. 过滤仅保留沪深主板股票（代码以sh.60或sz.00开头）
-3. 剔除ST/*ST股票、停牌日、新股上市前5日
+3. 剔除ST/*ST股票（逐日isST判断，避免前瞻偏差）、停牌日、新股上市前30日
 4. 缺失值处理
 5. 流动性过滤（日均成交额 < 500万剔除）
 6. 输出清洗后的pickle文件加速后续加载
 """
 
 import pandas as pd
-import numpy as np
 import os
 import warnings
 import gc
-
 from config import CONFIG
 
 warnings.filterwarnings('ignore')
@@ -24,6 +22,9 @@ warnings.filterwarnings('ignore')
 BASE_DIR = CONFIG['paths']['BASE_DIR']
 DATA_DIR = CONFIG['paths']['DATA_DIR']
 CLEAN_PKL = CONFIG['paths']['CLEAN_PKL']
+
+# 流水线版本号：过滤逻辑变更时递增，使旧缓存自动失效
+_PIPELINE_VERSION = 2
 
 
 def load_raw_data() -> pd.DataFrame:
@@ -42,50 +43,50 @@ def load_raw_data() -> pd.DataFrame:
         del temp_df
         gc.collect()
     
-    print(f"  读取 {len(files)} 个月度文件，原始数据: {df.shape[0]:,} 行, {df['code'].nunique()} 只股票")
+    print(f"  共读取 {len(files)} 个月度文件，共 {df['code'].nunique()} 只股票")
     print(f"  日期范围: {df['date'].min()} ~ {df['date'].max()}")
     return df
 
 
-def filter_mainboard(df: pd.DataFrame) -> pd.DataFrame:
-    """仅保留沪深主板股票（sh.60开头或sz.00开头）"""
-    print("[2/6] 过滤主板股票...")
-    mask = df['code'].str.startswith('sh.60') | df['code'].str.startswith('sz.00')
-    df = df[mask].copy()
-    print(f"  主板股票: {df['code'].nunique()} 只, {df.shape[0]:,} 行")
-    return df
-
 
 def remove_st(df: pd.DataFrame) -> pd.DataFrame:
-    """剔除ST/*ST股票（基于名称列）"""
-    print("[3/6] 剔除ST股票...")
-    n_before = df['code'].nunique()
-    # ST标记在名称中：ST、*ST、S*ST等
-    st_mask = df['name'].str.contains(r'\*?ST', case=True, regex=True, na=False)
+    """剔除ST/*ST股票（基于逐日isST字段，避免前瞻偏差）
+
+    使用baostock返回的isST逐日标记，仅剔除该股票处于ST状态时的记录，
+    保留同一只股票非ST期间的数据，避免用当前名称判断导致的前瞻偏差。
+    """
+    print("[3/6] 剔除ST股票（逐日判断）...")
+    stocks_before = df['code'].nunique()
+    # isST == 1 表示该股票在该日为ST状态，仅剔除该日记录
+    st_mask = df['isST'] == 1
+    n_st_records = st_mask.sum()
+    n_st_stocks = df.loc[st_mask, 'code'].nunique()
     df = df[~st_mask].copy()
-    n_after = df['code'].nunique()
-    print(f"  剔除含ST记录后: {n_after} 只股票 (移除了 {n_before - n_after} 只纯ST股)")
+    stocks_after = df['code'].nunique()
+    print(f"  剔除ST期间记录: {n_st_records:,} 行 (涉及 {n_st_stocks} 只股票)")
+    print(f"  这些股票非ST期间的数据已保留，避免前瞻偏差")
+    print(f"  股票数: {stocks_before} → {stocks_after} (完全ST股 {stocks_before - stocks_after} 只)")
     return df
 
 
 def remove_suspended_and_new(df: pd.DataFrame) -> pd.DataFrame:
     """
-    剔除停牌日和新股上市前5个交易日
-    停牌判断：volume=0 或 open/high/low/close全相等且volume=0
+    剔除停牌日和新股上市前30个交易日
+    停牌判断：基于baostock的isTrading字段（tradestatus），比volume=0更准确
     """
-    print("[4/6] 剔除停牌日和新股上市前5日...")
+    print("[4/6] 剔除停牌日和新股上市前30个交易日...")
     n_before = len(df)
 
-    # 剔除成交量为0的停牌日
-    df = df[df['volume'] > 0].copy()
+    # 剔除停牌日（isTrading != 1 表示停牌）
+    df = df[df['isTrading'] == 1].copy()
 
     # 剔除涨跌幅缺失的行
     df = df.dropna(subset=['pctChg'])
 
-    # 按股票排序，剔除每只股票最早的5个交易日（新股效应）
+    # 按股票排序，剔除每只股票最早的30个交易日（新股效应）
     df = df.sort_values(['code', 'date']).reset_index(drop=True)
     df['_rank'] = df.groupby('code').cumcount()
-    df = df[df['_rank'] >= 5].drop(columns=['_rank'])
+    df = df[df['_rank'] >= 30].drop(columns=['_rank'])
 
     print(f"  剔除后: {len(df):,} 行 (移除 {n_before - len(df):,} 行)")
     return df
@@ -150,6 +151,11 @@ def run_pipeline(end_date=None) -> pd.DataFrame:
     if os.path.exists(CLEAN_PKL):
         try:
             cached = pd.read_pickle(CLEAN_PKL)
+            # 版本号检查：过滤逻辑变更后旧缓存必须失效
+            cached_ver = getattr(cached, '_pipeline_version', 1)
+            if cached_ver < _PIPELINE_VERSION:
+                print(f"  [缓存版本过旧 v{cached_ver} < v{_PIPELINE_VERSION}]，重新生成...")
+                raise ValueError("pipeline version mismatch")
             cached_max = cached['date'].max()
             
             if end_date is not None:
@@ -173,7 +179,6 @@ def run_pipeline(end_date=None) -> pd.DataFrame:
             pass  # 读取失败则继续正常流程
 
     df = load_raw_data()
-    df = filter_mainboard(df)
     df = remove_st(df)
     df = remove_suspended_and_new(df)
     df = handle_missing(df)
@@ -190,8 +195,9 @@ def run_pipeline(end_date=None) -> pd.DataFrame:
         df = df[df['date'] <= pd.Timestamp(end_date)].copy()
         print(f"  [date filter] 数据截断至 {end_date}")
 
-    # 保存pickle
+    # 保存pickle（附带流水线版本号）
     os.makedirs(os.path.dirname(CLEAN_PKL), exist_ok=True)
+    df._pipeline_version = _PIPELINE_VERSION
     df.to_pickle(CLEAN_PKL)
     print(f"\n✅ 清洗完成! 保存至 {CLEAN_PKL}")
     print(f"  最终数据: {df.shape[0]:,} 行, {df['code'].nunique()} 只股票")
