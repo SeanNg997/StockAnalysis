@@ -48,9 +48,9 @@ echo "=============================================="
 # Step 1: 增量更新数据（仅最新日期执行）
 echo ""
 if [ "$DATE_ARG" != "$(date +%Y-%m-%d)" ]; then
-    echo "[Step 1/4] 历史模式：跳过数据更新，使用现有 CSV 数据"
+    echo "[Step 1/5] 历史模式：跳过数据更新，使用现有 CSV 数据"
 else
-    echo "[Step 1/4] 增量更新数据..."
+    echo "[Step 1/5] 增量更新数据..."
     python "$SRC_DIR/py00_fetch_stock_data.py"
 fi
 
@@ -73,16 +73,16 @@ except Exception:
 EOF
 }
 
-CLEAN_PKL="$PROJECT_DIR/data/mainboard_clean.pkl"
-FEATURE_PKL="$PROJECT_DIR/data/features.pkl"
+CLEAN_PKL="$PROJECT_DIR/output/tmp/mainboard_clean.pkl"
+FEATURE_PKL="$PROJECT_DIR/output/tmp/features.pkl"
 
 # Step 2: 数据清洗（截断到指定日期）
 echo ""
 CLEAN_CACHE=$(check_pkl_date "$CLEAN_PKL" "$DATE_ARG")
 if [ "$CLEAN_CACHE" = "hit" ]; then
-    echo "[Step 2/4] 数据清洗：缓存命中 ($DATE_ARG)，跳过"
+    echo "[Step 2/5] 数据清洗：缓存命中 ($DATE_ARG)，跳过"
 else
-    echo "[Step 2/4] 数据清洗..."
+    echo "[Step 2/5] 数据清洗..."
     python "$SRC_DIR/py01_data_loader.py" --date "$DATE_ARG"
 fi
 
@@ -90,20 +90,20 @@ fi
 echo ""
 FEATURE_CACHE=$(check_pkl_date "$FEATURE_PKL" "$DATE_ARG")
 if [ "$FEATURE_CACHE" = "hit" ]; then
-    echo "[Step 3/4] 特征工程：缓存命中 ($DATE_ARG)，跳过"
+    echo "[Step 3/5] 特征工程：缓存命中 ($DATE_ARG)，跳过"
 else
-    echo "[Step 3/4] 特征工程..."
+    echo "[Step 3/5] 特征工程..."
     python "$SRC_DIR/py02_features.py" --date "$DATE_ARG"
 fi
 
 # Step 4: 单日快速预测（只预测指定日期，不做 walk-forward）
 echo ""
-echo "[Step 4/4] 单日快速预测..."
+echo "[Step 4/5] 单日快速预测..."
 python "$SRC_DIR/py03_model.py" --date "$DATE_ARG"
 
 # Step 5: 生成策略报告
 echo ""
-echo "[Step 5] 生成策略报告..."
+echo "[Step 5/5] 生成策略报告..."
 python "$SRC_DIR/py04_today.py" --date "$DATE_ARG"
 
 echo ""

@@ -1,17 +1,4 @@
-"""
-py02_features.py — 特征工程模块
-================================
-职责：
-1. 计算技术指标（MA/EMA/MACD/RSI/Bollinger/ATR/KDJ/OBV等）
-2. 动量与价格位置特征
-3. 成交量特征
-4. 基本面截面排名特征
-5. 波动率与风险特征
-6. 市场环境特征（截面）
-7. 生成标签：T+1日开盘买入 → T+1+HOLD_DAYS日开盘卖出的收益率（T日为决策日）
-
-严格避免未来信息泄露：所有特征仅使用T日及之前数据。
-"""
+"""特征工程 — 技术指标 / 动量 / 截面特征 / 标签生成"""
 
 import pandas as pd
 import numpy as np
@@ -26,14 +13,10 @@ warnings.filterwarnings('ignore')
 BASE_DIR = CONFIG['paths']['BASE_DIR']
 CLEAN_PKL = CONFIG['paths']['CLEAN_PKL']
 FEATURE_PKL = CONFIG['paths']['FEATURE_PKL']
+TRADE_DAYS_TXT = CONFIG['paths']['TRADE_DAYS_TXT']
 
-# ============ 特征计算函数（全部在groupby内按股票计算） ============
-
-def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
-    """
-    对单只股票的DataFrame计算所有特征。
-    输入g已按date升序排列。
-    """
+def compute_features_for_stock(g: pd.DataFrame, trade_day_idx: dict = None) -> pd.DataFrame:
+    """对单只股票计算所有特征（输入须按date升序）"""
     close = g['close'].values.astype(np.float32)
     open_ = g['open'].values.astype(np.float32)
     high = g['high'].values.astype(np.float32)
@@ -45,39 +28,31 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
 
     feats = {}
 
-    # ===== 1. 价格动量类 =====
+    # 1. 价格动量类
     for period in [1, 3, 5, 10, 20, 60]:
         ret = np.empty(n)
         ret[:period] = np.nan
         ret[period:] = close[period:] / close[:-period] - 1.0
         feats[f'ret_{period}d'] = ret
 
-    # 对数收益率（1日）
     log_ret = np.empty(n)
     log_ret[0] = np.nan
     log_ret[1:] = np.log(close[1:] / close[:-1])
     feats['log_ret_1d'] = log_ret
 
-    # ===== 2. 均线系统 =====
+    # 2. 均线系统
     for w in [5, 10, 20, 60]:
-        # trailing MA：只使用当天及之前的数据，避免未来信息泄漏
-        _cs = np.cumsum(np.insert(close, 0, 0))
-        ma = np.empty(n)
-        for i in range(n):
-            start = max(0, i + 1 - w)
-            ma[i] = (_cs[i + 1] - _cs[start]) / (i + 1 - start)
+        ma = pd.Series(close).rolling(w, min_periods=1).mean().values
         feats[f'ma_{w}'] = ma
         feats[f'ma_bias_{w}'] = (close - ma) / (ma + 1e-10)
 
-    # 均线多头排列信号: MA5 > MA10 > MA20 > MA60
     feats['ma_bull'] = (
         (feats['ma_5'] > feats['ma_10']).astype(float) +
         (feats['ma_10'] > feats['ma_20']).astype(float) +
         (feats['ma_20'] > feats['ma_60']).astype(float)
     ) / 3.0
 
-    # ===== 3. MACD =====
-    # NumPy实现EWMA
+    # 3. MACD
     def ewma(x, span):
         alpha = 2 / (span + 1)
         n = len(x)
@@ -96,20 +71,28 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     feats['macd_dea'] = dea / (close + 1e-10)
     feats['macd_hist'] = macd_hist / (close + 1e-10)
 
-    # ===== 4. RSI =====
-    # delta从第1天开始差分，第0位设为0（避免prepend污染EWM初始化）
+    # 4. RSI
+    # Wilder's smoothing
+    def wilder_ema(x, period):
+        alpha = 1.0 / period
+        result = np.zeros(len(x))
+        result[0] = x[0]
+        for i in range(1, len(x)):
+            result[i] = alpha * x[i] + (1 - alpha) * result[i-1]
+        return result
+
     _rsi_delta = np.zeros(n)
     _rsi_delta[1:] = close[1:] - close[:-1]
     _rsi_gain = np.where(_rsi_delta > 0, _rsi_delta, 0.0)
     _rsi_loss = np.where(_rsi_delta < 0, -_rsi_delta, 0.0)
 
     for period in [6, 12, 24]:
-        avg_gain = ewma(_rsi_gain, period)
-        avg_loss = ewma(_rsi_loss, period)
+        avg_gain = wilder_ema(_rsi_gain, period)
+        avg_loss = wilder_ema(_rsi_loss, period)
         rs = avg_gain / (avg_loss + 1e-10)
         feats[f'rsi_{period}'] = 100.0 - 100.0 / (1.0 + rs)
 
-    # ===== 5. 布林带 =====
+    # 5. 布林带
     bb_period = 20
     bb_ma = pd.Series(close).rolling(bb_period, min_periods=1).mean().values
     bb_std = pd.Series(close).rolling(bb_period, min_periods=2).std().fillna(0).values
@@ -118,7 +101,7 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     feats['bb_pctb'] = (close - bb_lower) / (bb_upper - bb_lower + 1e-10)
     feats['bb_width'] = (bb_upper - bb_lower) / (bb_ma + 1e-10)
 
-    # ===== 6. ATR =====
+    # 6. ATR
     hl = high - low
     tr = np.empty(n)
     tr[0] = hl[0]
@@ -129,7 +112,7 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     atr14 = pd.Series(tr).ewm(span=14, adjust=False).mean().values
     feats['atr14_ratio'] = atr14 / (close + 1e-10)
 
-    # ===== 7. KDJ =====
+    # 7. KDJ
     kdj_period = 9
     low_min = pd.Series(low).rolling(kdj_period, min_periods=1).min().values
     high_max = pd.Series(high).rolling(kdj_period, min_periods=1).max().values
@@ -141,56 +124,46 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     feats['kdj_d'] = d
     feats['kdj_j'] = j
 
-    # ===== 8. 成交量特征 =====
+    # 8. 成交量特征
     vol_s = pd.Series(volume)
     vol_ma5 = vol_s.rolling(5, min_periods=1).mean().values
     feats['vol_ratio'] = volume / (vol_ma5 + 1e-10)
 
-    # OBV（向量化：np.sign(diff)*volume 累加）
     _obv_sign = np.sign(np.diff(close, prepend=close[0]))
     obv = np.cumsum(_obv_sign * volume)
-    # trailing滚动平均（只使用当天及之前数据）
-    _obv_cs = np.cumsum(np.insert(obv, 0, 0))
-    obv_ma = np.empty(n)
-    for i in range(n):
-        start = max(0, i + 1 - 10)
-        obv_ma[i] = (_obv_cs[i + 1] - _obv_cs[start]) / (i + 1 - start)
+    obv_ma = pd.Series(obv).rolling(10, min_periods=1).mean().values
     feats['obv_diff'] = (obv - obv_ma) / (np.abs(obv_ma) + 1e-10)
 
-    # 换手率均值和突变
     turn_s = pd.Series(turn)
     turn_ma5 = turn_s.rolling(5, min_periods=1).mean().values
     feats['turn_ratio'] = turn / (turn_ma5 + 1e-10)
     feats['turn_ma5'] = turn_ma5
 
-    # 成交额（归一化）
     amt_s = pd.Series(amount)
     amt_ma20 = amt_s.rolling(20, min_periods=1).mean().values
     feats['amt_ratio'] = amount / (amt_ma20 + 1e-10)
 
-    # ===== 9. 波动率与风险 =====
+    # 9. 波动率与风险
     log_ret_s = pd.Series(feats['log_ret_1d'])
     for w in [5, 10, 20]:
         feats[f'volatility_{w}d'] = log_ret_s.rolling(w, min_periods=2).std().values
 
-    # 上行/下行波动率
     pos_ret = log_ret_s.clip(lower=0)
     neg_ret = log_ret_s.clip(upper=0)
     feats['upside_vol_20'] = pos_ret.rolling(20, min_periods=2).std().values
     feats['downside_vol_20'] = neg_ret.rolling(20, min_periods=2).std().values
 
-    # 20日最大回撤
     close_s20 = pd.Series(close)
     rolling_max = close_s20.rolling(20, min_periods=1).max().values
     feats['drawdown_20d'] = (close - rolling_max) / (rolling_max + 1e-10)
 
-    # ===== 10. 价格位置 =====
+    # 10. 价格位置
     for w in [10, 20, 60]:
         h = pd.Series(high).rolling(w, min_periods=1).max().values
         l = pd.Series(low).rolling(w, min_periods=1).min().values
         feats[f'price_pos_{w}d'] = (close - l) / (h - l + 1e-10)
 
-    # ===== 11. 基本面变化率 =====
+    # 11. 基本面变化率
     for col_name, col_vals in [('peTTM', g['peTTM'].values),
                                 ('pbMRQ', g['pbMRQ'].values),
                                 ('psTTM', g['psTTM'].values)]:
@@ -198,27 +171,22 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
         ma20 = col_s.rolling(20, min_periods=1).mean().values
         feats[f'{col_name}_chg'] = (col_vals - ma20) / (np.abs(ma20) + 1e-10)
 
-    # ===== 12. 额外alpha因子 =====
-    # 反转因子：短期超跌反弹
+    # 12. 额外alpha因子
     ret_5d = feats['ret_5d']
     vol_5d = feats['volatility_5d']
     feats['reversal_5d'] = -ret_5d  # 短期反转
-    # 波动率调整动量
     safe_vol = np.where(np.isnan(vol_5d) | (vol_5d < 1e-10), 1e-10, vol_5d)
     feats['risk_adj_mom_20d'] = feats['ret_20d'] / safe_vol
 
-    # 成交额变化趋势
     amt_5ma = pd.Series(amount).rolling(5, min_periods=1).mean().values
     amt_20ma = pd.Series(amount).rolling(20, min_periods=1).mean().values
     feats['amt_trend'] = amt_5ma / (amt_20ma + 1e-10)
 
-    # 价格加速度（动量变化率）
     ret_1d = feats['ret_1d']
     ret_1d_s = pd.Series(ret_1d)
     feats['momentum_acc'] = ret_1d_s.rolling(5, min_periods=2).mean().values - \
                             ret_1d_s.rolling(20, min_periods=5).mean().values
 
-    # 量价背离：价格上涨但成交量萎缩
     price_trend = pd.Series(close).pct_change(5).values
     vol_trend = pd.Series(volume).pct_change(5).values
     feats['vol_price_diverge'] = np.where(
@@ -226,17 +194,15 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
         price_trend - vol_trend
     )
 
-    # 上影线比例（卖压指标）
     body = np.abs(close - open_)
     total_range = high - low + 1e-10
     feats['upper_shadow'] = (high - np.maximum(close, open_)) / total_range
     feats['lower_shadow'] = (np.minimum(close, open_) - low) / total_range
 
-    # ===== 13. 标签：T+1开盘买入 → 持有HOLD_DAYS天 → T+1+HOLD_DAYS开盘卖出 =====
+    # 13. 标签：T+1开盘买入 → 持有HOLD_DAYS天 → T+1+HOLD_DAYS开盘卖出
     HOLD_DAYS = CONFIG['features']['HOLD_DAYS']  # 持有交易日数（T+1买入 → T+1+HOLD_DAYS卖出）
     sell_offset = HOLD_DAYS + 1  # 卖出价在 T+1+HOLD_DAYS 位置
 
-    # 使用更高效的方式创建滞后/超前数组
     open_next_1 = np.roll(open_, -1)
     open_next_1[-1] = np.nan
 
@@ -245,22 +211,27 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
     if n <= sell_offset:
         open_next_n[:] = np.nan
 
-    # 扣除交易成本
-    # 注意：最低佣金1元在标签计算中无法体现（不知道交易金额），
-    # 但由于每笔交易通常数万元，比例费率的影响更大
     buy_cost = CONFIG['features']['BUY_COST']
     sell_cost = CONFIG['features']['SELL_COST']
     raw_label = (open_next_n * sell_cost) / (open_next_1 * buy_cost) - 1.0
 
-    # Winsorize极端标签值
-    # 主板5日复利极端收益约50%，±30%保留绝大多数信号同时抑制极端噪声。
-    # 原±10%过于保守，会压制高动量标的的训练信号。
+    # 验证标签交易日连续性
+    if trade_day_idx is not None:
+        dates = g['date'].values
+        for i in range(n - sell_offset):
+            buy_date = dates[i + 1]
+            sell_date = dates[i + sell_offset]
+            buy_idx = trade_day_idx.get(buy_date)
+            sell_idx = trade_day_idx.get(sell_date)
+            if buy_idx is None or sell_idx is None or (sell_idx - buy_idx) != HOLD_DAYS:
+                raw_label[i] = np.nan
+
+    # Winsorize极端标签
     label_min = CONFIG['features']['LABEL_WINSORIZE_MIN']
     label_max = CONFIG['features']['LABEL_WINSORIZE_MAX']
     raw_label = np.clip(raw_label, label_min, label_max)
     feats['label'] = raw_label
 
-    # 将所有特征转为DataFrame
     feat_df = pd.DataFrame(feats, index=g.index)
     return feat_df
 
@@ -268,31 +239,29 @@ def compute_features_for_stock(g: pd.DataFrame) -> pd.DataFrame:
 def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
     """对所有股票批量计算特征"""
     print("开始特征工程...")
-    df = df.sort_values(['代码', 'date']).reset_index(drop=True)
+    df = df.sort_values(['code', 'date']).reset_index(drop=True)
 
-    # 向量化计算所有股票技术指标
+    trade_days = pd.read_csv(TRADE_DAYS_TXT, header=None, names=['date'])
+    trade_days['date'] = pd.to_datetime(trade_days['date'])
+    trade_day_idx = {d: i for i, d in enumerate(trade_days['date'].values)}
+
     print("  计算个股技术指标...")
 
-    # 按股票分组处理
-    stock_groups = df.groupby('代码')
-    feat_cols_initialized = False
+    stock_groups = df.groupby('code')
+    feat_dfs = []
 
-    for stock_code, group in stock_groups:
-        # 计算特征
-        stock_feats = compute_features_for_stock(group)
-        
-        # 首批时初始化特征列
-        if not feat_cols_initialized:
-            for col in stock_feats.columns:
-                df[col] = np.nan
-            feat_cols_initialized = True
-        
-        # 直接写入原 DataFrame
-        df.loc[stock_feats.index, stock_feats.columns] = stock_feats
+    for _, group in stock_groups:
+        stock_feats = compute_features_for_stock(group, trade_day_idx=trade_day_idx)
+        feat_dfs.append(stock_feats)
+
+    feat_all = pd.concat(feat_dfs)
+    # 只取特征列（不在原始 df 中的列）
+    new_cols = [c for c in feat_all.columns if c not in df.columns]
+    df = df.join(feat_all[new_cols], how='left')
 
     print(f"  完成所有 {len(stock_groups)} 只股票的特征计算")
 
-    # ===== 截面特征（市场环境） =====
+    # 截面特征
     print("  计算截面特征...")
     daily = df.groupby('date').agg(
         mkt_ret_mean=('ret_1d', 'mean'),
@@ -300,60 +269,52 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
         mkt_advance_ratio=('ret_1d', lambda x: (x > 0).mean()),
     ).reset_index()
 
-    # 市场动量（5日滚动）
     daily = daily.sort_values('date')
     daily['mkt_mom_5d'] = daily['mkt_ret_mean'].rolling(5, min_periods=1).sum()
 
     df = df.merge(daily, on='date', how='left')
 
-    # 个股相对市场超额收益
     df['excess_ret_1d'] = df['ret_1d'] - df['mkt_ret_mean']
 
-    # ===== 基本面截面排名（百分位） =====
+    # 基本面截面排名（0值为缺失值填充，排名前先将0替换为NaN避免扭曲截面）
     print("  计算截面排名...")
     for col in ['peTTM', 'pbMRQ', 'psTTM']:
-        df[f'{col}_rank'] = df.groupby('date')[col].rank(pct=True)
+        df[f'{col}_rank'] = df.groupby('date')[col].transform(
+            lambda x: x.replace(0, np.nan).rank(pct=True)
+        )
 
-    # ===== 动量截面排名 =====
+    # 动量截面排名
     for period in [5, 10, 20]:
         df[f'ret_{period}d_rank'] = df.groupby('date')[f'ret_{period}d'].rank(pct=True)
 
-    # 清理：删除特征计算初期的NaN行（前60日）
+    # 清理前60日 NaN
     print("  清理NaN行...")
-    df = df.sort_values(['代码', 'date'])
-    df['_rank'] = df.groupby('代码').cumcount()
+    df = df.sort_values(['code', 'date'])
+    df['_rank'] = df.groupby('code').cumcount()
     df = df[df['_rank'] >= 60].drop(columns=['_rank'])
     df = df.reset_index(drop=True)
 
-    # 特征列转 float32 节省内存
     feat_cols = get_feature_columns(df)
-    # 批量转换所有浮点列
     float_cols = [col for col in feat_cols if df[col].dtype == np.float64]
     if float_cols:
         df[float_cols] = df[float_cols].astype(np.float32)
     gc.collect()
 
-    print(f"✅ 特征工程完成! {df.shape[0]:,} 行, {df.shape[1]} 列")
+    print(f"\n✅ 特征工程完成! {df.shape[0]:,} 行, {df.shape[1]} 列")
     return df
 
 
 def get_feature_columns(df: pd.DataFrame) -> list:
-    """获取所有特征列名（排除标识列、标签列等）"""
-    exclude = {'代码', '名称', 'date', 'open', 'high', 'low', 'close',
+    """获取所有特征列名"""
+    exclude = {'code', 'name', 'date', 'open', 'high', 'low', 'close',
                'volume', 'amount', 'turn', 'pctChg',
-               'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM', 'label'}
+               'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM', 'label',
+               'isST', 'isTrading'}
     return [c for c in df.columns if c not in exclude]
 
 
 def run_pipeline(end_date=None):
-    """执行特征工程流水线
-
-    Args:
-        end_date: 数据截止日期（含），格式 'YYYY-MM-DD'。None 表示使用全部数据。
-    """
-    # 缓存命中检查
-    # 1. 若指定了 end_date，检查 pkl 最新日期是否等于 end_date
-    # 2. 若未指定 end_date，检查 pkl 最新日期是否与清洗后数据一致
+    """执行特征工程流水线"""
     if os.path.exists(FEATURE_PKL):
         try:
             cached = pd.read_pickle(FEATURE_PKL)
@@ -378,14 +339,12 @@ def run_pipeline(end_date=None):
 
     df = pd.read_pickle(CLEAN_PKL)
 
-    # 截断到指定日期（在特征计算前截断，确保不使用未来数据）
     if end_date is not None:
         df = df[df['date'] <= pd.Timestamp(end_date)].copy()
         print(f"  [date filter] 数据截断至 {end_date}")
 
     df = compute_all_features(df)
 
-    # 保存
     os.makedirs(os.path.dirname(FEATURE_PKL), exist_ok=True)
     df.to_pickle(FEATURE_PKL)
     print(f"保存至 {FEATURE_PKL}")

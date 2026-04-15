@@ -1,18 +1,9 @@
-"""
-py06_report.py — 报告与可视化模块
-====================================
-职责：
-1. 绘制累计收益率曲线（策略 vs 基准）
-2. 回撤曲线
-3. 每日持仓数量曲线
-4. 月度收益热力图
-5. 特征重要性
-"""
+"""报告与可视化 — 净值曲线 / 回撤 / 月度热力图 / 特征重要性 / 交易分析"""
 
 import pandas as pd
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')  # 非交互式后端
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import os
@@ -22,13 +13,14 @@ from config import CONFIG
 
 warnings.filterwarnings('ignore')
 
-# 中文字体配置
-plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'Heiti TC']
+plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'Noto Sans CJK SC',
+                                    'Noto Sans Mono CJK SC', 'SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 BASE_DIR = CONFIG['paths']['BASE_DIR']
 BACKTEST_OUTPUT_DIR = CONFIG['paths']['BACKTEST_OUTPUT_DIR']
 FEATURE_PKL = CONFIG['paths']['FEATURE_PKL']
+CLEAN_PKL = CONFIG['paths']['CLEAN_PKL']
 
 INITIAL_CAPITAL = CONFIG['backtest']['INITIAL_CAPITAL']
 
@@ -47,7 +39,6 @@ def plot_equity_curve(daily_df: pd.DataFrame):
     ax.fill_between(dates, strategy_pct, 0,
                     where=(strategy_pct < 0), color='#2ecc71', alpha=0.1)
 
-    # 基准线（0%）
     ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5, label='基准(0%)')
 
     ax.set_title('A股量化策略 — 累计收益率曲线', fontsize=14, fontweight='bold')
@@ -138,14 +129,12 @@ def plot_monthly_returns(daily_df: pd.DataFrame):
     daily = daily_df.copy()
     daily['date'] = pd.to_datetime(daily['date'])
     daily['daily_return'] = daily['portfolio_value'].pct_change()
-    
-    # 月度收益率
+
     monthly = daily.groupby([daily['date'].dt.year, daily['date'].dt.month])['daily_return'].apply(
         lambda x: (1 + x).prod() - 1
     ).unstack(fill_value=0)
 
     fig, ax = plt.subplots(figsize=(14, 5))
-    # A股惯例：红涨绿跌，使用反转的 RdYlGn_r（正收益=红，负收益=绿）
     im = ax.imshow(monthly.values * 100, cmap='RdYlGn_r', aspect='auto', vmin=-10, vmax=10)
 
     ax.set_xticks(range(len(monthly.columns)))
@@ -153,7 +142,6 @@ def plot_monthly_returns(daily_df: pd.DataFrame):
     ax.set_yticks(range(len(monthly.index)))
     ax.set_yticklabels(monthly.index)
 
-    # 在每个格子中标注数值
     for i in range(len(monthly.index)):
         for j in range(len(monthly.columns)):
             val = monthly.values[i, j] * 100
@@ -172,24 +160,18 @@ def plot_monthly_returns(daily_df: pd.DataFrame):
 
 
 def plot_feature_importance(model_path=None):
-    """
-    绘制特征重要性（如果模型可用）
-    这里使用一个简化方法：读取最新模型的特征重要性
-    """
-    # 由于walk-forward中模型没有持久化到文件，
-    # 我们用一个简化方式：训练一个小模型获取特征重要性
+    """绘制特征重要性（快速训练一个小模型获取）"""
     print("计算特征重要性...")
     try:
         import lightgbm as lgb
 
         df = pd.read_pickle(FEATURE_PKL)
-
-        # 使用最近2年数据
         recent = df[df['date'] >= '2024-01-01'].copy()
 
-        exclude = {'代码', '名称', 'date', 'open', 'high', 'low', 'close',
+        exclude = {'code', 'name', 'date', 'open', 'high', 'low', 'close',
                     'volume', 'amount', 'turn', 'pctChg',
                     'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM', 'label',
+                    'isST', 'isTrading',
                     'ma_5', 'ma_10', 'ma_20', 'ma_60'}
         feature_cols = [c for c in df.columns if c not in exclude]
 
@@ -199,7 +181,6 @@ def plot_feature_importance(model_path=None):
         X = X.loc[valid]
         y = y.loc[valid]
 
-        # 快速训练
         dtrain = lgb.Dataset(X, label=y)
         params = {
             'objective': 'regression', 'metric': 'mae',
@@ -226,6 +207,314 @@ def plot_feature_importance(model_path=None):
         print(f"  特征重要性绘制失败: {e}")
 
 
+def _load_trade_features():
+    """加载卖出交易并关联买入日股票特征"""
+    trade_path = os.path.join(BACKTEST_OUTPUT_DIR, 'trade_log.csv')
+    trade_df = pd.read_csv(trade_path, parse_dates=['date'])
+    sells = trade_df[trade_df['action'] == 'SELL'].copy()
+    if sells.empty:
+        return None
+
+    price_df = pd.read_pickle(CLEAN_PKL)
+    price_df['date'] = pd.to_datetime(price_df['date'])
+
+    pos_path = os.path.join(BACKTEST_OUTPUT_DIR, 'position_log.csv')
+    pos_df = pd.read_csv(pos_path, parse_dates=['date', 'buy_date'])
+
+    # 去重，避免 merge_asof 报错
+    pos_df = pos_df.drop_duplicates(subset=['code', 'date'])
+
+    sell_with_buy = sells.merge(
+        pos_df.groupby('code').last()[['buy_date']].reset_index(),
+        on='code', how='left'
+    )
+    sell_with_buy['buy_date_approx'] = sell_with_buy['date'] - pd.to_timedelta(
+        sell_with_buy['hold_days'].clip(lower=1), unit='D'
+    )
+    sell_with_buy['buy_date_final'] = sell_with_buy['buy_date'].fillna(
+        sell_with_buy['buy_date_approx']
+    )
+
+    price_indexed = price_df.set_index(['date', 'code'])
+
+    # 向量化：用 merge_asof 匹配买入日最近的交易日数据
+    buy_day_info = sell_with_buy[['code', 'buy_date_final']].drop_duplicates()
+    buy_day_info = buy_day_info.rename(columns={'buy_date_final': 'date'})
+
+    # merge_asof 要求 on 列全局有序，按 code 分组处理
+    price_subset = price_df[['code', 'date', 'turn', 'amount', 'peTTM', 'pbMRQ', 'close']].copy()
+    merged_parts = []
+    for code, grp in buy_day_info.groupby('code'):
+        grp_sorted = grp.sort_values('date')
+        price_code = price_subset[price_subset['code'] == code][['date', 'turn', 'amount', 'peTTM', 'pbMRQ', 'close']].sort_values('date')
+        part = pd.merge_asof(grp_sorted, price_code, on='date', direction='backward')
+        merged_parts.append(part)
+    merged_buy = pd.concat(merged_parts, ignore_index=True) if merged_parts else pd.DataFrame()
+    merged_buy = merged_buy.rename(columns={'date': 'buy_date_final'})
+
+    # 计算20日波动率（向量化）
+    vol_df = price_df.sort_values(['code', 'date']).copy()
+    vol_df['vol_20'] = vol_df.groupby('code')['pctChg'].transform(
+        lambda x: x.rolling(20, min_periods=10).std()
+    )
+    vol_subset = vol_df[['code', 'date', 'vol_20']].copy()
+    vol_subset = vol_subset.rename(columns={'date': 'buy_date_final', 'vol_20': 'f_vol_20'})
+
+    # merge_asof 要求 on 列全局有序，按 code 分组处理
+    vol_parts = []
+    for code, grp in merged_buy.groupby('code'):
+        grp_sorted = grp.sort_values('buy_date_final')
+        vol_code = vol_subset[vol_subset['code'] == code].sort_values('buy_date_final')
+        part = pd.merge_asof(grp_sorted, vol_code[['buy_date_final', 'f_vol_20']], on='buy_date_final', direction='backward')
+        vol_parts.append(part)
+    merged_buy = pd.concat(vol_parts, ignore_index=True) if vol_parts else pd.DataFrame()
+
+    merged_buy = merged_buy.rename(columns={
+        'turn': 'f_turn', 'amount': 'f_amount',
+        'peTTM': 'f_peTTM', 'pbMRQ': 'f_pbMRQ', 'close': 'f_close'
+    })
+
+    result = sell_with_buy.merge(
+        merged_buy[['code', 'buy_date_final', 'f_turn', 'f_amount', 'f_peTTM', 'f_pbMRQ', 'f_close', 'f_vol_20']],
+        on=['code', 'buy_date_final'], how='left'
+    )
+    return result
+
+
+def _plot_group_analysis(data, col, bins, labels, title, filename):
+    """通用分组分析绘图"""
+    data = data.copy()
+    data['group'] = pd.cut(data[col], bins=bins, labels=labels, include_lowest=True)
+    data = data.dropna(subset=['group', 'profit_pct'])
+
+    grouped = data.groupby('group', observed=True).agg(
+        count=('profit_pct', 'size'),
+        win_rate=('profit_pct', lambda x: (x > 0).mean()),
+        avg_return=('profit_pct', 'mean'),
+        avg_profit=('profit', 'mean'),
+    ).reset_index()
+
+    if grouped.empty:
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig.suptitle(title, fontsize=14, fontweight='bold')
+
+    colors = ['#3498db', '#2ecc71', '#e74c3c', '#f39c12', '#9b59b6']
+
+    bars = axes[0].bar(grouped['group'].astype(str), grouped['win_rate'] * 100,
+                       color=colors[:len(grouped)])
+    axes[0].set_ylabel('胜率 (%)')
+    axes[0].set_title('胜率')
+    axes[0].axhline(y=50, color='gray', linestyle='--', alpha=0.5)
+    for bar, v in zip(bars, grouped['win_rate']):
+        axes[0].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                     f'{v:.0%}', ha='center', va='bottom', fontsize=9)
+
+    bar_colors = ['#e74c3c' if v >= 0 else '#2ecc71' for v in grouped['avg_return']]
+    bars = axes[1].bar(grouped['group'].astype(str), grouped['avg_return'] * 100,
+                       color=bar_colors)
+    axes[1].set_ylabel('平均收益率 (%)')
+    axes[1].set_title('平均收益率')
+    axes[1].axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    for bar, v in zip(bars, grouped['avg_return']):
+        axes[1].text(bar.get_x() + bar.get_width() / 2,
+                     bar.get_height() + (0.1 if v >= 0 else -0.3),
+                     f'{v:+.2%}', ha='center', va='bottom', fontsize=9)
+
+    bars = axes[2].bar(grouped['group'].astype(str), grouped['count'],
+                       color=colors[:len(grouped)])
+    axes[2].set_ylabel('交易笔数')
+    axes[2].set_title('交易笔数')
+    for bar, v in zip(bars, grouped['count']):
+        axes[2].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                     str(int(v)), ha='center', va='bottom', fontsize=9)
+
+    for ax in axes:
+        ax.tick_params(axis='x', rotation=30)
+        ax.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    path = os.path.join(BACKTEST_OUTPUT_DIR, filename)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  保存: {path}")
+
+
+def plot_trade_analysis():
+    """交易分析：按多维度分析模型表现"""
+    print("生成交易分析图表...")
+    data = _load_trade_features()
+    if data is None or data.empty:
+        print("  无卖出交易数据，跳过")
+        return
+
+    # 按成交额分组
+    if 'f_amount' in data.columns and data['f_amount'].notna().sum() > 10:
+        _plot_group_analysis(
+            data, 'f_amount',
+            bins=[0, 5e7, 1.5e8, 5e8, np.inf],
+            labels=['<5千万', '5千万~1.5亿', '1.5~5亿', '>5亿'],
+            title='按成交额分组 · 交易表现',
+            filename='analysis_by_amount.png'
+        )
+
+    # 按换手率分组
+    if 'f_turn' in data.columns and data['f_turn'].notna().sum() > 10:
+        _plot_group_analysis(
+            data, 'f_turn',
+            bins=[0, 1, 3, 8, np.inf],
+            labels=['<1%', '1~3%', '3~8%', '>8%'],
+            title='按换手率分组 · 交易表现',
+            filename='analysis_by_turnover.png'
+        )
+
+    # 按20日波动率分组
+    if 'f_vol_20' in data.columns and data['f_vol_20'].notna().sum() > 10:
+        _plot_group_analysis(
+            data, 'f_vol_20',
+            bins=[0, 1.5, 2.5, 4, np.inf],
+            labels=['低波(<1.5%)', '中波(1.5~2.5%)', '中高波(2.5~4%)', '高波(>4%)'],
+            title='按20日波动率分组 · 交易表现',
+            filename='analysis_by_volatility.png'
+        )
+
+    # 按PE分组
+    if 'f_peTTM' in data.columns:
+        pe_valid = data[(data['f_peTTM'] > 0) & (data['f_peTTM'] < 200)].copy()
+        if len(pe_valid) > 10:
+            _plot_group_analysis(
+                pe_valid, 'f_peTTM',
+                bins=[0, 15, 30, 60, 200],
+                labels=['低估值(<15)', '合理(15~30)', '偏高(30~60)', '高估值(>60)'],
+                title='按PE(TTM)分组 · 交易表现',
+                filename='analysis_by_pe.png'
+            )
+
+    # 按卖出原因
+    _plot_sell_reason_analysis(data)
+
+    # 综合统计
+    _save_analysis_summary(data)
+    print("  交易分析完成")
+
+
+def _plot_sell_reason_analysis(data):
+    """按卖出原因分析"""
+    if 'reason' not in data.columns:
+        return
+
+    grouped = data.groupby('reason').agg(
+        count=('profit_pct', 'size'),
+        win_rate=('profit_pct', lambda x: (x > 0).mean()),
+        avg_return=('profit_pct', 'mean'),
+        total_profit=('profit', 'sum'),
+    ).sort_values('count', ascending=False).reset_index()
+
+    if grouped.empty:
+        return
+
+    REASON_CN = {
+        'STOP_LOSS': '止损', 'TAKE_PROFIT': '止盈',
+        'HOLD_EXPIRE': '到期', 'SIGNAL_REVERSE': '信号反转',
+    }
+    grouped['reason_cn'] = grouped['reason'].map(REASON_CN).fillna(grouped['reason'])
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle('按卖出原因 · 交易表现', fontsize=14, fontweight='bold')
+
+    colors = {'止损': '#2ecc71', '止盈': '#e74c3c', '到期': '#3498db', '信号反转': '#f39c12'}
+    bar_colors = [colors.get(r, '#95a5a6') for r in grouped['reason_cn']]
+
+    axes[0].pie(grouped['count'], labels=grouped['reason_cn'], autopct='%1.0f%%',
+                colors=bar_colors, startangle=90)
+    axes[0].set_title('卖出原因分布')
+
+    bars = axes[1].bar(grouped['reason_cn'], grouped['win_rate'] * 100, color=bar_colors)
+    axes[1].set_ylabel('胜率 (%)')
+    axes[1].set_title('各原因胜率')
+    axes[1].axhline(y=50, color='gray', linestyle='--', alpha=0.5)
+    for bar, v in zip(bars, grouped['win_rate']):
+        axes[1].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                     f'{v:.0%}', ha='center', va='bottom', fontsize=9)
+
+    profit_colors = ['#e74c3c' if v >= 0 else '#2ecc71' for v in grouped['total_profit']]
+    bars = axes[2].bar(grouped['reason_cn'], grouped['total_profit'], color=profit_colors)
+    axes[2].set_ylabel('总盈亏 (元)')
+    axes[2].set_title('各原因总盈亏')
+    axes[2].axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    for bar, v in zip(bars, grouped['total_profit']):
+        axes[2].text(bar.get_x() + bar.get_width() / 2,
+                     bar.get_height() + (50 if v >= 0 else -150),
+                     f'{v:+,.0f}', ha='center', va='bottom', fontsize=9)
+
+    for ax in axes[1:]:
+        ax.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    path = os.path.join(BACKTEST_OUTPUT_DIR, 'analysis_by_sell_reason.png')
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  保存: {path}")
+
+
+def _save_analysis_summary(data):
+    """保存交易分析汇总 Markdown"""
+    lines = ["# 交易分析报告\n"]
+    lines.append(f"> 分析样本：**{len(data)}** 笔卖出交易\n")
+    lines.append("---\n")
+
+    overall_wr = (data['profit_pct'] > 0).mean()
+    overall_avg = data['profit_pct'].mean()
+    lines.append("## 总体表现\n")
+    lines.append("| 指标 | 数值 |")
+    lines.append("|------|-----:|")
+    lines.append(f"| 总卖出笔数 | {len(data)} |")
+    lines.append(f"| 总体胜率 | {overall_wr:.1%} |")
+    lines.append(f"| 平均收益率 | {overall_avg:+.2%} |")
+    lines.append(f"| 总盈亏 | ¥{data['profit'].sum():+,.0f} |\n")
+
+    # 按维度输出最佳/最差组
+    dims = [
+        ('f_amount', [0, 5e7, 1.5e8, 5e8, np.inf],
+         ['<5千万', '5千万~1.5亿', '1.5~5亿', '>5亿'], '成交额'),
+        ('f_turn', [0, 1, 3, 8, np.inf],
+         ['<1%', '1~3%', '3~8%', '>8%'], '换手率'),
+        ('f_vol_20', [0, 1.5, 2.5, 4, np.inf],
+         ['低波(<1.5%)', '中波(1.5~2.5%)', '中高波(2.5~4%)', '高波(>4%)'], '20日波动率'),
+    ]
+
+    lines.append("## 各维度最佳表现分组\n")
+    lines.append("| 维度 | 最佳分组 | 胜率 | 平均收益率 | 笔数 |")
+    lines.append("|------|:--------:|-----:|-----------:|-----:|")
+
+    for col, bins, labels, dim_name in dims:
+        if col not in data.columns or data[col].notna().sum() < 10:
+            continue
+        tmp = data.copy()
+        tmp['group'] = pd.cut(tmp[col], bins=bins, labels=labels, include_lowest=True)
+        tmp = tmp.dropna(subset=['group', 'profit_pct'])
+        grp = tmp.groupby('group', observed=True).agg(
+            wr=('profit_pct', lambda x: (x > 0).mean()),
+            avg=('profit_pct', 'mean'),
+            cnt=('profit_pct', 'size'),
+        )
+        grp = grp[grp['cnt'] >= 5]  # 至少5笔才有统计意义
+        if grp.empty:
+            continue
+        best = grp.loc[grp['avg'].idxmax()]
+        lines.append(f"| {dim_name} | {best.name} | {best['wr']:.0%}"
+                     f" | {best['avg']:+.2%} | {int(best['cnt'])} |")
+
+    lines.append("\n---\n")
+    lines.append("> *样本量较小的分组结论可能不稳定，建议结合样本外数据验证。*\n")
+
+    md_path = os.path.join(BACKTEST_OUTPUT_DIR, 'trade_analysis.md')
+    with open(md_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+    print(f"  保存: {md_path}")
+
+
 def generate_all_reports():
     """生成所有报告和图表"""
     os.makedirs(BACKTEST_OUTPUT_DIR, exist_ok=True)
@@ -243,6 +532,7 @@ def generate_all_reports():
     plot_positions(daily_df)
     plot_monthly_returns(daily_df)
     plot_feature_importance()
+    plot_trade_analysis()
 
     print(f"\n✅ 所有图表已保存至 {BACKTEST_OUTPUT_DIR}/")
 
