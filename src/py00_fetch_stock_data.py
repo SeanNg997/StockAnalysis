@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import os
 import gc
 import glob
+import argparse
 from config import CONFIG
 
 # Path
@@ -46,15 +47,6 @@ def get_expected_latest_date() -> str:
         prev_days = [d for d in trading_days if d < today_str]
         return prev_days[-1] if prev_days else trading_days[-1]
 
-# ── 月度文件管理 ──
-
-def get_monthly_file(yyyymm: str) -> str:
-    return os.path.join(DATA_DIR, f"Stock_dailyK_{yyyymm}.csv")
-
-
-def list_monthly_files() -> list:
-    return sorted(glob.glob(os.path.join(DATA_DIR, "Stock_dailyK_*.csv")))
-
 
 # ── 下载状态管理 ──
 
@@ -79,7 +71,7 @@ def save_completed(completed: set):
 
 def load_existing_csv() -> pd.DataFrame:
     """加载所有月度CSV合并返回"""
-    files = list_monthly_files()
+    files = sorted(glob.glob(os.path.join(DATA_DIR, "Stock_dailyK_*.csv")))
     df = pd.DataFrame()
     if not files:
         return df
@@ -98,7 +90,7 @@ def save_to_csv(df: pd.DataFrame):
     df = df.copy()
     df["_month"] = pd.to_datetime(df["date"]).dt.strftime("%Y%m")
     for month, group in df.groupby("_month"):
-        monthly_file = get_monthly_file(month)
+        monthly_file = os.path.join(DATA_DIR, f"Stock_dailyK_{month}.csv")
         group.drop(columns=["_month"]).to_csv(monthly_file, index=False, encoding="utf-8-sig")
 
 
@@ -110,7 +102,7 @@ def save_incremental_months(new_df: pd.DataFrame):
     new_df["_month"] = pd.to_datetime(new_df["date"]).dt.strftime("%Y%m")
     for month, group in new_df.groupby("_month"):
         group = group.drop(columns=["_month"])
-        monthly_file = get_monthly_file(month)
+        monthly_file = os.path.join(DATA_DIR, f"Stock_dailyK_{month}.csv")
         if os.path.exists(monthly_file):
             existing_month = pd.read_csv(monthly_file, encoding="utf-8-sig")
             combined = pd.concat([existing_month, group], ignore_index=True)
@@ -370,7 +362,7 @@ def main(full: bool = False):
             with open(os.path.join(DATA_DIR, ".last_date.txt"), "w") as f:
                 f.write(str(latest))
 
-        files = list_monthly_files()
+        files = sorted(glob.glob(os.path.join(DATA_DIR, "Stock_dailyK_*.csv")))
         total_stocks = len(existing_df["code"].unique())
         print("✅ 全量下载完成!")
         print(f"数据已保存至 data/ 目录，共 {len(files)} 个文件")
@@ -385,7 +377,6 @@ def main(full: bool = False):
 
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser(description="A股日K数据下载")
     parser.add_argument("-f", "--full", action="store_true", help="全量下载模式，重新下载所有股票数据")
     args = parser.parse_args()

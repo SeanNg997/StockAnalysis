@@ -10,7 +10,7 @@ CONFIG = {
 
     'data_loader': {
         'MIN_AVG_AMOUNT': 500e4,   # 最低20日均成交额(元)
-        'MIN_TRADING_DAYS': 120,
+        'MIN_TRADING_DAYS': 100,
     },
 
     'features': {
@@ -58,11 +58,11 @@ CONFIG = {
         'STOP_LOSS': -0.05,
         'TAKE_PROFIT': 0.08,
         'INITIAL_CAPITAL': 100_000,
-        'MAX_DAILY_BUY': 2,
+        'MAX_DAILY_BUY': 5,
         'MARKET_REGIME_LOOKBACK': 10,
         'MIN_EXEC_AMOUNT': 100e4,  # 执行日最低成交额(100万)
-        'MIN_STOCK_PRICE': 2.0,    # 最低股价(元)，过滤退市/垃圾股
         'MAX_DELIST_HOLD_DAYS': 5, # 持仓股停牌超过此天数视为退市，强制清仓
+        'MIN_STOCK_PRICE': 2.0,    # 最低股价(元)，过滤退市/垃圾股
         'MIN_PRICE_DAYS': 5,       # 连续N个交易日低于MIN_STOCK_PRICE视为高风险
         'MIN_PRICE_CONSECUTIVE': True,  # True=连续N天，False=最近N天内任意N天
     },
