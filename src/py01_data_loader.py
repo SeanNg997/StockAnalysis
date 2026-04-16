@@ -6,7 +6,6 @@ import os
 import warnings
 import gc
 from config import CONFIG
-
 warnings.filterwarnings('ignore')
 
 BASE_DIR = CONFIG['paths']['BASE_DIR']

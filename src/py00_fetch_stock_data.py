@@ -242,7 +242,7 @@ def main(full: bool = False):
             pending_update = []
             pending_full = []
             skip_delisted_no_data = 0
-            for code, name, _, _, is_delisted in stock_list:
+            for code, name, list_date, delisted_date, is_delisted in stock_list:
                 last_date = last_date_map.get(code)
                 if last_date is None:
                     if is_delisted:
