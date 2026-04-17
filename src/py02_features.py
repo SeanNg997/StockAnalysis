@@ -24,9 +24,29 @@ def compute_features_for_stock(g: pd.DataFrame, trade_day_idx: dict = None) -> p
     volume = g['volume'].values.astype(np.float32)
     amount = g['amount'].values.astype(np.float32)
     turn = g['turn'].values.astype(np.float32)
+    is_trading = g['isTrading'].values.astype(int)
     n = len(g)
 
     feats = {}
+    
+    # 计算连续停牌天数
+    consecutive_suspend = np.zeros(n, dtype=int)
+    current_suspend = 0
+    for i in range(n):
+        if is_trading[i] != 1:
+            current_suspend += 1
+        else:
+            current_suspend = 0
+        consecutive_suspend[i] = current_suspend
+    feats['consecutive_suspend'] = consecutive_suspend
+    
+    # 计算最近5天是否有停牌
+    recent_5d_suspend = np.zeros(n, dtype=int)
+    for i in range(n):
+        start = max(0, i - 4)
+        has_suspend = np.any(is_trading[start:i+1] != 1)
+        recent_5d_suspend[i] = 1 if has_suspend else 0
+    feats['recent_5d_suspend'] = recent_5d_suspend
 
     # 1. 价格动量类
     for period in [1, 3, 5, 10, 20, 60]:
@@ -263,6 +283,7 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # 截面特征
     print("  计算截面特征...")
+    # 市场整体截面特征
     daily = df.groupby('date').agg(
         mkt_ret_mean=('ret_1d', 'mean'),
         mkt_ret_std=('ret_1d', 'std'),
@@ -275,6 +296,44 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.merge(daily, on='date', how='left')
 
     df['excess_ret_1d'] = df['ret_1d'] - df['mkt_ret_mean']
+    
+    # 行业截面特征（industry）
+    print("  计算行业截面特征...")
+    industry_daily = df.groupby(['date', 'industry']).agg(
+        industry_ret_mean=('ret_1d', 'mean'),
+        industry_ret_std=('ret_1d', 'std'),
+        industry_advance_ratio=('ret_1d', lambda x: (x > 0).mean()),
+        industry_count=('code', 'count')
+    ).reset_index()
+    
+    # 计算行业动量
+    industry_daily = industry_daily.sort_values(['industry', 'date'])
+    industry_daily['industry_mom_5d'] = industry_daily.groupby('industry')['industry_ret_mean'].rolling(5, min_periods=1).sum().reset_index(level=0, drop=True)
+    
+    # 合并行业截面特征
+    df = df.merge(industry_daily, on=['date', 'industry'], how='left')
+    
+    # 计算行业超额收益
+    df['excess_ret_industry'] = df['ret_1d'] - df['industry_ret_mean']
+    
+    # 行业分类截面特征（industryClassification）
+    print("  计算行业分类截面特征...")
+    industry_class_daily = df.groupby(['date', 'industryClassification']).agg(
+        industry_class_ret_mean=('ret_1d', 'mean'),
+        industry_class_ret_std=('ret_1d', 'std'),
+        industry_class_advance_ratio=('ret_1d', lambda x: (x > 0).mean()),
+        industry_class_count=('code', 'count')
+    ).reset_index()
+    
+    # 计算行业分类动量
+    industry_class_daily = industry_class_daily.sort_values(['industryClassification', 'date'])
+    industry_class_daily['industry_class_mom_5d'] = industry_class_daily.groupby('industryClassification')['industry_class_ret_mean'].rolling(5, min_periods=1).sum().reset_index(level=0, drop=True)
+    
+    # 合并行业分类截面特征
+    df = df.merge(industry_class_daily, on=['date', 'industryClassification'], how='left')
+    
+    # 计算行业分类超额收益
+    df['excess_ret_industry_class'] = df['ret_1d'] - df['industry_class_ret_mean']
 
     # 基本面截面排名（0值为缺失值填充，排名前先将0替换为NaN避免扭曲截面）
     print("  计算截面排名...")

@@ -28,7 +28,7 @@ python "$SRC_DIR/py00_fetch_stock_data.py"
 # Step 2: 数据清洗（全量）
 echo ""
 echo "[Step 2/7] 数据清洗..."
-python "$SRC_DIR/py01_data_loader.py"
+python "$SRC_DIR/py01_data_clean.py"
 
 # Step 3: 特征工程（全量）
 echo ""

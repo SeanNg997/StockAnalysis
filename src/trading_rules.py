@@ -69,17 +69,17 @@ def filter_stock_pool(candidates: pd.DataFrame,
         on='code', how='left'
     )
 
-    # 1. 排除 ST
-    st_mask = merged['isST'] == 1
-    n_st = st_mask.sum()
-    merged = merged[~st_mask]
-    stats['排除ST'] = int(n_st)
+    # 1. 不再排除 ST 股票
+    # st_mask = merged['isST'] == 1
+    # n_st = st_mask.sum()
+    # merged = merged[~st_mask]
+    # stats['排除ST'] = int(n_st)
 
-    # 2. 排除停牌
-    suspended_mask = merged['isTrading'] != 1
-    n_suspended = suspended_mask.sum()
-    merged = merged[~suspended_mask]
-    stats['排除停牌'] = int(n_suspended)
+    # 2. 不再单独排除停牌（已被最近5天无停牌规则包含）
+    # suspended_mask = merged['isTrading'] != 1
+    # n_suspended = suspended_mask.sum()
+    # merged = merged[~suspended_mask]
+    # stats['排除停牌'] = int(n_suspended)
 
     # 3. 排除流动性不足
     low_liq_mask = merged['mkt_amount'] < MIN_EXEC_AMOUNT
@@ -124,13 +124,34 @@ def filter_stock_pool(candidates: pd.DataFrame,
             merged = merged[~low_consecutive_mask]
             stats['排除连续低价股'] = int(n_low_consecutive)
 
-    # 6. 排除低预测收益
+    # 6. 排除特征期内有连续2天及以上停牌的股票
+    if 'consecutive_suspend' in merged.columns:
+        suspend_mask = merged['consecutive_suspend'] > 2
+        n_suspend = suspend_mask.sum()
+        merged = merged[~suspend_mask]
+        stats['排除连续停牌'] = int(n_suspend)
+    
+    # 7. 排除最近5天有停牌的股票
+    if 'recent_5d_suspend' in merged.columns:
+        recent_suspend_mask = merged['recent_5d_suspend'] == 1
+        n_recent_suspend = recent_suspend_mask.sum()
+        merged = merged[~recent_suspend_mask]
+        stats['排除最近5天停牌'] = int(n_recent_suspend)
+    
+    # 8. 排除上市时间不足60天的股票
+    if 'isNew' in merged.columns:
+        new_mask = merged['isNew'] == 1
+        n_new = new_mask.sum()
+        merged = merged[~new_mask]
+        stats['排除新股'] = int(n_new)
+
+    # 7. 排除低预测收益
     low_ret_mask = merged['pred_return'] <= MIN_PRED_RETURN
     n_low_ret = low_ret_mask.sum()
     merged = merged[~low_ret_mask]
     stats['低于收益阈值'] = int(n_low_ret)
 
-    # 7. 排除低置信度
+    # 8. 排除低置信度
     low_conf_mask = merged['confidence'] <= MIN_CONFIDENCE
     n_low_conf = low_conf_mask.sum()
     merged = merged[~low_conf_mask]
@@ -139,7 +160,7 @@ def filter_stock_pool(candidates: pd.DataFrame,
     stats['最终候选'] = len(merged)
 
     # 清理临时列
-    drop_cols = [c for c in ['isST', 'isTrading', 'mkt_amount', 'mkt_close'] if c in merged.columns]
+    drop_cols = [c for c in ['isST', 'isTrading', 'mkt_amount', 'mkt_close', 'consecutive_suspend'] if c in merged.columns]
     merged = merged.drop(columns=drop_cols)
 
     if return_stats:

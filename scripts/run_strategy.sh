@@ -83,7 +83,7 @@ if [ "$CLEAN_CACHE" = "hit" ]; then
     echo "[Step 2/5] 数据清洗：缓存命中 ($DATE_ARG)，跳过"
 else
     echo "[Step 2/5] 数据清洗..."
-    python "$SRC_DIR/py01_data_loader.py" --date "$DATE_ARG"
+    python "$SRC_DIR/py01_data_clean.py" --date "$DATE_ARG"
 fi
 
 # Step 3: 特征工程（截断到指定日期）

@@ -19,7 +19,7 @@ MARKET_PKL = CONFIG['paths']['MARKET_PKL']
 def load_raw_data() -> pd.DataFrame:
     """加载所有月度CSV合并返回"""
     import glob as _glob
-    print("[1/6] 加载月度CSV数据...")
+    print("[1/3] 加载月度CSV数据...")
     files = sorted(_glob.glob(os.path.join(DATA_DIR, 'Stock_dailyK_*.csv')))
     if not files:
         raise FileNotFoundError(f"未找到月度CSV文件 (Stock_dailyK_*.csv) in {DATA_DIR}")
@@ -50,35 +50,18 @@ def build_market_status(df: pd.DataFrame, end_date=None):
     return market_df
 
 
-
-def remove_st(df: pd.DataFrame) -> pd.DataFrame:
-    """剔除ST/*ST状态的日记录（基于逐日isST字段，避免前瞻偏差）"""
-    print("[2/6] 剔除ST/*ST股票（仅剔除ST状态的日记录）...")
-    st_mask = df['isST'] == 1
-    df = df[~st_mask].copy()
-    print(f"  剔除后：{len(df):,} 行")
-    return df
-
-
-def remove_suspended(df: pd.DataFrame) -> pd.DataFrame:
-    """剔除停牌日"""
-    print("[3/6] 剔除停牌日...")
-    df = df[df['isTrading'] == 1].copy()
-    print(f"  剔除后：{len(df):,} 行")
-
-    return df
-
-
-def remove_new(df: pd.DataFrame) -> pd.DataFrame:
-    """剔除新股上市前30个交易日"""
-    print("[4/6] 剔除新股上市的前30个交易日...")
+def add_is_new_flag(df: pd.DataFrame) -> pd.DataFrame:
+    """添加isNew字段，新股上市前30个交易日标记为1，其他为0"""
+    print("[2/3] 添加isNew字段（新股上市前30个交易日标记为1）...")
 
     stock_list_df = pd.read_csv(STOCK_LIST_CSV, encoding='utf-8-sig')
     stock_list_df['list_date'] = pd.to_datetime(stock_list_df['list_date'])
     trade_days = pd.read_csv(TRADE_DAYS_TXT, header=None, names=['date'])
     trade_days['date'] = pd.to_datetime(trade_days['date'])
     df['date'] = pd.to_datetime(df['date'])
-    df = df.merge(stock_list_df[['code', 'list_date']], on='code', how='left')
+    
+    # Merge stock_list_df with industry columns
+    df = df.merge(stock_list_df[['code', 'list_date', 'industry', 'industryClassification']], on='code', how='left')
 
     # 向量化计算 cutoff_date
     trade_dates = trade_days['date'].values
@@ -93,50 +76,82 @@ def remove_new(df: pd.DataFrame) -> pd.DataFrame:
 
     stock_list_df['cutoff_date'] = cutoff_dates
     df = df.merge(stock_list_df[['code', 'cutoff_date']], on='code', how='left')
-    mask = df['cutoff_date'].notna() & (df['date'] > df['cutoff_date'])
-    df = df[mask].copy()
+    
+    # 添加isNew字段：前30个交易日标记为1，其他为0
+    df['isNew'] = 0
+    mask = df['cutoff_date'].notna() & (df['date'] <= df['cutoff_date'])
+    df.loc[mask, 'isNew'] = 1
+    
     df = df.drop(columns=['list_date', 'cutoff_date'])
 
-    print(f"  剔除后：{len(df):,} 行")
+    print(f"  isNew=1 的行数：{df['isNew'].sum():,} 行")
     return df
 
 
 def handle_missing(df: pd.DataFrame) -> pd.DataFrame:
-    """缺失值处理：组内前值填充 + 零填充"""
-    print("[5/6] 处理缺失值...")
+    """缺失值处理：连续缺失小于等于2天用前值，否则全部设置为0"""
+    print("[3/3] 处理缺失值...")
     numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount',
                     'turn', 'pctChg', 'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM']
 
     df = df.sort_values(['code', 'date'])
-    df[numeric_cols] = df.groupby('code')[numeric_cols].transform(lambda x: x.ffill())
 
-    df[numeric_cols] = df[numeric_cols].fillna(0)
-
-    missing = df[numeric_cols].isna().sum().sum()
-    print(f"  处理后残余缺失值: {missing}")
-    return df
-
-
-def filter_liquidity(df: pd.DataFrame) -> pd.DataFrame:
-    """过滤流动性不足的股票"""
-    print("[6/6] 流动性过滤...")
-    df = df.sort_values(['code', 'date'])
-
-    def rolling_mean(x):
-        return x.rolling(20, min_periods=10).mean()
+    before_missing = df[numeric_cols].isna().sum().sum()
     
-    df['avg_amount_20'] = df.groupby('code')['amount'].transform(rolling_mean)
+    # 对每个股票分组处理
+    for col in numeric_cols:
+        # 保存原始数据的副本
+        original_col = df[col].copy()
+        
+        # 计算连续缺失天数
+        def calculate_consecutive_missing(group):
+            missing_mask = group.isna()
+            consecutive_missing = missing_mask.astype(int).groupby((~missing_mask).cumsum()).cumsum()
+            return consecutive_missing
+        
+        # 计算每个股票的连续缺失天数
+        consecutive_missing = df.groupby('code')[col].transform(calculate_consecutive_missing)
+        
+        # 前值填充所有缺失值
+        df[col] = df.groupby('code')[col].transform(lambda x: x.ffill())
+        
+        # 找出所有连续缺失超过2天的缺失值组
+        # 对每个股票分组处理
+        for code, group in df.groupby('code'):
+            # 找出该股票的缺失值位置
+            missing_indices = group[original_col.isna()].index
+            if len(missing_indices) == 0:
+                continue
+            
+            # 计算连续缺失的起始和结束位置
+            consecutive_groups = []
+            current_start = missing_indices[0]
+            current_end = missing_indices[0]
+            
+            for i in range(1, len(missing_indices)):
+                if missing_indices[i] == missing_indices[i-1] + 1:
+                    current_end = missing_indices[i]
+                else:
+                    consecutive_groups.append((current_start, current_end))
+                    current_start = missing_indices[i]
+                    current_end = missing_indices[i]
+            consecutive_groups.append((current_start, current_end))
+            
+            # 对于连续缺失超过2天的组，将整个组设置为0
+            for start, end in consecutive_groups:
+                group_length = end - start + 1
+                if group_length > 2:
+                    df.loc[start:end, col] = 0
 
-    min_avg_amount = CONFIG['data_loader']['MIN_AVG_AMOUNT']
-    df = df[df['avg_amount_20'] >= min_avg_amount].copy()
-    df = df.drop(columns=['avg_amount_20'])
+    after_missing = df[numeric_cols].isna().sum().sum()
+    filled = before_missing - after_missing
+    
+    # 处理可能的剩余缺失值（如股票的第一个值）
+    df[numeric_cols] = df[numeric_cols].fillna(0)
+    final_missing = df[numeric_cols].isna().sum().sum()
 
-    min_trading_days = CONFIG['data_loader']['MIN_TRADING_DAYS']
-    stock_counts = df.groupby('code').size()
-    valid_stocks = stock_counts[stock_counts >= min_trading_days].index
-    df = df[df['code'].isin(valid_stocks)].copy()
-
-    print(f"  剔除后：{len(df):,} 行")
+    print(f"  原始缺失值: {before_missing:,}")
+    print(f"  处理后缺失值: {final_missing}")
     return df
 
 
@@ -173,14 +188,9 @@ def run_pipeline(end_date=None) -> pd.DataFrame:
 
     df = load_raw_data()
     build_market_status(df, end_date=end_date)
-    df = remove_st(df)
-    df = remove_suspended(df)
-    df = remove_new(df) 
+    df = add_is_new_flag(df) 
     df = handle_missing(df)
-    df = filter_liquidity(df)
-
     df = df.sort_values(['date', 'code']).reset_index(drop=True)
-
     df['date'] = pd.to_datetime(df['date'])
 
     if end_date is not None:

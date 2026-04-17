@@ -33,7 +33,8 @@ def get_feature_columns(df: pd.DataFrame) -> list:
                'volume', 'amount', 'turn', 'pctChg',
                'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM', 'label',
                'isST', 'isTrading',
-               'ma_5', 'ma_10', 'ma_20', 'ma_60'}
+               'ma_5', 'ma_10', 'ma_20', 'ma_60', 'consecutive_suspend',
+               'industry', 'industryClassification'}
     return [c for c in df.columns if c not in exclude]
 
 
@@ -151,9 +152,9 @@ def _retrain_degenerate_dates(df, feature_cols, all_dates, degenerate_dates,
             X_v = df.loc[val_mask, feature_cols]
             y_v = df.loc[val_mask, 'label']
 
-            valid_tr = y_tr.notna()
+            valid_tr = y_tr.notna() & (df.loc[train_mask, 'isTrading'] == 1) & (df.loc[train_mask, 'consecutive_suspend'] <= 2) & (df.loc[train_mask, 'recent_5d_suspend'] == 0)
             X_tr, y_tr = X_tr[valid_tr], y_tr[valid_tr]
-            valid_v = y_v.notna()
+            valid_v = y_v.notna() & (df.loc[val_mask, 'isTrading'] == 1) & (df.loc[val_mask, 'consecutive_suspend'] <= 2) & (df.loc[val_mask, 'recent_5d_suspend'] == 0)
             X_v, y_v = X_v[valid_v], y_v[valid_v]
 
             # 截面标准化
@@ -377,11 +378,11 @@ def train_and_predict(df: pd.DataFrame, end_date=None) -> pd.DataFrame:
             X_val = df.loc[val_mask, feature_cols]
             y_val = df.loc[val_mask, 'label']
 
-            # 去掉标签为NaN的行
-            valid_train = y_train.notna()
+            # 去掉标签为NaN的行，同时排除标签期间内有停牌、特征期内连续停牌超过2天、最近5天有停牌的情况
+            valid_train = y_train.notna() & (df.loc[train_mask, 'isTrading'] == 1) & (df.loc[train_mask, 'consecutive_suspend'] <= 2) & (df.loc[train_mask, 'recent_5d_suspend'] == 0)
             X_train = X_train[valid_train]
             y_train = y_train[valid_train]
-            valid_val = y_val.notna()
+            valid_val = y_val.notna() & (df.loc[val_mask, 'isTrading'] == 1) & (df.loc[val_mask, 'consecutive_suspend'] <= 2) & (df.loc[val_mask, 'recent_5d_suspend'] == 0)
             X_val = X_val[valid_val]
             y_val = y_val[valid_val]
 

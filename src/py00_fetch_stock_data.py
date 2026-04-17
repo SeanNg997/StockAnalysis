@@ -8,6 +8,7 @@ import os
 import gc
 import glob
 import argparse
+from typing import Optional
 from config import CONFIG
 
 # Path
@@ -16,6 +17,7 @@ DATA_DIR = CONFIG['paths']['DATA_DIR']
 STOCK_LIST_CSV = CONFIG['paths']['STOCK_LIST_CSV']
 TRADE_DAYS_TXT = CONFIG['paths']['TRADE_DAYS_TXT']
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(DATA_DIR + "/tmp",  exist_ok=True)
 
 START_DATE = CONFIG['data_fetch']['START_DATE']
 ADJUST_FLAG = CONFIG['data_fetch']['ADJUST_FLAG']
@@ -130,6 +132,17 @@ def get_stock_list():
                 isDelisted = (row[5] != "1")
                 stock_list.append((code, row[1], row[2], row[3], isDelisted))
     stock_list_df = pd.DataFrame(stock_list, columns=["code", "name", "list_date", "delisted_date", "isDelisted"])
+    
+    print("正在获取股票行业信息...")
+    industry_list = []
+    rs_industry = bs.query_stock_industry()
+    while rs_industry.next():
+        industry_list.append(rs_industry.get_row_data())
+    industry_df = pd.DataFrame(industry_list, columns=["updateDate", "code", "code_name", "industry", "industryClassification"])
+    
+    # Merge stock list with industry data, keeping all stocks
+    stock_list_df = stock_list_df.merge(industry_df[["code", "industry", "industryClassification"]], on="code", how="left")
+    
     stock_list_df.to_csv(STOCK_LIST_CSV, index=False, encoding="utf-8-sig")
     print(f"共获取 {len(stock_list)} 只主板股票（含退市股）")
     return stock_list
@@ -169,7 +182,7 @@ def _to_dataframe(rows, fields, symbol, name):
         df = df.drop(columns=["tradestatus"])
     return df
 
-def fetch_dailyK(symbol: str, name: str, start_date: str = START_DATE) -> pd.DataFrame | None:
+def fetch_dailyK(symbol: str, name: str, start_date: str = START_DATE) -> Optional[pd.DataFrame]:
     """获取单只股票日K线数据"""
     rs = bs.query_history_k_data_plus(
         symbol,
@@ -200,7 +213,7 @@ def is_complete(existing_df: pd.DataFrame, code: str, expected_date: str, is_del
     return last_date >= expected_date
 
 
-def _update_max_date(current: str | None, batch: pd.DataFrame) -> str:
+def _update_max_date(current: Optional[str], batch: pd.DataFrame) -> str:
     """返回 current 与 batch 中最大日期的较大值"""
     batch_max = batch["date"].max()
     return batch_max if current is None else max(current, batch_max)
@@ -242,7 +255,7 @@ def main(full: bool = False):
             pending_update = []
             pending_full = []
             skip_delisted_no_data = 0
-            for code, name, list_date, delisted_date, is_delisted in stock_list:
+            for code, name, _, _, is_delisted in stock_list:
                 last_date = last_date_map.get(code)
                 if last_date is None:
                     if is_delisted:
