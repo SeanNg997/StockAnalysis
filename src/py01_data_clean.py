@@ -45,14 +45,12 @@ def build_market_status(df: pd.DataFrame, end_date=None):
 
     os.makedirs(os.path.dirname(MARKET_PKL), exist_ok=True)
     market_df.to_pickle(MARKET_PKL)
-    print(f"  ✅ 市场状态快照已保存至 {MARKET_PKL}")
-    print(f"     {market_df.shape[0]:,} 行, {market_df['code'].nunique()} 只股票")
     return market_df
 
 
 def add_is_new_flag(df: pd.DataFrame) -> pd.DataFrame:
     """添加isNew字段，新股上市前30个交易日标记为1，其他为0"""
-    print("[2/3] 添加isNew字段（新股上市前30个交易日标记为1）...")
+    print("[2/3] 添加isNew字段...")
 
     stock_list_df = pd.read_csv(STOCK_LIST_CSV, encoding='utf-8-sig')
     stock_list_df['list_date'] = pd.to_datetime(stock_list_df['list_date'])
@@ -199,7 +197,8 @@ def run_pipeline(end_date=None) -> pd.DataFrame:
 
     os.makedirs(os.path.dirname(CLEAN_PKL), exist_ok=True)
     df.to_pickle(CLEAN_PKL)
-    print(f"\n✅ 清洗完成! 保存至 {CLEAN_PKL}")
+    print(f"\n✅ 市场状态快照已保存至 {MARKET_PKL}")
+    print(f"✅ 清洗完成! 保存至 {CLEAN_PKL}")
     print(f"  最终数据: {df.shape[0]:,} 行, {df['code'].nunique()} 只股票")
     print(f"  日期范围: {df['date'].min().date()} ~ {df['date'].max().date()}")
 

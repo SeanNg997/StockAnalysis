@@ -279,10 +279,8 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
     new_cols = [c for c in feat_all.columns if c not in df.columns]
     df = df.join(feat_all[new_cols], how='left')
 
-    print(f"  完成所有 {len(stock_groups)} 只股票的特征计算")
-
     # 截面特征
-    print("  计算截面特征...")
+    print("  计算市场截面特征...")
     # 市场整体截面特征
     daily = df.groupby('date').agg(
         mkt_ret_mean=('ret_1d', 'mean'),
@@ -317,7 +315,6 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
     df['excess_ret_industry'] = df['ret_1d'] - df['industry_ret_mean']
     
     # 行业分类截面特征（industryClassification）
-    print("  计算行业分类截面特征...")
     industry_class_daily = df.groupby(['date', 'industryClassification']).agg(
         industry_class_ret_mean=('ret_1d', 'mean'),
         industry_class_ret_std=('ret_1d', 'std'),
