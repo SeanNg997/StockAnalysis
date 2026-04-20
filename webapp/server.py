@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -25,6 +25,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 STATIC_DIR = BASE_DIR / "webapp" / "static"
 RUN_OUTPUT_DIR = BASE_DIR / "output" / "web_console"
 BACKTEST_DAILY_CSV = BASE_DIR / "output" / "backtest" / "backtest_daily.csv"
+PORTFOLIO_JSON = BASE_DIR / "output" / "portfolio.json"
 
 
 @dataclass(frozen=True)
@@ -34,7 +35,8 @@ class TaskDefinition:
     description: str
     category: str
     accent: str
-    command: list[str]
+    command: list[str] | None = None
+    steps: list[str] | None = None
     supports_curve: bool = False
 
     def to_public(self) -> dict[str, Any]:
@@ -88,10 +90,10 @@ TASKS: dict[str, TaskDefinition] = {
     "today_strategy": TaskDefinition(
         id="today_strategy",
         name="今日策略",
-        description="运行 py04，生成当前交易决策报告。",
+        description="运行 py03 单日训练 + py04 生成交易决策（有持仓时自动生成持仓建议）。",
         category="模型与策略",
         accent="green",
-        command=_python_task("py04_today.py"),
+        command=_python_task("py04_today.py") + ["--train-latest"],
     ),
     "run_backtest": TaskDefinition(
         id="run_backtest",
@@ -113,19 +115,19 @@ TASKS: dict[str, TaskDefinition] = {
     "full_pipeline": TaskDefinition(
         id="full_pipeline",
         name="完整回测流水线",
-        description="调用 run_backtest.sh，按步骤执行抓数、训练、回测和报告。",
+        description="依次执行：抓数据 → 清洗 → 特征 → 训练 → 回测 → 图表。",
         category="一键任务",
         accent="crimson",
-        command=["bash", str(BASE_DIR / "scripts" / "run_backtest.sh")],
+        steps=["fetch_data", "clean_data", "build_features", "train_model", "run_backtest", "build_report"],
         supports_curve=True,
     ),
     "fast_strategy": TaskDefinition(
         id="fast_strategy",
         name="快速策略流水线",
-        description="调用 run_strategy.sh，快速得到当日策略结果。",
+        description="依次执行：抓数据 → 清洗 → 特征 → 今日策略。",
         category="一键任务",
         accent="jade",
-        command=["bash", str(BASE_DIR / "scripts" / "run_strategy.sh")],
+        steps=["fetch_data", "clean_data", "build_features", "today_strategy"],
     ),
 }
 
@@ -285,33 +287,43 @@ class TaskManager:
         else:
             preexec_fn = os.setsid
 
-        try:
-            process = subprocess.Popen(
-                run.task.command,
-                cwd=BASE_DIR,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                env=env,
-                preexec_fn=preexec_fn,
-                creationflags=creationflags,
-            )
-        except Exception as exc:
-            run.mark_finished("failed", error_message=str(exc))
-            return
-
-        run.process = process
+        commands = self._resolve_commands(run.task)
         run.mark_started()
 
         progress_thread = threading.Thread(target=self._tail_progress_file, args=(run,), daemon=True)
         progress_thread.start()
 
-        assert process.stdout is not None
-        for line in process.stdout:
-            run.append_log(line)
+        returncode = 0
+        for i, (step_label, cmd) in enumerate(commands):
+            if run.stop_requested:
+                break
+            if step_label:
+                run.append_log(f"\n{'='*50}\n[{i+1}/{len(commands)}] {step_label}\n{'='*50}\n")
 
-        returncode = process.wait()
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    cwd=BASE_DIR,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env=env,
+                    preexec_fn=preexec_fn,
+                    creationflags=creationflags,
+                )
+            except Exception as exc:
+                run.mark_finished("failed", error_message=str(exc))
+                return
+
+            run.process = process
+            assert process.stdout is not None
+            for line in process.stdout:
+                run.append_log(line)
+            returncode = process.wait()
+            if returncode != 0:
+                break
+
         progress_thread.join(timeout=1.0)
         self._drain_progress_file(run)
 
@@ -321,6 +333,15 @@ class TaskManager:
             run.mark_finished("success", returncode=returncode)
         else:
             run.mark_finished("failed", returncode=returncode)
+
+    def _resolve_commands(self, task: TaskDefinition) -> list[tuple[str, list[str]]]:
+        if task.steps:
+            result = []
+            for step_id in task.steps:
+                sub = TASKS[step_id]
+                result.append((sub.name, sub.command))
+            return result
+        return [("", task.command)]
 
     def _tail_progress_file(self, run: TaskRun) -> None:
         idle_rounds = 0
@@ -457,6 +478,21 @@ def state() -> dict[str, Any]:
 @app.get("/api/backtest/latest")
 def latest_backtest() -> dict[str, Any]:
     return load_latest_backtest_snapshot()
+
+
+@app.get("/api/portfolio")
+def get_portfolio() -> list:
+    if PORTFOLIO_JSON.exists():
+        return json.loads(PORTFOLIO_JSON.read_text(encoding="utf-8"))
+    return []
+
+
+@app.post("/api/portfolio")
+async def save_portfolio(request: Request) -> dict[str, Any]:
+    positions = await request.json()
+    PORTFOLIO_JSON.parent.mkdir(parents=True, exist_ok=True)
+    PORTFOLIO_JSON.write_text(json.dumps(positions, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "count": len(positions)}
 
 
 @app.post("/api/tasks/{task_id}/run")

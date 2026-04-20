@@ -407,6 +407,140 @@ button:disabled {
   color: rgba(237, 245, 242, 0.84);
 }
 
+/* ── 持仓编辑器 ── */
+
+.portfolio-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.portfolio-header h3 { margin: 0; }
+
+.portfolio-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.portfolio-actions .ghost-btn {
+  padding: 3px 10px;
+  font-size: 12px;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.1);
+  color: #edf5f2;
+  border: 1px solid rgba(255,255,255,0.15);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.portfolio-actions .ghost-btn:hover {
+  background: rgba(255,255,255,0.2);
+}
+
+.portfolio-actions .ghost-btn.has-changes {
+  background: rgba(32,136,90,0.4);
+  border-color: rgba(32,136,90,0.6);
+  color: #a8f0cc;
+}
+
+.portfolio-table {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  flex: 1;
+  min-height: 0;
+}
+
+.portfolio-empty {
+  color: rgba(237,245,242,0.5);
+  font-size: 13px;
+  text-align: center;
+  padding: 20px 0;
+}
+
+.portfolio-card {
+  padding: 10px;
+  border-radius: 10px;
+  border-left: 3px solid transparent;
+  transition: background 0.3s, border-color 0.3s;
+}
+
+.portfolio-card.is-saved {
+  background: rgba(255,255,255,0.04);
+  border-left-color: rgba(32,136,90,0.5);
+}
+
+.portfolio-card.is-unsaved {
+  background: rgba(183,128,39,0.12);
+  border-left-color: rgba(183,128,39,0.7);
+}
+
+.portfolio-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.portfolio-card-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(237,245,242,0.5);
+}
+
+.portfolio-card label {
+  display: block;
+  font-size: 10px;
+  color: rgba(237,245,242,0.45);
+  margin: 4px 0 2px;
+}
+
+.portfolio-card input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px 8px;
+  font-size: 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(0,0,0,0.2);
+  color: #edf5f2;
+  outline: none;
+  font-family: inherit;
+  transition: border-color 0.2s;
+}
+
+.portfolio-card input:focus {
+  border-color: rgba(255,255,255,0.35);
+}
+
+.portfolio-del-btn {
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: rgba(255,255,255,0.06);
+  border-radius: 6px;
+  color: rgba(237,245,242,0.35);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0;
+  line-height: 22px;
+  text-align: center;
+  transition: all 0.15s;
+}
+
+.portfolio-del-btn:hover {
+  color: #fff;
+  background: var(--danger);
+}
+
+.portfolio-editor {
+  display: flex;
+  flex-direction: column;
+}
+
 .task-groups {
   display: grid;
   gap: 12px;
@@ -432,6 +566,10 @@ button:disabled {
   user-select: none;
   color: rgba(22, 48, 43, 0.88);
   background: rgba(255, 255, 255, 0.55);
+}
+
+.task-group--pipeline summary {
+  background: linear-gradient(135deg, rgba(184, 63, 74, 0.18), rgba(197, 127, 44, 0.15) 35%, rgba(31, 141, 118, 0.15) 65%, rgba(52, 101, 200, 0.18));
 }
 
 .task-group summary::-webkit-details-marker {
@@ -468,7 +606,7 @@ button:disabled {
 .task-card {
   padding: 12px 12px 12px 14px;
   border-radius: 14px;
-  background: rgba(255, 255, 255, 0.66);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--task-accent, var(--accent)) 8%, rgba(255,255,255,0.66)), rgba(255,255,255,0.66) 50%, color-mix(in srgb, var(--task-accent, var(--accent)) 5%, rgba(255,255,255,0.66)));
   border: 1px solid rgba(22, 48, 43, 0.08);
   display: grid;
   gap: 8px;

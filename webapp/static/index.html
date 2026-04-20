@@ -98,11 +98,15 @@
         </div>
       </div>
 
-      <div class="status-notes">
-        <h3>操作提示</h3>
-        <ul>
-          <li>同一时间仅允许一个任务运行，避免模型缓存和输出文件相互覆盖。</li>
-        </ul>
+      <div class="status-notes portfolio-editor">
+        <div class="portfolio-header">
+          <h3>持仓管理</h3>
+          <div class="portfolio-actions">
+            <button id="portfolio-add-btn" class="ghost-btn" type="button">+ 添加</button>
+            <button id="portfolio-save-btn" class="ghost-btn" type="button">保存</button>
+          </div>
+        </div>
+        <div id="portfolio-table" class="portfolio-table"></div>
       </div>
     </aside>
   </main>

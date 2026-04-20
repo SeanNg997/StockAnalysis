@@ -28,6 +28,9 @@ const dom = {
   chart: document.getElementById("equity-chart"),
   chartEmpty: document.getElementById("chart-empty"),
   chartOverlay: document.getElementById("chart-overlay"),
+  portfolioTable: document.getElementById("portfolio-table"),
+  portfolioAddBtn: document.getElementById("portfolio-add-btn"),
+  portfolioSaveBtn: document.getElementById("portfolio-save-btn"),
 };
 
 function setText(element, value) {
@@ -128,17 +131,21 @@ function isTaskRunning() {
 }
 
 function isDefaultGroupOpen(category) {
-  return category === "模型与策略";
+  return category === "一键任务";
 }
 
 function renderTasks() {
   if (!dom.taskGroups) return;
   const grouped = groupTasks(state.tasks);
   dom.taskGroups.innerHTML = "";
-  const categories = Object.entries(grouped);
+  const categories = Object.entries(grouped).sort(([a], [b]) => {
+    if (a === "一键任务") return -1;
+    if (b === "一键任务") return 1;
+    return 0;
+  });
   categories.forEach(([category, tasks]) => {
     const groupEl = document.createElement("section");
-    groupEl.className = "task-group";
+    groupEl.className = `task-group${category === "一键任务" ? " task-group--pipeline" : ""}`;
     const details = document.createElement("details");
     const knownOpenState = state.taskGroupOpen.get(category);
     details.open = knownOpenState ?? isDefaultGroupOpen(category);
@@ -156,7 +163,7 @@ function renderTasks() {
 
     tasks.forEach((task) => {
       const card = document.createElement("article");
-      card.className = `task-card accent-${task.accent}`;
+      card.className = `task-card accent-${task.accent}${task.category === "一键任务" ? " pipeline-card" : ""}`;
 
       const running = isTaskRunning();
       const disabled = running;
@@ -597,6 +604,142 @@ function mergeCurvePoints(existing, incoming) {
   return Array.from(map.values()).sort((a, b) => a.date.localeCompare(b.date));
 }
 
+/* ── 持仓管理 ── */
+
+let portfolioData = [];
+let savedSnapshot = "[]";
+
+function isPortfolioDirty() {
+  return JSON.stringify(collectPortfolioFromDOM()) !== savedSnapshot;
+}
+
+function renderPortfolioTable() {
+  if (!dom.portfolioTable) return;
+  if (portfolioData.length === 0) {
+    dom.portfolioTable.innerHTML = '<p class="portfolio-empty">暂无持仓，点击"+ 添加"录入</p>';
+    updateSaveBtn();
+    return;
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const savedList = JSON.parse(savedSnapshot);
+  let html = "";
+  portfolioData.forEach((pos, idx) => {
+    const saved = savedList[idx];
+    const isSaved = saved
+      && saved.code === (pos.code || "")
+      && saved.buy_price === (pos.buy_price || 0)
+      && saved.buy_date === (pos.buy_date || "")
+      && saved.shares === (pos.shares || 0);
+    const cls = isSaved ? "portfolio-card is-saved" : "portfolio-card is-unsaved";
+    html += `<div class="${cls}" data-idx="${idx}">
+      <div class="portfolio-card-header">
+        <span class="portfolio-card-label">#${idx + 1}</span>
+        <button class="portfolio-del-btn" type="button" data-idx="${idx}">&times;</button>
+      </div>
+      <label>代码</label>
+      <input type="text" class="pf-code" value="${pos.code || ""}" placeholder="600519">
+      <label>买入价</label>
+      <input type="number" class="pf-price" value="${pos.buy_price || ""}" step="0.01" placeholder="0.00">
+      <label>日期</label>
+      <input type="date" class="pf-date" value="${pos.buy_date || today}">
+      <label>股数</label>
+      <input type="number" class="pf-shares" value="${pos.shares || ""}" step="100" placeholder="100">
+    </div>`;
+  });
+  dom.portfolioTable.innerHTML = html;
+  dom.portfolioTable.querySelectorAll(".portfolio-del-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      portfolioData.splice(Number(btn.dataset.idx), 1);
+      renderPortfolioTable();
+    });
+  });
+  dom.portfolioTable.querySelectorAll("input").forEach((input) => {
+    input.addEventListener("input", () => {
+      updateCardDirtyState();
+      updateSaveBtn();
+    });
+  });
+  updateSaveBtn();
+}
+
+function updateCardDirtyState() {
+  if (!dom.portfolioTable) return;
+  const savedList = JSON.parse(savedSnapshot);
+  dom.portfolioTable.querySelectorAll(".portfolio-card").forEach((card) => {
+    const idx = Number(card.dataset.idx);
+    const saved = savedList[idx];
+    const code = card.querySelector(".pf-code").value.trim();
+    const price = parseFloat(card.querySelector(".pf-price").value) || 0;
+    const date = card.querySelector(".pf-date").value;
+    const shares = parseInt(card.querySelector(".pf-shares").value, 10) || 0;
+    const isSaved = saved
+      && saved.code === code
+      && saved.buy_price === price
+      && saved.buy_date === date
+      && saved.shares === shares;
+    card.classList.toggle("is-saved", isSaved);
+    card.classList.toggle("is-unsaved", !isSaved);
+  });
+}
+
+function updateSaveBtn() {
+  if (!dom.portfolioSaveBtn) return;
+  const dirty = isPortfolioDirty();
+  dom.portfolioSaveBtn.classList.toggle("has-changes", dirty);
+  dom.portfolioSaveBtn.textContent = dirty ? "保存 *" : "已保存";
+}
+
+function collectPortfolioFromDOM() {
+  if (!dom.portfolioTable) return [];
+  const cards = dom.portfolioTable.querySelectorAll(".portfolio-card");
+  return Array.from(cards).map((card) => ({
+    code: card.querySelector(".pf-code").value.trim(),
+    buy_price: parseFloat(card.querySelector(".pf-price").value) || 0,
+    buy_date: card.querySelector(".pf-date").value,
+    shares: parseInt(card.querySelector(".pf-shares").value, 10) || 0,
+  })).filter((p) => p.code);
+}
+
+async function loadPortfolio() {
+  try {
+    const res = await fetch("/api/portfolio");
+    portfolioData = await res.json();
+  } catch {
+    portfolioData = [];
+  }
+  savedSnapshot = JSON.stringify(portfolioData);
+  renderPortfolioTable();
+}
+
+async function savePortfolio() {
+  portfolioData = collectPortfolioFromDOM();
+  try {
+    const res = await fetch("/api/portfolio", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(portfolioData),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      savedSnapshot = JSON.stringify(portfolioData);
+      renderPortfolioTable();
+    }
+  } catch (err) {
+    alert("保存失败: " + err.message);
+  }
+}
+
+if (dom.portfolioAddBtn) {
+  dom.portfolioAddBtn.addEventListener("click", () => {
+    portfolioData = collectPortfolioFromDOM();
+    portfolioData.push({ code: "", buy_price: 0, buy_date: new Date().toISOString().slice(0, 10), shares: 100 });
+    renderPortfolioTable();
+  });
+}
+if (dom.portfolioSaveBtn) {
+  dom.portfolioSaveBtn.addEventListener("click", savePortfolio);
+}
+
 window.addEventListener("resize", () => renderChart());
 window.setInterval(() => {
   if (isTaskRunning()) renderRunStatus();
@@ -620,6 +763,7 @@ fetchState()
   .catch((error) => {
     alert(error.message);
   });
+loadPortfolio();
 
 window.addEventListener("load", () => {
   renderChart();

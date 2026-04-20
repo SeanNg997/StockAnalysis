@@ -1330,6 +1330,7 @@ def run_pipeline(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="优化版 py03 模型训练与预测")
     parser.add_argument("--date", dest="end_date", help="指定预测日期（YYYY-MM-DD）")
+    parser.add_argument("--latest", action="store_true", help="单日模式：仅预测数据中最新交易日")
     parser.add_argument("--max-train-rows", type=int, default=None, help="手动限制训练样本行数")
     parser.add_argument(
         "--checkpoint-every",
@@ -1343,8 +1344,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+    end_date = args.end_date
+    if args.latest:
+        df_tmp = pd.read_pickle(FEATURE_PKL)
+        end_date = pd.to_datetime(df_tmp["date"]).max().strftime("%Y-%m-%d")
+        del df_tmp
     run_pipeline(
-        end_date=args.end_date,
+        end_date=end_date,
         max_train_rows=args.max_train_rows,
         checkpoint_every=args.checkpoint_every,
     )

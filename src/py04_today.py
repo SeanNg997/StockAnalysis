@@ -281,10 +281,11 @@ def generate_stock_report(stock_code, target_date=None):
     return report
 
 
-def generate_today_strategy(target_date=None):
-    """生成全市场实盘交易决策"""
+def generate_today_strategy(target_date=None, portfolio_path=None):
+    """生成全市场实盘交易决策（可选持仓分析）"""
     print("生成今日交易决策...")
     latest, latest_date, pred_df, market_day, market_history = _load_latest_data(target_date)
+    latest_by_code, latest_records = _build_latest_indexes(latest)
 
     hold_days = CONFIG['backtest']['HOLD_DAYS']
     min_pred_return = CONFIG['backtest']['MIN_PRED_RETURN']
@@ -306,11 +307,64 @@ def generate_today_strategy(target_date=None):
     # 评分排序
     if len(qualified) > 0:
         qualified = rules.score_candidates(qualified)
-        qualified = qualified.head(20)
 
-    exec_date = next_trading_day(latest_date.date(), known_trading_days=set(
-        pred_df['date'].dt.date.unique()
-    ))
+    known_days = sorted(pred_df['date'].dt.date.unique())
+    known_days_set = set(known_days)
+    exec_date = next_trading_day(latest_date.date(), known_trading_days=known_days_set)
+
+    # 加载持仓
+    positions = {}
+    sell_list = []
+    sell_codes = set()
+    sell_reasons = {}
+    has_portfolio = False
+    if portfolio_path is not None:
+        positions = _load_portfolio(portfolio_path)
+        if positions:
+            has_portfolio = True
+            for code, pos in positions.items():
+                pos['hold_days'] = _calc_hold_days(pos['buy_date'], latest_date, known_days, exec_date)
+                row = latest_records.get(code)
+                if row is not None:
+                    pos['current_price'] = row.get('close', pos['buy_price'])
+            decision_data = latest_by_code.reindex(list(positions.keys())).dropna(how='all').reset_index(drop=True)
+            sell_list = rules.decide_sells(positions, decision_data)
+            sell_codes = {code for code, _ in sell_list}
+            sell_reasons = {code: reason for code, reason in sell_list}
+
+    # 构建被交易规则硬条件过滤掉的持仓股及原因（停牌、ST、流动性不足等）
+    portfolio_filter_warnings = {}
+    if has_portfolio and len(market_day) > 0:
+        mkt_by_code = market_day.drop_duplicates(subset=['code'], keep='last').set_index('code')
+        for code in positions:
+            reasons = []
+            if code in mkt_by_code.index:
+                mr = mkt_by_code.loc[code]
+                if mr.get('isTrading', 1) != 1:
+                    reasons.append("当日停牌")
+                if not rules.ALLOW_ST_BUY and mr.get('isST', 0) == 1:
+                    reasons.append("ST 状态")
+                if mr.get('amount', float('inf')) < rules.MIN_EXEC_AMOUNT:
+                    reasons.append("流动性不足")
+                if mr.get('close', float('inf')) < rules.MIN_STOCK_PRICE:
+                    reasons.append("股价低于最低阈值")
+            else:
+                reasons.append("无市场数据")
+            if reasons:
+                portfolio_filter_warnings[code] = reasons
+
+    qualified_top20 = qualified.head(20)
+
+    # 买入推荐：排除已持仓，考虑仓位限制
+    if has_portfolio:
+        n_after_sell = len(positions) - len(sell_codes)
+        n_empty = rules.MAX_POSITIONS - n_after_sell
+        available_for_buy = qualified[~qualified['code'].isin(set(positions.keys()))]
+        buy_candidates = available_for_buy.head(max(n_empty, 0)) if n_empty > 0 else pd.DataFrame()
+    else:
+        buy_candidates = qualified.head(5)
+
+    n_buy = len(buy_candidates)
 
     # Markdown 报告
     lines = []
@@ -351,21 +405,86 @@ def generate_today_strategy(target_date=None):
     lines.append("")
     lines.append("---\n")
 
-    # 推荐买入 TOP5
-    lines.append("## 今日推荐买入\n")
-    top5 = qualified.head(5)
-    n_buy = len(top5)
+    # 持仓板块（仅有持仓时显示）
+    if has_portfolio:
+        REASON_CN = {
+            'STOP_LOSS': '触发止损',
+            'TAKE_PROFIT': '触发止盈',
+            'HOLD_EXPIRE': '持有到期',
+            'SIGNAL_REVERSE': '信号反转',
+            'DELIST_FORCE_SELL': '退市/长期无数据强制清仓',
+        }
 
+        total_cost = sum(p['shares'] * p['buy_price'] for p in positions.values())
+        total_value = sum(p['shares'] * p['current_price'] for p in positions.values())
+        total_profit = total_value - total_cost
+        total_profit_pct = total_profit / total_cost if total_cost > 0 else 0
+
+        lines.append("## 持仓概览\n")
+        lines.append("| 指标 | 数值 |")
+        lines.append("|------|-----:|")
+        lines.append(f"| 持仓数 | {len(positions)} / {rules.MAX_POSITIONS} |")
+        lines.append(f"| 持仓市值 | ¥{total_value:,.0f} |")
+        lines.append(f"| 总成本 | ¥{total_cost:,.0f} |")
+        lines.append(f"| 浮动盈亏 | **{total_profit:+,.0f}**（{total_profit_pct:+.2%}） |\n")
+        lines.append("---\n")
+
+        lines.append("## 持仓明细与操作建议\n")
+        for code, pos in positions.items():
+            row = latest_records.get(code)
+            stock_name = row.get('name', 'N/A') if row is not None else 'N/A'
+            pred_return = row['pred_return'] if row is not None else np.nan
+            confidence = row['confidence'] if row is not None else np.nan
+            profit_pct = (pos['current_price'] - pos['buy_price']) / pos['buy_price']
+
+            if code in sell_codes:
+                action = f"**明日卖出**（{REASON_CN.get(sell_reasons[code], sell_reasons[code])}）"
+                action_icon = "SELL"
+            else:
+                remaining = hold_days - pos['hold_days']
+                action = f"继续持有（剩余 {max(remaining, 0)} 个交易日）"
+                action_icon = "HOLD"
+
+            lines.append(f"### {'[卖]' if action_icon == 'SELL' else '[持]'} {stock_name}（`{code}`）\n")
+            lines.append("| 指标 | 数值 |")
+            lines.append("|------|-----:|")
+            lines.append(f"| 买入价 | ¥{pos['buy_price']:.2f} |")
+            lines.append(f"| 当前价 | ¥{pos['current_price']:.2f} |")
+            lines.append(f"| 浮盈/亏 | **{profit_pct:+.2%}** |")
+            lines.append(f"| 已持有 | {pos['hold_days']} 个交易日 |")
+            if not np.isnan(pred_return):
+                lines.append(f"| 最新预测收益率 | {pred_return:+.4%} |")
+                lines.append(f"| 置信度 | {confidence:.2%} |")
+            lines.append(f"| **操作建议** | {action} |")
+
+            if code in portfolio_filter_warnings:
+                reason_str = "、".join(portfolio_filter_warnings[code])
+                lines.append(f"\n> **注意**：该股票不在本模型策略下今日的准许买入列表中（{reason_str}），请谨慎处理。")
+            lines.append("")
+
+        lines.append("---\n")
+
+    # 推荐买入
+    lines.append("## 今日推荐买入\n")
     if n_buy == 0:
-        lines.append(f"> **建议空仓**：当前无股票满足买入条件"
-                      f"（预测收益率 > {min_pred_return:.2%} 且置信度 > {min_confidence:.0%}）\n")
+        if has_portfolio and rules.MAX_POSITIONS - (len(positions) - len(sell_codes)) <= 0:
+            lines.append("> 仓位已满，无需新买入\n")
+        else:
+            lines.append(f"> **建议空仓**：当前无股票满足买入条件"
+                          f"（预测收益率 > {min_pred_return:.2%} 且置信度 > {min_confidence:.0%}）\n")
     else:
-        lines.append(f"> 共 **{n_buy}** 只股票推荐买入，建议各 **{1/n_buy:.0%}** 仓位，"
+        weight_scores = buy_candidates['pred_return'] * (0.5 + 0.5 * buy_candidates['confidence'])
+        total_ws = weight_scores.sum()
+        if total_ws <= 0:
+            weights = [1.0 / n_buy] * n_buy
+        else:
+            weights = (weight_scores / total_ws).tolist()
+
+        lines.append(f"> 共 **{n_buy}** 只股票推荐买入（加权分配），"
                       f"持有 {hold_days} 个交易日\n")
         lines.append("| # | 名称 | 代码 | 收盘价 | 预测收益率 | 置信度 | 建议仓位 |")
         lines.append("|:-:|:----:|:----:|-------:|-----------:|-------:|:--------:|")
-        for i, (_, row) in enumerate(top5.iterrows()):
-            weight = 1.0 / max(n_buy, 1)
+        for i, ((_, row), weight) in enumerate(zip(buy_candidates.iterrows(), weights)):
             lines.append(
                 f"| **{i+1}** | {row.get('name', 'N/A')} | `{row['code']}`"
                 f" | ¥{row.get('close', 0):.2f}"
@@ -380,7 +499,7 @@ def generate_today_strategy(target_date=None):
     lines.append("> 通过票池筛选后的排名\n")
     lines.append("| # | 名称 | 代码 | 收盘价 | 预测收益率 | 置信度 |")
     lines.append("|:-:|:----:|:----:|-------:|-----------:|-------:|")
-    for i, (_, row) in enumerate(qualified.head(20).iterrows()):
+    for i, (_, row) in enumerate(qualified_top20.iterrows()):
         arrow = "+" if row['pred_return'] > 0 else ""
         bold = "**" if i < n_buy else ""
         lines.append(
@@ -392,6 +511,29 @@ def generate_today_strategy(target_date=None):
         )
 
     lines.append("\n---\n")
+
+    # 操作清单（仅有持仓时显示）
+    if has_portfolio:
+        lines.append("## 操作清单（集合竞价执行）\n")
+        has_action = False
+        seq = 0
+        for code, reason in sell_list:
+            pos = positions[code]
+            row = latest_records.get(code)
+            name = row.get('name', '') if row is not None else ''
+            seq += 1
+            lines.append(f"{seq}. **卖出** {name}（`{code}`）{pos['shares']} 股"
+                          f" — {REASON_CN.get(reason, reason)}")
+            has_action = True
+        for _, row in buy_candidates.iterrows():
+            seq += 1
+            lines.append(f"{seq}. **买入** {row.get('name', '')}（`{row['code']}`）"
+                          f" — 预测收益 {row['pred_return']:+.4%}")
+            has_action = True
+        if not has_action:
+            lines.append("> 今日无需操作，继续持有\n")
+        lines.append("\n---\n")
+
     lines.append("> *以上为模型预测结果，仅供参考，不构成投资建议。严格遵守 T+1 规则，以集合竞价开盘价成交。*")
 
     report = "\n".join(lines)
@@ -433,178 +575,40 @@ def _load_portfolio(portfolio_path):
     return positions
 
 
-def _calc_hold_days(buy_date, latest_date, known_trading_days):
-    """计算持有交易日数"""
+def _calc_hold_days(buy_date, latest_date, known_trading_days, exec_date=None):
+    """计算持有交易日数（从买入日次日算到执行日）"""
+    end = exec_date if exec_date is not None else latest_date.date()
+    if hasattr(end, 'date'):
+        end = end.date()
+    buy_d = buy_date.date() if hasattr(buy_date, 'date') else buy_date
     count = 0
     for d in known_trading_days:
-        if d > buy_date.date() and d <= latest_date.date():
+        if d > buy_d and d <= end:
             count += 1
+    # exec_date 可能不在 known_trading_days 中（未来交易日），单独补算
+    if exec_date is not None and end not in set(known_trading_days) and end > buy_d and end.weekday() < 5:
+        count += 1
     return count
 
 
-def generate_portfolio_advice(portfolio_path, target_date=None):
-    """生成持仓监控报告"""
-    print("生成持仓操作建议...")
-    positions = _load_portfolio(portfolio_path)
-    if not positions:
-        print("持仓为空，无需生成报告")
-        return
 
-    latest, latest_date, pred_df, market_day, market_history = _load_latest_data(target_date)
-    latest_by_code, latest_records = _build_latest_indexes(latest)
-    known_days = sorted(pred_df['date'].dt.date.unique())
-    known_days_set = set(known_days)
-
-    # 计算每只持仓的持有天数和当前价格
-    for code, pos in positions.items():
-        pos['hold_days'] = _calc_hold_days(pos['buy_date'], latest_date, known_days)
-        row = latest_records.get(code)
-        if row is not None:
-            pos['current_price'] = row.get('close', pos['buy_price'])
-
-    # 构建决策数据（需要 code, close, pred_return 列）
-    decision_data = latest_by_code.reindex(list(positions.keys())).dropna(how='all').reset_index(drop=True)
-
-    # 卖出
-    sell_list = rules.decide_sells(positions, decision_data)
-    sell_codes = {code for code, _ in sell_list}
-    sell_reasons = {code: reason for code, reason in sell_list}
-
-    # 买入建议
-    n_after_sell = len(positions) - len(sell_codes)
-    n_empty = rules.MAX_POSITIONS - n_after_sell
-    buy_candidates = []
-    if n_empty > 0 and len(market_day) > 0:
-        qualified = rules.filter_stock_pool(latest, market_day, market_history=market_history)
-        if len(qualified) > 0:
-            qualified = rules.score_candidates(qualified)
-            available = qualified[~qualified['code'].isin(set(positions.keys()))]
-            buy_candidates = available.head(n_empty)
-
-    hold_days_cfg = CONFIG['backtest']['HOLD_DAYS']
-    exec_date = next_trading_day(latest_date.date(), known_trading_days=known_days_set)
-
-    # 生成报告
-    lines = []
-    lines.append("# 持仓监控 · 今日操作建议\n")
-    lines.append("| 决策基准日 | 执行日期 |")
-    lines.append("|:----------:|:--------:|")
-    lines.append(f"| {latest_date.date()} | **{exec_date}**（盘前集合竞价） |\n")
-    lines.append("---\n")
-
-    # 持仓概览
-    total_cost = sum(p['shares'] * p['buy_price'] for p in positions.values())
-    total_value = sum(p['shares'] * p['current_price'] for p in positions.values())
-    total_profit = total_value - total_cost
-    total_profit_pct = total_profit / total_cost if total_cost > 0 else 0
-
-    lines.append("## 持仓概览\n")
-    lines.append("| 指标 | 数值 |")
-    lines.append("|------|-----:|")
-    lines.append(f"| 持仓数 | {len(positions)} / {rules.MAX_POSITIONS} |")
-    lines.append(f"| 持仓市值 | ¥{total_value:,.0f} |")
-    lines.append(f"| 总成本 | ¥{total_cost:,.0f} |")
-    lines.append(f"| 浮动盈亏 | **{total_profit:+,.0f}**（{total_profit_pct:+.2%}） |\n")
-    lines.append("---\n")
-
-    REASON_CN = {
-        'STOP_LOSS': '触发止损',
-        'TAKE_PROFIT': '触发止盈',
-        'HOLD_EXPIRE': '持有到期',
-        'SIGNAL_REVERSE': '信号反转',
-    }
-
-    # 逐只持仓详情
-    lines.append("## 持仓明细与操作建议\n")
-    for code, pos in positions.items():
-        row = latest_records.get(code)
-        stock_name = row.get('name', 'N/A') if row is not None else 'N/A'
-        pred_return = row['pred_return'] if row is not None else np.nan
-        confidence = row['confidence'] if row is not None else np.nan
-        profit_pct = (pos['current_price'] - pos['buy_price']) / pos['buy_price']
-
-        if code in sell_codes:
-            action = f"**明日卖出**（{REASON_CN.get(sell_reasons[code], sell_reasons[code])}）"
-            action_icon = "SELL"
-        else:
-            remaining = hold_days_cfg - pos['hold_days']
-            action = f"继续持有（剩余 {max(remaining, 0)} 个交易日）"
-            action_icon = "HOLD"
-
-        lines.append(f"### {'[卖]' if action_icon == 'SELL' else '[持]'} {stock_name}（`{code}`）\n")
-        lines.append("| 指标 | 数值 |")
-        lines.append("|------|-----:|")
-        lines.append(f"| 买入价 | ¥{pos['buy_price']:.2f} |")
-        lines.append(f"| 当前价 | ¥{pos['current_price']:.2f} |")
-        lines.append(f"| 浮盈/亏 | **{profit_pct:+.2%}** |")
-        lines.append(f"| 已持有 | {pos['hold_days']} 个交易日 |")
-        if not np.isnan(pred_return):
-            lines.append(f"| 最新预测收益率 | {pred_return:+.4%} |")
-            lines.append(f"| 置信度 | {confidence:.2%} |")
-        lines.append(f"| **操作建议** | {action} |")
-        lines.append("")
-
-    lines.append("---\n")
-
-    # 买入建议
-    lines.append("## 新买入建议\n")
-    if len(buy_candidates) == 0:
-        if n_empty <= 0:
-            lines.append("> 仓位已满，无需新买入\n")
-        else:
-            lines.append("> 当前无股票满足买入条件\n")
-    else:
-        lines.append(f"> 卖出后空余 **{n_empty}** 个仓位，推荐以下股票：\n")
-        lines.append("| # | 名称 | 代码 | 收盘价 | 预测收益率 | 置信度 |")
-        lines.append("|:-:|:----:|:----:|-------:|-----------:|-------:|")
-        for i, (_, row) in enumerate(buy_candidates.iterrows()):
-            lines.append(
-                f"| {i+1} | {row.get('name', 'N/A')} | `{row['code']}`"
-                f" | ¥{row.get('close', 0):.2f}"
-                f" | **{row['pred_return']:+.4%}**"
-                f" | {row['confidence']:.1%} |"
-            )
-
-    lines.append("\n---\n")
-
-    # 操作清单
-    lines.append("## 操作清单（集合竞价执行）\n")
-    has_action = False
-    seq = 0
-    for code, reason in sell_list:
-        pos = positions[code]
-        row = latest_records.get(code)
-        name = row.get('name', '') if row is not None else ''
-        seq += 1
-        lines.append(f"{seq}. **卖出** {name}（`{code}`）{pos['shares']} 股"
-                      f" — {REASON_CN.get(reason, reason)}")
-        has_action = True
-    for _, row in buy_candidates.iterrows():
-        seq += 1
-        lines.append(f"{seq}. **买入** {row.get('name', '')}（`{row['code']}`）"
-                      f" — 预测收益 {row['pred_return']:+.4%}")
-        has_action = True
-    if not has_action:
-        lines.append("> 今日无需操作，继续持有\n")
-
-    lines.append("\n---\n")
-    lines.append("> *以上为模型预测结果，仅供参考，不构成投资建议。*")
-
-    report = "\n".join(lines)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    report_path = os.path.join(OUTPUT_DIR, 'portfolio_advice.md')
-    with open(report_path, 'w', encoding='utf-8') as f:
-        f.write(report)
-
-    print(report)
-    print(f"\n操作建议已保存至 {report_path}")
-    return report
+def _run_train_latest():
+    """调用 py03 单日模式，仅预测 features.pkl 中最新交易日"""
+    feature_pkl = CONFIG['paths']['FEATURE_PKL']
+    df_tmp = pd.read_pickle(feature_pkl)
+    latest_date = pd.to_datetime(df_tmp["date"]).max().strftime("%Y-%m-%d")
+    del df_tmp
+    print(f"[py04] 先运行 py03 单日训练，目标日期: {latest_date}")
+    import py03_model
+    py03_model.run_pipeline(end_date=latest_date)
+    print("[py04] py03 单日训练完成\n")
 
 
 if __name__ == '__main__':
     _target_date = None
     _stock_code = None
     _portfolio_path = None
+    _train_latest = False
     _args = sys.argv[1:]
 
     if '--date' in _args:
@@ -617,12 +621,29 @@ if __name__ == '__main__':
         _portfolio_path = _args[_idx + 1]
         _args = [a for i, a in enumerate(_args) if i != _idx and i != _idx + 1]
 
+    if '--train-latest' in _args:
+        _train_latest = True
+        _args = [a for a in _args if a != '--train-latest']
+
     if _args:
         _stock_code = _args[0]
 
-    if _portfolio_path:
-        generate_portfolio_advice(_portfolio_path, target_date=_target_date)
-    elif _stock_code:
+    if _train_latest:
+        _run_train_latest()
+
+    if _stock_code:
         generate_stock_report(_stock_code, target_date=_target_date)
     else:
-        generate_today_strategy(target_date=_target_date)
+        # 自动检测持仓
+        if not _portfolio_path:
+            _auto_portfolio = os.path.join(CONFIG['paths']['OUTPUT_DIR'], 'portfolio.json')
+            if os.path.exists(_auto_portfolio):
+                try:
+                    with open(_auto_portfolio, 'r', encoding='utf-8') as _f:
+                        _pdata = json.load(_f)
+                    if _pdata:
+                        print(f"[py04] 检测到持仓记录 ({len(_pdata)} 条)\n")
+                        _portfolio_path = _auto_portfolio
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        generate_today_strategy(target_date=_target_date, portfolio_path=_portfolio_path)
