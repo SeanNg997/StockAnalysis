@@ -6,6 +6,7 @@ const state = {
   chartHoverIndex: null,
   chartHoverX: null,
   chartHoverXPx: null,
+  chartResizeObserver: null,
   logLines: [],
   socket: null,
   taskGroupOpen: new Map(),
@@ -269,13 +270,14 @@ function renderChart() {
   const points = getChartPoints();
   renderMetrics(points);
 
+  const chartHostRect = dom.chart.parentElement?.getBoundingClientRect();
   const chartRectNow = dom.chart.getBoundingClientRect();
   const viewportWidth = Math.max(
-    Math.floor(chartRectNow.width || dom.chart.clientWidth || dom.chart.parentElement?.clientWidth || 880),
+    Math.floor(chartHostRect?.width || chartRectNow.width || dom.chart.clientWidth || 880),
     320
   );
   const viewportHeight = Math.max(
-    Math.floor(chartRectNow.height || dom.chart.clientHeight || dom.chart.parentElement?.clientHeight || 340),
+    Math.floor(chartHostRect?.height || chartRectNow.height || dom.chart.clientHeight || 340),
     260
   );
   const width = viewportWidth;
@@ -606,8 +608,19 @@ if (dom.refreshLatestBtn) {
   });
 }
 
+if (dom.chart && "ResizeObserver" in window) {
+  state.chartResizeObserver = new ResizeObserver(() => {
+    renderChart();
+  });
+  state.chartResizeObserver.observe(dom.chart.parentElement || dom.chart);
+}
+
 fetchState()
   .then(connectWebSocket)
   .catch((error) => {
     alert(error.message);
   });
+
+window.addEventListener("load", () => {
+  renderChart();
+});

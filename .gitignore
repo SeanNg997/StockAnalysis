@@ -14,7 +14,6 @@ data/.download_status.txt
 # 保留追踪
 !data/.gitkeep
 !data/.last_date.txt
-!output/history/.gitkeep
 
 # Claude Code 本地环境
 .claude/
@@ -31,5 +30,4 @@ Thumbs.db
 *~
 
 # output
-output/*
-!output/backtest/
+output/
