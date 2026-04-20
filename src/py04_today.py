@@ -438,7 +438,7 @@ def generate_today_strategy(target_date=None, portfolio_path=None):
             profit_pct = (pos['current_price'] - pos['buy_price']) / pos['buy_price']
 
             if code in sell_codes:
-                action = f"**明日卖出**（{REASON_CN.get(sell_reasons[code], sell_reasons[code])}）"
+                action = f"**卖出**（{REASON_CN.get(sell_reasons[code], sell_reasons[code])}）"
                 action_icon = "SELL"
             else:
                 remaining = hold_days - pos['hold_days']
