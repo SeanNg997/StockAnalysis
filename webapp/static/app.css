@@ -256,6 +256,16 @@ button:disabled {
   color: rgba(22, 48, 43, 0.72);
 }
 
+.chip-ws-connected {
+  background: rgba(130, 196, 148, 0.3);
+  color: rgba(24, 72, 45, 0.9);
+}
+
+.chip-ws-disconnected {
+  background: rgba(226, 198, 126, 0.34);
+  color: rgba(98, 72, 22, 0.92);
+}
+
 .chart-shell {
   position: relative;
   min-height: 0;

@@ -546,11 +546,11 @@ function connectWebSocket() {
   const socket = new WebSocket(`${protocol}://${window.location.host}/ws`);
   state.socket = socket;
   setText(dom.wsStatusChip, "连接中");
-  setClassName(dom.wsStatusChip, "chip chip-muted");
+  setClassName(dom.wsStatusChip, "chip chip-ws-disconnected");
 
   socket.addEventListener("open", () => {
     setText(dom.wsStatusChip, "实时已连接");
-    setClassName(dom.wsStatusChip, "chip");
+    setClassName(dom.wsStatusChip, "chip chip-ws-connected");
   });
 
   socket.addEventListener("message", (event) => {
@@ -591,7 +591,7 @@ function connectWebSocket() {
 
   socket.addEventListener("close", () => {
     setText(dom.wsStatusChip, "连接断开，重连中");
-    setClassName(dom.wsStatusChip, "chip chip-muted");
+    setClassName(dom.wsStatusChip, "chip chip-ws-disconnected");
     setTimeout(connectWebSocket, 1200);
   });
 }

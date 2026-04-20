@@ -11,7 +11,8 @@ cd "$PROJECT_DIR"
 
 echo "=============================================="
 echo "  StockAnalysis Web Console"
-echo "  地址: http://$HOST:$PORT"
+echo "  Address: http://$HOST:$PORT"
+echo "  Do not close this terminal. Use Ctrl + Click to open the link above."
 echo "=============================================="
 
 "$PYTHON_BIN" -m uvicorn webapp.server:app --host "$HOST" --port "$PORT"
