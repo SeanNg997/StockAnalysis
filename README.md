@@ -25,6 +25,9 @@ python src/py00_fetch_stock_data.py
 
 # 启动本地网页控制台（按钮执行 + 实时日志 + 回测曲线）
 ./scripts/run_web_console.sh
+
+# Windows 双击启动（推荐）
+scripts\\run_web_console.bat
 ```
 
 启动网页控制台后，浏览器访问 `http://127.0.0.1:8000` 即可操作。
@@ -43,7 +46,8 @@ src/
 scripts/
 ├── run_strategy.sh            日常快速预测（增量更新 + 单日预测 + 策略报告）
 ├── run_backtest.sh            完整重训练（Walk-Forward + 回测 + 可视化）
-└── run_web_console.sh         启动本地网页控制台
+├── run_web_console.sh         macOS/Linux 启动本地网页控制台
+└── run_web_console.bat        Windows 双击启动本地网页控制台
 webapp/
 ├── server.py                  FastAPI 控制台后端（启动任务 / 转发日志 / 推送回测曲线）
 └── static/                    控制台静态页面（单页仪表盘）
