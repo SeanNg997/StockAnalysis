@@ -6,6 +6,7 @@ import os
 import sys
 import json
 import warnings
+from functools import lru_cache
 from datetime import date, timedelta
 
 from config import CONFIG
@@ -17,6 +18,13 @@ CLEAN_PKL = CONFIG['paths']['CLEAN_PKL']
 PREDICT_PKL = CONFIG['paths']['PREDICT_PKL']
 MARKET_PKL = CONFIG['paths']['MARKET_PKL']
 OUTPUT_DIR = CONFIG['paths']['OUTPUT_DIR']
+TODAY_PRICE_CACHE_PKL = os.path.join(OUTPUT_DIR, 'tmp', 'today_price_view.pkl')
+TODAY_PREDICT_CACHE_PKL = os.path.join(OUTPUT_DIR, 'tmp', 'today_predict_view.pkl')
+TODAY_MARKET_CACHE_PKL = os.path.join(OUTPUT_DIR, 'tmp', 'today_market_view.pkl')
+
+PRICE_VIEW_COLS = ['code', 'name', 'date', 'open', 'close', 'volume', 'amount']
+PREDICT_VIEW_COLS = ['date', 'code', 'pred_return', 'pred_std', 'confidence']
+MARKET_VIEW_COLS = ['code', 'date', 'isST', 'isTrading', 'open', 'close', 'amount']
 
 
 def next_trading_day(d: date, known_trading_days=None) -> date:
@@ -45,13 +53,94 @@ def normalize_stock_code(code):
     raise ValueError(f"无法识别股票代码: {code}，请输入6位主板代码（如 600000 或 002202）")
 
 
+def _cache_is_fresh(cache_path, source_path):
+    return (
+        os.path.exists(cache_path) and
+        os.path.getmtime(cache_path) >= os.path.getmtime(source_path)
+    )
+
+
+def _ensure_view_cache(cache_path, source_path, required_cols, preprocess=None):
+    """为大体量原始 pkl 构建轻量视图，避免每次读取整表后再裁剪。"""
+    if not _cache_is_fresh(cache_path, source_path):
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        df = pd.read_pickle(source_path)[required_cols].copy()
+        if preprocess is not None:
+            df = preprocess(df)
+        df.to_pickle(cache_path)
+    return pd.read_pickle(cache_path)
+
+
+def _preprocess_price_view(df: pd.DataFrame) -> pd.DataFrame:
+    df['code'] = df['code'].astype('category')
+    df['name'] = df['name'].astype('category')
+    return df.sort_values(['date', 'code']).reset_index(drop=True)
+
+
+def _preprocess_predict_view(df: pd.DataFrame) -> pd.DataFrame:
+    df['code'] = df['code'].astype('category')
+    return df.sort_values(['date', 'code']).reset_index(drop=True)
+
+
+def _preprocess_market_view(df: pd.DataFrame) -> pd.DataFrame:
+    df['code'] = df['code'].astype('category')
+    df['isST'] = df['isST'].fillna(0).astype('int8')
+    df['isTrading'] = df['isTrading'].fillna(0).astype('int8')
+    return df.sort_values(['date', 'code']).reset_index(drop=True)
+
+
+@lru_cache(maxsize=1)
+def _load_price_view():
+    return _ensure_view_cache(
+        TODAY_PRICE_CACHE_PKL, CLEAN_PKL, PRICE_VIEW_COLS, preprocess=_preprocess_price_view
+    )
+
+
+@lru_cache(maxsize=1)
+def _load_predict_view():
+    return _ensure_view_cache(
+        TODAY_PREDICT_CACHE_PKL, PREDICT_PKL, PREDICT_VIEW_COLS, preprocess=_preprocess_predict_view
+    )
+
+
+@lru_cache(maxsize=1)
+def _load_market_view():
+    return _ensure_view_cache(
+        TODAY_MARKET_CACHE_PKL, MARKET_PKL, MARKET_VIEW_COLS, preprocess=_preprocess_market_view
+    )
+
+
+def _build_market_history_tail(market_df: pd.DataFrame, latest_date: pd.Timestamp) -> pd.DataFrame:
+    """只保留每只股票截至 latest_date 最近 N 天的低价判断窗口。"""
+    history = market_df.loc[
+        market_df['date'] <= latest_date, ['code', 'date', 'close']
+    ].copy()
+    if history.empty:
+        return history
+    return (
+        history.sort_values(['code', 'date'])
+        .groupby('code', group_keys=False)
+        .tail(rules.MIN_PRICE_DAYS)
+        .reset_index(drop=True)
+    )
+
+
+def _build_latest_indexes(latest: pd.DataFrame):
+    if latest.empty:
+        return pd.DataFrame(), {}
+
+    latest_by_code = latest.drop_duplicates(subset=['code'], keep='last').set_index('code', drop=False)
+    latest_records = latest_by_code.to_dict('index')
+    return latest_by_code, latest_records
+
+
 def _load_latest_data(target_date=None):
     """加载预测结果、价格数据和市场状态"""
-    pred_df = pd.read_pickle(PREDICT_PKL)
+    pred_df = _load_predict_view()
 
     if target_date is not None:
         ts = pd.Timestamp(target_date)
-        available = pred_df[pred_df['date'] <= ts]['date']
+        available = pred_df.loc[pred_df['date'] <= ts, 'date']
         if available.empty:
             raise ValueError(f"predictions.pkl 中没有 <= {target_date} 的数据")
         latest_date = available.max()
@@ -62,21 +151,19 @@ def _load_latest_data(target_date=None):
 
     print(f"最新数据日期: {latest_date.date()}")
 
-    latest_pred = pred_df[pred_df['date'] == latest_date].copy()
+    latest_pred = pred_df.loc[pred_df['date'] == latest_date].copy()
 
-    df = pd.read_pickle(CLEAN_PKL)
-    latest_price = df[df['date'] == latest_date][
-        ['code', 'name', 'open', 'close', 'volume', 'amount']
-    ].copy()
-    del df
+    price_df = _load_price_view()
+    latest_price = price_df.loc[price_df['date'] == latest_date, PRICE_VIEW_COLS].copy()
 
     latest = latest_pred.merge(latest_price, on='code', how='left')
     latest = latest.sort_values('pred_return', ascending=False)
 
-    market_df = pd.read_pickle(MARKET_PKL)
-    market_day = market_df[market_df['date'] == latest_date].copy()
+    market_df = _load_market_view()
+    market_day = market_df.loc[market_df['date'] == latest_date].copy()
+    market_history = _build_market_history_tail(market_df, latest_date)
 
-    return latest, latest_date, pred_df, market_day, market_df
+    return latest, latest_date, pred_df, market_day, market_history
 
 
 def generate_stock_report(stock_code, target_date=None):
@@ -84,14 +171,14 @@ def generate_stock_report(stock_code, target_date=None):
     full_code = normalize_stock_code(stock_code)
     short_code = full_code.split('.')[1]
     print(f"生成 {full_code} 的交易决策...")
-    latest, latest_date, pred_df, market_day, market_df = _load_latest_data(target_date)
+    latest, latest_date, pred_df, market_day, _market_history = _load_latest_data(target_date)
+    latest_by_code, latest_records = _build_latest_indexes(latest)
 
-    stock = latest[latest['code'] == full_code].copy()
-    if stock.empty:
+    if full_code not in latest_records:
         print(f"未找到股票 {full_code} 的预测数据")
         sys.exit(1)
 
-    row = stock.iloc[0]
+    row = latest_records[full_code]
     stock_name = row.get('name', 'N/A')
     close_price = row.get('close', 0)
     open_price = row.get('open', 0)
@@ -101,14 +188,15 @@ def generate_stock_report(stock_code, target_date=None):
     confidence = row['confidence']
     hold_days = CONFIG['backtest']['HOLD_DAYS']
 
-    mkt_row = market_day[market_day['code'] == full_code]
     warnings_list = []
-    if len(mkt_row) > 0:
-        mr = mkt_row.iloc[0]
-        if mr['isST'] == 1:
-            warnings_list.append("该股当前处于 ST 状态，模型预测可能不准确")
-        if mr['isTrading'] != 1:
-            warnings_list.append("该股当日停牌，无法交易")
+    if not market_day.empty:
+        market_day_records = market_day.drop_duplicates(subset=['code'], keep='last').set_index('code').to_dict('index')
+        mr = market_day_records.get(full_code)
+        if mr is not None:
+            if mr['isST'] == 1:
+                warnings_list.append("该股当前处于 ST 状态，模型预测可能不准确")
+            if mr['isTrading'] != 1:
+                warnings_list.append("该股当日停牌，无法交易")
 
     total = len(latest)
     rank = (latest['pred_return'] > pred_return).sum() + 1
@@ -133,7 +221,11 @@ def generate_stock_report(stock_code, target_date=None):
         advice = "不建议买入"
         advice_detail = "预测收益为负，建议回避或减仓"
 
-    stock_history = pred_df[pred_df['code'] == full_code].sort_values('date').tail(5)
+    stock_history = (
+        pred_df.loc[pred_df['code'] == full_code, ['date', 'pred_return', 'confidence']]
+        .sort_values('date')
+        .tail(5)
+    )
     known_days = set(pred_df['date'].dt.date.unique())
     exec_date = next_trading_day(latest_date.date(), known_trading_days=known_days)
 
@@ -192,7 +284,7 @@ def generate_stock_report(stock_code, target_date=None):
 def generate_today_strategy(target_date=None):
     """生成全市场实盘交易决策"""
     print("生成今日交易决策...")
-    latest, latest_date, pred_df, market_day, market_df = _load_latest_data(target_date)
+    latest, latest_date, pred_df, market_day, market_history = _load_latest_data(target_date)
 
     hold_days = CONFIG['backtest']['HOLD_DAYS']
     min_pred_return = CONFIG['backtest']['MIN_PRED_RETURN']
@@ -202,7 +294,7 @@ def generate_today_strategy(target_date=None):
     n_total = len(latest)
     if len(market_day) > 0:
         qualified, pool_stats = rules.filter_stock_pool(
-            latest, market_day, return_stats=True, market_history=market_df
+            latest, market_day, return_stats=True, market_history=market_history
         )
     else:
         qualified = latest[
@@ -222,9 +314,9 @@ def generate_today_strategy(target_date=None):
 
     # Markdown 报告
     lines = []
-    lines.append(f"# A股量化策略 · 今日决策\n")
-    lines.append(f"| 决策基准日 | 执行日期 |")
-    lines.append(f"|:----------:|:--------:|")
+    lines.append("# A股量化策略 · 今日决策\n")
+    lines.append("| 决策基准日 | 执行日期 |")
+    lines.append("|:----------:|:--------:|")
     lines.append(f"| {latest_date.date()} | **{exec_date}**（盘前集合竞价） |\n")
     lines.append("---\n")
 
@@ -358,19 +450,20 @@ def generate_portfolio_advice(portfolio_path, target_date=None):
         print("持仓为空，无需生成报告")
         return
 
-    latest, latest_date, pred_df, market_day, market_df = _load_latest_data(target_date)
+    latest, latest_date, pred_df, market_day, market_history = _load_latest_data(target_date)
+    latest_by_code, latest_records = _build_latest_indexes(latest)
     known_days = sorted(pred_df['date'].dt.date.unique())
     known_days_set = set(known_days)
 
     # 计算每只持仓的持有天数和当前价格
     for code, pos in positions.items():
         pos['hold_days'] = _calc_hold_days(pos['buy_date'], latest_date, known_days)
-        row = latest[latest['code'] == code]
-        if not row.empty:
-            pos['current_price'] = row.iloc[0].get('close', pos['buy_price'])
+        row = latest_records.get(code)
+        if row is not None:
+            pos['current_price'] = row.get('close', pos['buy_price'])
 
     # 构建决策数据（需要 code, close, pred_return 列）
-    decision_data = latest[latest['code'].isin(positions.keys())].copy()
+    decision_data = latest_by_code.reindex(list(positions.keys())).dropna(how='all').reset_index(drop=True)
 
     # 卖出
     sell_list = rules.decide_sells(positions, decision_data)
@@ -382,7 +475,7 @@ def generate_portfolio_advice(portfolio_path, target_date=None):
     n_empty = rules.MAX_POSITIONS - n_after_sell
     buy_candidates = []
     if n_empty > 0 and len(market_day) > 0:
-        qualified = rules.filter_stock_pool(latest, market_day, market_history=market_df)
+        qualified = rules.filter_stock_pool(latest, market_day, market_history=market_history)
         if len(qualified) > 0:
             qualified = rules.score_candidates(qualified)
             available = qualified[~qualified['code'].isin(set(positions.keys()))]
@@ -394,8 +487,8 @@ def generate_portfolio_advice(portfolio_path, target_date=None):
     # 生成报告
     lines = []
     lines.append("# 持仓监控 · 今日操作建议\n")
-    lines.append(f"| 决策基准日 | 执行日期 |")
-    lines.append(f"|:----------:|:--------:|")
+    lines.append("| 决策基准日 | 执行日期 |")
+    lines.append("|:----------:|:--------:|")
     lines.append(f"| {latest_date.date()} | **{exec_date}**（盘前集合竞价） |\n")
     lines.append("---\n")
 
@@ -424,10 +517,10 @@ def generate_portfolio_advice(portfolio_path, target_date=None):
     # 逐只持仓详情
     lines.append("## 持仓明细与操作建议\n")
     for code, pos in positions.items():
-        row = latest[latest['code'] == code]
-        stock_name = row.iloc[0].get('name', 'N/A') if not row.empty else 'N/A'
-        pred_return = row.iloc[0]['pred_return'] if not row.empty else np.nan
-        confidence = row.iloc[0]['confidence'] if not row.empty else np.nan
+        row = latest_records.get(code)
+        stock_name = row.get('name', 'N/A') if row is not None else 'N/A'
+        pred_return = row['pred_return'] if row is not None else np.nan
+        confidence = row['confidence'] if row is not None else np.nan
         profit_pct = (pos['current_price'] - pos['buy_price']) / pos['buy_price']
 
         if code in sell_codes:
@@ -461,7 +554,6 @@ def generate_portfolio_advice(portfolio_path, target_date=None):
         else:
             lines.append("> 当前无股票满足买入条件\n")
     else:
-        n_buy = len(buy_candidates)
         lines.append(f"> 卖出后空余 **{n_empty}** 个仓位，推荐以下股票：\n")
         lines.append("| # | 名称 | 代码 | 收盘价 | 预测收益率 | 置信度 |")
         lines.append("|:-:|:----:|:----:|-------:|-----------:|-------:|")
@@ -481,8 +573,8 @@ def generate_portfolio_advice(portfolio_path, target_date=None):
     seq = 0
     for code, reason in sell_list:
         pos = positions[code]
-        row = latest[latest['code'] == code]
-        name = row.iloc[0].get('name', '') if not row.empty else ''
+        row = latest_records.get(code)
+        name = row.get('name', '') if row is not None else ''
         seq += 1
         lines.append(f"{seq}. **卖出** {name}（`{code}`）{pos['shares']} 股"
                       f" — {REASON_CN.get(reason, reason)}")

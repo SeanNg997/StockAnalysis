@@ -214,7 +214,6 @@ def compute_features_for_stock(g: pd.DataFrame, trade_day_idx: dict = None) -> p
         price_trend - vol_trend
     )
 
-    body = np.abs(close - open_)
     total_range = high - low + 1e-10
     feats['upper_shadow'] = (high - np.maximum(close, open_)) / total_range
     feats['lower_shadow'] = (np.minimum(close, open_) - low) / total_range

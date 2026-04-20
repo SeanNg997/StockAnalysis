@@ -8,11 +8,6 @@ CONFIG = {
         'ADJUST_FLAG': '2',  # 1:后复权 2:前复权 3:不复权
     },
 
-    'data_loader': {
-        'MIN_AVG_AMOUNT': 500e4,   # 最低20日均成交额(元)
-        'MIN_TRADING_DAYS': 100,
-    },
-
     'features': {
         'HOLD_DAYS': 4,            # T+1买入 → T+5卖出
         'BUY_COST': 1.0 + 0.000085,
@@ -22,7 +17,6 @@ CONFIG = {
     },
 
     'model': {
-        'N_ENSEMBLE': 6,
         'TRAIN_YEARS': 3,
         'RETRAIN_DAYS': 22,
         'BACKTEST_YEARS': 3,
@@ -61,8 +55,11 @@ CONFIG = {
         'MAX_DAILY_BUY': 5,
         'MARKET_REGIME_LOOKBACK': 10,
         'MIN_EXEC_AMOUNT': 100e4,  # 执行日最低成交额(100万)
+        'MAX_OPEN_TRADE_AMOUNT_RATIO': 0.02,  # 单票单日最多按成交额的2%成交（容量约束）
+        'ALLOW_ST_BUY': True,                 # 是否允许买入 ST（实盘可按券商权限改为 False）
+        'SPECIAL_LIMIT_GAP_TOL': 0.03,        # 开盘涨跌幅超过常规涨跌停+容差，视为特殊规则日（IPO/复牌等）
         'MAX_DELIST_HOLD_DAYS': 5, # 持仓股停牌超过此天数视为退市，强制清仓
-        'MIN_STOCK_PRICE': 2.0,    # 最低股价(元)，过滤退市/垃圾股
+        'MIN_STOCK_PRICE': 3.0,    # 最低股价(元)，过滤低质量股
         'MIN_PRICE_DAYS': 5,       # 连续N个交易日低于MIN_STOCK_PRICE视为高风险
         'MIN_PRICE_CONSECUTIVE': True,  # True=连续N天，False=最近N天内任意N天
     },
@@ -78,6 +75,7 @@ CONFIG = {
         'FEATURE_PKL': 'output/tmp/features.pkl',
         'PREDICT_PKL': 'output/tmp/predictions.pkl',
         'MARKET_PKL': 'output/tmp/market_status.pkl',
+        'BACKTEST_MARKET_PKL': 'output/tmp/market_status_backtest.pkl',
     }
 }
 

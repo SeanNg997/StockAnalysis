@@ -1,13 +1,13 @@
 # StockAnalysis — A股量化交易策略系统
 
-基于 LightGBM Ensemble + Walk-Forward 滚动训练的 A 股量化选股系统，支持每日自动化运行和 GitHub Actions 定时推送。
+基于 LightGBM Ensemble + Walk-Forward 滚动训练的 A 股量化选股系统，支持每日自动化运行与本地网页控制台。
 
 ## 1 策略特性
 
-- **模型**：LightGBM Ensemble（6个不同随机种子并行训练），Huber 损失函数
-- **持有周期**：T+1 买入，持有5个交易日后卖出（T+6 开盘）
-- **选股范围**：沪深主板（sh.60* / sz.00*），剔除 ST、停牌、新股、低流动性
-- **风控**：止损 -5%，止盈 +8%，每日最多建仓2只，最大持仓5只
+- **模型**：LightGBM Ensemble（3个随机种子集成），Huber 损失函数
+- **持有周期**：T+1 买入，持有4个交易日后卖出（T+5 开盘）
+- **选股范围**：沪深主板（sh.60* / sz.00*），过滤停牌/新股/低流动性/低价风险（执行层允许 ST）
+- **风控**：止损 -5%，止盈 +8%，每日最多建仓5只，最大持仓5只
 
 ## 2 快速开始
 
@@ -22,62 +22,39 @@ python src/py00_fetch_stock_data.py
 
 # 日常：增量更新 + 快速预测（约7分钟）
 ./scripts/run_strategy.sh
+
+# 启动本地网页控制台（按钮执行 + 实时日志 + 回测曲线）
+./scripts/run_web_console.sh
 ```
+
+启动网页控制台后，浏览器访问 `http://127.0.0.1:8000` 即可操作。
 
 ## 3 项目结构
 
 ```
 src/
 ├── py00_fetch_stock_data.py   数据获取（baostock，全量/增量/断点续传）
-├── py01_data_loader.py        数据清洗（主板过滤、ST剔除、流动性筛选）
+├── py01_data_clean.py         数据清洗（主板过滤、流动性筛选、市场状态快照）
 ├── py02_features.py           特征工程（60+技术/动量/截面特征）
-├── py03_model.py              LightGBM Ensemble 训练与预测（并行训练）
+├── py03_model.py              LightGBM Ensemble 训练与预测（3-seed集成）
 ├── py04_today.py              今日交易决策（生成TOP5买入建议）
 ├── py05_backtest.py           回测引擎（T+1、涨跌停、止损止盈、交易成本）
 └── py06_report.py             可视化报告（净值、回撤、热力图）
 scripts/
 ├── run_strategy.sh            日常快速预测（增量更新 + 单日预测 + 策略报告）
-└── run_backtest.sh            完整重训练（Walk-Forward + 回测 + 可视化）
-.github/workflows/
-└── daily_report.yml           每个交易日北京时间19:03盘后自动运行 + 邮件推送
+├── run_backtest.sh            完整重训练（Walk-Forward + 回测 + 可视化）
+└── run_web_console.sh         启动本地网页控制台
+webapp/
+├── server.py                  FastAPI 控制台后端（启动任务 / 转发日志 / 推送回测曲线）
+└── static/                    控制台静态页面（单页仪表盘）
 ```
 
-## 4 GitHub Actions配置
+## 4 网页控制台
 
-仓库已配置定时工作流，**每个交易日北京时间 19:30（盘后）自动运行**，完成数据更新 → 特征 → 预测 → 策略报告 → 邮件推送全流程。
-
-**邮件推送**需在 Settings → Secrets and variables → Actions 中配置：
-`EMAIL_SERVER` / `EMAIL_PORT` / `EMAIL_USERNAME` / `EMAIL_PASSWORD` / `EMAIL_RECIPIENT`
-
-首次启用：在 GitHub Actions 页面手动触发一次 workflow 即可（自动全量初始化）。
-
-## 5 回测结果
-
-> 回测期间：**2023-04-03 ~ 2026-04-03**（约3年，727个交易日）
->
-> 初始资金 10 万元，期末资产 **40.3 万元**，总回报率 **+302.7%**，年化收益率 **62.1%**，最大回撤 **-28.3%**，夏普比率 **1.46**。
-
-### A. 净值曲线
-
-![净值曲线](output/backtest/equity_curve.png)
-
-### B. 回撤曲线
-
-![回撤曲线](output/backtest/drawdown_curve.png)
-
-### C. 每日仓位与交易次数
-
-![每日持仓](output/backtest/daily_positions.png)
-
-### D. 月度收益热力图
-
-![月度收益热力图](output/backtest/monthly_returns.png)
-
----
-
-完整的模块说明、特征工程详解、模型设计、回测原理、常见问题等，请参阅：
-
-- **[document.md](document.md)** — 项目完整技术文档
+- 为 `py00` 到 `py06` 和两个 shell 流水线提供独立按钮
+- 网页内实时显示脚本 `print` / 错误输出
+- 运行 `py05_backtest.py` 或 `run_backtest.sh` 时，实时刷新收益曲线
+- 自动读取最新一次 `output/backtest/backtest_daily.csv` 作为历史曲线基线
 
 ## 风险提示
 

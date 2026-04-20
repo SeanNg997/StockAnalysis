@@ -14,10 +14,11 @@ from config import CONFIG
 # Path
 BASE_DIR = CONFIG['paths']['BASE_DIR']
 DATA_DIR = CONFIG['paths']['DATA_DIR']
+OUTPUT_DIR = CONFIG['paths']['OUTPUT_DIR']
 STOCK_LIST_CSV = CONFIG['paths']['STOCK_LIST_CSV']
 TRADE_DAYS_TXT = CONFIG['paths']['TRADE_DAYS_TXT']
 os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(DATA_DIR + "/tmp",  exist_ok=True)
+os.makedirs(OUTPUT_DIR + "/tmp",  exist_ok=True)
 
 START_DATE = CONFIG['data_fetch']['START_DATE']
 ADJUST_FLAG = CONFIG['data_fetch']['ADJUST_FLAG']
@@ -182,13 +183,14 @@ def _to_dataframe(rows, fields, symbol, name):
         df = df.drop(columns=["tradestatus"])
     return df
 
-def fetch_dailyK(symbol: str, name: str, start_date: str = START_DATE) -> Optional[pd.DataFrame]:
-    """获取单只股票日K线数据"""
+def fetch_dailyK(symbol: str, name: str, start_date: str = START_DATE, end_date: Optional[str] = None) -> Optional[pd.DataFrame]:
+    """获取单只股票日K线数据（下载上限由 end_date 控制）"""
+    query_end_date = end_date or END_DATE
     rs = bs.query_history_k_data_plus(
         symbol,
         "date,open,high,low,close,volume,amount,turn,pctChg,isST,tradestatus,peTTM,pbMRQ,psTTM,pcfNcfTTM",
         start_date=start_date,
-        end_date=END_DATE,
+        end_date=query_end_date,
         frequency="d",
         adjustflag=ADJUST_FLAG
     )
@@ -233,7 +235,7 @@ def main(full: bool = False):
               
         # 获取股票列表和交易日列表
         stock_list = get_stock_list()
-        trade_days = get_trade_days_list()
+        get_trade_days_list(end_date=expected_latest_date)
 
         existing_df = load_existing_csv()
         if existing_df.empty:
@@ -279,7 +281,7 @@ def main(full: bool = False):
             new_chunks = []
             for idx, (code, name, last_date) in enumerate(tqdm(pending_update, desc="增量更新中", ncols=80)):
                 from_date = (pd.to_datetime(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
-                new_df = fetch_dailyK(code, name, from_date)
+                new_df = fetch_dailyK(code, name, from_date, end_date=expected_latest_date)
                 if new_df is not None and not new_df.empty:
                     new_chunks.append(new_df)
                     update_count += 1
@@ -300,7 +302,7 @@ def main(full: bool = False):
             new_chunks = []
             if pending_full:
                 for idx, (code, name) in enumerate(tqdm(pending_full, desc="新增股票中", ncols=80)):
-                    new_df = fetch_dailyK(code, name)
+                    new_df = fetch_dailyK(code, name, end_date=expected_latest_date)
                     if new_df is not None and not new_df.empty:
                         new_chunks.append(new_df)
                         new_count += 1
@@ -351,7 +353,7 @@ def main(full: bool = False):
         fail_count = 0
 
         for idx, (code, name, _) in enumerate(tqdm(pending, desc="正在下载日K数据", ncols=80)):
-            df = fetch_dailyK(code, name)
+            df = fetch_dailyK(code, name, end_date=expected_latest_date)
             if df is not None and not df.empty:
                 if not existing_df.empty and code in existing_df["code"].values:
                     existing_df = existing_df[existing_df["code"] != code]

@@ -15,6 +15,7 @@ export TZ=Asia/Shanghai
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SRC_DIR="$PROJECT_DIR/src"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 START_TIME=$(date +%s)
 
 # 解析参数：--date YYYY-MM-DD
@@ -51,14 +52,14 @@ if [ "$DATE_ARG" != "$(date +%Y-%m-%d)" ]; then
     echo "[Step 1/5] 历史模式：跳过数据更新，使用现有 CSV 数据"
 else
     echo "[Step 1/5] 增量更新数据..."
-    python "$SRC_DIR/py00_fetch_stock_data.py"
+    "$PYTHON_BIN" "$SRC_DIR/py00_fetch_stock_data.py"
 fi
 
 # 检查 pkl 缓存是否已是目标日期（用 Python 读取 max(date)）
 check_pkl_date() {
     local pkl_path="$1"
     local target_date="$2"
-    python - <<EOF
+    "$PYTHON_BIN" - <<EOF
 import sys, pandas as pd, os
 pkl = "$pkl_path"
 if not os.path.exists(pkl):
@@ -83,7 +84,7 @@ if [ "$CLEAN_CACHE" = "hit" ]; then
     echo "[Step 2/5] 数据清洗：缓存命中 ($DATE_ARG)，跳过"
 else
     echo "[Step 2/5] 数据清洗..."
-    python "$SRC_DIR/py01_data_clean.py" --date "$DATE_ARG"
+    "$PYTHON_BIN" "$SRC_DIR/py01_data_clean.py" --date "$DATE_ARG"
 fi
 
 # Step 3: 特征工程（截断到指定日期）
@@ -93,18 +94,18 @@ if [ "$FEATURE_CACHE" = "hit" ]; then
     echo "[Step 3/5] 特征工程：缓存命中 ($DATE_ARG)，跳过"
 else
     echo "[Step 3/5] 特征工程..."
-    python "$SRC_DIR/py02_features.py" --date "$DATE_ARG"
+    "$PYTHON_BIN" "$SRC_DIR/py02_features.py" --date "$DATE_ARG"
 fi
 
 # Step 4: 单日快速预测（只预测指定日期，不做 walk-forward）
 echo ""
 echo "[Step 4/5] 单日快速预测..."
-python "$SRC_DIR/py03_model.py" --date "$DATE_ARG"
+"$PYTHON_BIN" "$SRC_DIR/py03_model.py" --date "$DATE_ARG"
 
 # Step 5: 生成策略报告
 echo ""
 echo "[Step 5/5] 生成策略报告..."
-python "$SRC_DIR/py04_today.py" --date "$DATE_ARG"
+"$PYTHON_BIN" "$SRC_DIR/py04_today.py" --date "$DATE_ARG"
 
 echo ""
 echo "=============================================="

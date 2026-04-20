@@ -1,6 +1,5 @@
 """交易规则引擎 — 票池筛选 / 执行日验证 / 卖出决策 / 买入选股 / 市场择时"""
 
-import numpy as np
 import pandas as pd
 
 from config import CONFIG
@@ -22,6 +21,7 @@ MAX_DELIST_HOLD_DAYS = _BT['MAX_DELIST_HOLD_DAYS']
 MARKET_REGIME_LOOKBACK = _BT['MARKET_REGIME_LOOKBACK']
 MIN_PRICE_DAYS = _BT.get('MIN_PRICE_DAYS', 5)  # 连续低于MIN_STOCK_PRICE的天数阈值
 MIN_PRICE_CONSECUTIVE = _BT.get('MIN_PRICE_CONSECUTIVE', True)  # 是否要求连续
+ALLOW_ST_BUY = _BT.get('ALLOW_ST_BUY', True)
 
 
 def calc_buy_cost(amount: float) -> float:
@@ -32,10 +32,12 @@ def calc_sell_cost(amount: float) -> float:
     return max(amount * COMMISSION_RATE, MIN_COMMISSION) + amount * STAMP_TAX
 
 
-def get_limit_price(prev_close: float, code: str) -> tuple:
-    """根据T日收盘价计算T+1日涨停/跌停价"""
+def get_limit_price(prev_close: float, code: str, is_st: bool = False) -> tuple:
+    """根据T日收盘价与证券属性计算T+1日涨停/跌停价"""
     code_lower = code.lower()
-    if code_lower.startswith('sh.688') or code_lower.startswith('sz.300'):
+    if is_st:
+        pct = 0.05
+    elif code_lower.startswith('sh.688') or code_lower.startswith('sz.300'):
         pct = 0.20
     elif code_lower.startswith('bj.'):
         pct = 0.30
@@ -46,10 +48,72 @@ def get_limit_price(prev_close: float, code: str) -> tuple:
     return limit_up, limit_down
 
 
+def compute_dynamic_threshold(candidates: pd.DataFrame, base_threshold: float = MIN_PRED_RETURN) -> float:
+    """根据市场环境动态调整预测收益阈值
+
+    Args:
+        candidates: 候选股票（含预测数据）
+        base_threshold: 基础阈值
+
+    Returns:
+        动态调整后的阈值
+    """
+    if len(candidates) == 0:
+        return base_threshold
+
+    median_return = candidates['pred_return'].median()
+    pct_75 = candidates['pred_return'].quantile(0.75)
+    pct_25 = candidates['pred_return'].quantile(0.25)
+
+    # 市场整体预测收益高时，提高阈值
+    if median_return > 0.005:  # 中位数>0.5%，牛市
+        return max(base_threshold, pct_25)  # 至少25分位数
+    elif median_return < -0.002:  # 中位数<-0.2%，熊市
+        return max(base_threshold * 0.5, pct_75)  # 降低阈值但取75分位数
+    else:  # 震荡市
+        return base_threshold
+
+
+def _compute_low_price_risk_codes(market_history: pd.DataFrame,
+                                  current_date,
+                                  candidate_codes=None) -> set:
+    """向量化判断最近 N 个有效交易日是否持续低于最低股价阈值。"""
+    if market_history is None or len(market_history) == 0 or current_date is None:
+        return set()
+
+    history = market_history.loc[
+        market_history['date'] <= current_date, ['code', 'date', 'close']
+    ].copy()
+    if history.empty:
+        return set()
+
+    if candidate_codes is not None:
+        history = history[history['code'].isin(candidate_codes)]
+        if history.empty:
+            return set()
+
+    history = history.sort_values(['code', 'date'])
+    recent = history.groupby('code', group_keys=False).tail(MIN_PRICE_DAYS)
+    if recent.empty:
+        return set()
+
+    counts = recent.groupby('code')['close'].size()
+    low_counts = recent['close'].lt(MIN_STOCK_PRICE).groupby(recent['code']).sum()
+    enough_history = counts >= MIN_PRICE_DAYS
+
+    if MIN_PRICE_CONSECUTIVE:
+        flagged = enough_history & (low_counts == MIN_PRICE_DAYS)
+    else:
+        flagged = enough_history & (low_counts >= MIN_PRICE_DAYS)
+
+    return set(flagged[flagged].index)
+
+
 def filter_stock_pool(candidates: pd.DataFrame,
                       market_day: pd.DataFrame,
                       return_stats: bool = False,
-                      market_history: pd.DataFrame = None) -> pd.DataFrame | tuple:
+                      market_history: pd.DataFrame = None,
+                      use_dynamic_threshold: bool = True) -> pd.DataFrame | tuple:
     """决策日票池筛选
 
     Args:
@@ -57,6 +121,7 @@ def filter_stock_pool(candidates: pd.DataFrame,
         market_day: 决策日市场状态
         return_stats: 是否返回筛选统计
         market_history: 历史市场数据（用于检查连续低价），需要包含['code','date','close']
+        use_dynamic_threshold: 是否使用动态预测收益阈值
     """
     total = len(candidates)
     stats = {'总候选': total}
@@ -69,17 +134,18 @@ def filter_stock_pool(candidates: pd.DataFrame,
         on='code', how='left'
     )
 
-    # 1. 不再排除 ST 股票
-    # st_mask = merged['isST'] == 1
-    # n_st = st_mask.sum()
-    # merged = merged[~st_mask]
-    # stats['排除ST'] = int(n_st)
+    # 1. ST 过滤：可配置（实盘可按券商权限关闭）
+    if not ALLOW_ST_BUY:
+        st_mask = merged['isST'] == 1
+        n_st = st_mask.sum()
+        merged = merged[~st_mask]
+        stats['排除ST'] = int(n_st)
 
-    # 2. 不再单独排除停牌（已被最近5天无停牌规则包含）
-    # suspended_mask = merged['isTrading'] != 1
-    # n_suspended = suspended_mask.sum()
-    # merged = merged[~suspended_mask]
-    # stats['排除停牌'] = int(n_suspended)
+    # 2. 排除当日停牌，减少执行层 BUY_FAILED_SUSPENDED
+    suspended_mask = merged['isTrading'] != 1
+    n_suspended = suspended_mask.sum()
+    merged = merged[~suspended_mask]
+    stats['排除停牌'] = int(n_suspended)
 
     # 3. 排除流动性不足
     low_liq_mask = merged['mkt_amount'] < MIN_EXEC_AMOUNT
@@ -98,26 +164,9 @@ def filter_stock_pool(candidates: pd.DataFrame,
     if market_history is not None and len(merged) > 0:
         current_date = market_day['date'].iloc[0] if 'date' in market_day.columns else None
         if current_date is not None:
-            # 获取最近MIN_PRICE_DAYS天的历史数据
-            recent_history = market_history[
-                market_history['date'] <= current_date
-            ].sort_values(['code', 'date'])
-
-            # 计算每只股票最近MIN_PRICE_DAYS天的收盘价
-            codes = merged['code'].unique()
-            low_consecutive_codes = set()
-
-            for code in codes:
-                code_hist = recent_history[recent_history['code'] == code].tail(MIN_PRICE_DAYS)
-                if len(code_hist) >= MIN_PRICE_DAYS:
-                    if MIN_PRICE_CONSECUTIVE:
-                        # 检查是否连续N天都低于阈值
-                        if (code_hist['close'] < MIN_STOCK_PRICE).all():
-                            low_consecutive_codes.add(code)
-                    else:
-                        # 检查最近N天内是否有任意N天低于阈值
-                        if (code_hist['close'] < MIN_STOCK_PRICE).sum() >= MIN_PRICE_DAYS:
-                            low_consecutive_codes.add(code)
+            low_consecutive_codes = _compute_low_price_risk_codes(
+                market_history, current_date, candidate_codes=merged['code'].unique()
+            )
 
             low_consecutive_mask = merged['code'].isin(low_consecutive_codes)
             n_low_consecutive = low_consecutive_mask.sum()
@@ -130,14 +179,14 @@ def filter_stock_pool(candidates: pd.DataFrame,
         n_suspend = suspend_mask.sum()
         merged = merged[~suspend_mask]
         stats['排除连续停牌'] = int(n_suspend)
-    
+
     # 7. 排除最近5天有停牌的股票
     if 'recent_5d_suspend' in merged.columns:
         recent_suspend_mask = merged['recent_5d_suspend'] == 1
         n_recent_suspend = recent_suspend_mask.sum()
         merged = merged[~recent_suspend_mask]
         stats['排除最近5天停牌'] = int(n_recent_suspend)
-    
+
     # 8. 排除上市时间不足60天的股票
     if 'isNew' in merged.columns:
         new_mask = merged['isNew'] == 1
@@ -145,13 +194,20 @@ def filter_stock_pool(candidates: pd.DataFrame,
         merged = merged[~new_mask]
         stats['排除新股'] = int(n_new)
 
-    # 7. 排除低预测收益
-    low_ret_mask = merged['pred_return'] <= MIN_PRED_RETURN
+    # 9. 动态调整预测收益阈值（高优先级优化 #9）
+    if use_dynamic_threshold:
+        dynamic_threshold = compute_dynamic_threshold(merged, MIN_PRED_RETURN)
+        stats['动态收益阈值'] = f"{dynamic_threshold:.4f}"
+    else:
+        dynamic_threshold = MIN_PRED_RETURN
+
+    # 10. 排除低预测收益
+    low_ret_mask = merged['pred_return'] <= dynamic_threshold
     n_low_ret = low_ret_mask.sum()
     merged = merged[~low_ret_mask]
     stats['低于收益阈值'] = int(n_low_ret)
 
-    # 8. 排除低置信度
+    # 11. 排除低置信度
     low_conf_mask = merged['confidence'] <= MIN_CONFIDENCE
     n_low_conf = low_conf_mask.sum()
     merged = merged[~low_conf_mask]
@@ -166,67 +222,6 @@ def filter_stock_pool(candidates: pd.DataFrame,
     if return_stats:
         return merged, stats
     return merged
-
-
-def validate_buy_execution(code: str, market_indexed, exec_date,
-                           prev_close: float = None) -> tuple:
-    """执行日买入验证，返回 (can_buy, reason, exec_open)"""
-    try:
-        row = market_indexed.loc[(exec_date, code)]
-    except KeyError:
-        return False, 'NO_DATA', None
-
-    if row['isTrading'] != 1:
-        return False, 'SUSPENDED', None
-
-    if row['isST'] == 1:
-        return False, 'ST', None
-
-    t1_open = row['open']
-    if t1_open <= 0:
-        return False, 'INVALID_PRICE', None
-
-    if row['amount'] < MIN_EXEC_AMOUNT:
-        return False, 'LOW_LIQUIDITY', None
-
-    # 涨停检查
-    if prev_close is not None:
-        limit_up, _ = get_limit_price(prev_close, code)
-        if t1_open >= limit_up - 0.001:
-            return False, 'LIMIT_UP', None
-
-    return True, 'OK', t1_open
-
-
-def validate_sell_execution(code: str, market_indexed, exec_date,
-                            prev_close: float, sell_reason: str = '') -> tuple:
-    """执行日卖出验证，返回 (can_sell, reason, exec_open)"""
-    try:
-        row = market_indexed.loc[(exec_date, code)]
-    except KeyError:
-        # exec_date 在 market_status 里完全找不到该股票 → 真正退市，以0价格强制出仓
-        if sell_reason == 'DELIST_FORCE_SELL':
-            return True, 'OK', 0.0
-        return False, 'NO_DATA', None
-
-    if row['isTrading'] != 1:
-        # 停牌：区分是临时停牌还是长期退市
-        if sell_reason == 'DELIST_FORCE_SELL':
-            # 停牌超过 MAX_DELIST_HOLD_DAYS 天（远超正常持有期）才归零，否则等待复牌
-            return False, 'SUSPENDED', None
-        return False, 'SUSPENDED', None
-
-    t1_open = row['open']
-    if t1_open <= 0:
-        return False, 'INVALID_PRICE', None
-
-    # 跌停检查（强制清仓不受跌停限制）
-    if sell_reason != 'DELIST_FORCE_SELL':
-        _, limit_down = get_limit_price(prev_close, code)
-        if t1_open <= limit_down + 0.001:
-            return False, 'LIMIT_DOWN', None
-
-    return True, 'OK', t1_open
 
 
 def decide_sells(positions: dict, decision_data: pd.DataFrame) -> list:
@@ -259,15 +254,19 @@ def decide_sells(positions: dict, decision_data: pd.DataFrame) -> list:
     return sell_list
 
 
-def score_candidates(candidates: pd.DataFrame, method: str = 'return_only') -> pd.DataFrame:
-    """计算综合评分并按score降序排列"""
+def score_candidates(candidates: pd.DataFrame, method: str = 'confidence_weighted') -> pd.DataFrame:
+    """计算综合评分并按score降序排列
+
+    高优先级优化 #6: 默认使用置信度加权评分
+    """
     df = candidates.copy()
     if method == 'default':
         df['score'] = df['pred_return'] * (0.6 + 0.4 * df['confidence'])
     elif method == 'return_only':
         df['score'] = df['pred_return']
     elif method == 'confidence_weighted':
-        df['score'] = df['pred_return'] * df['confidence']
+        # 置信度加权：基础权重0.5 + 置信度贡献0.5
+        df['score'] = df['pred_return'] * (0.5 + 0.5 * df['confidence'])
     elif method == 'sharpe_like':
         pred_std = (1.0 / (df['confidence'] + 1e-10) - 1.0) / 100.0
         df['score'] = df['pred_return'] / (pred_std + 1e-10)
@@ -277,8 +276,11 @@ def score_candidates(candidates: pd.DataFrame, method: str = 'return_only') -> p
 
 
 def select_buys(candidates: pd.DataFrame, held_codes: set, sold_today: set,
-                n_slots: int, method: str = 'return_only') -> list:
-    """选出要买入的股票代码列表"""
+                n_slots: int, method: str = 'confidence_weighted') -> list:
+    """选出要买入的股票代码列表
+
+    高优先级优化 #6: 默认使用置信度加权评分
+    """
     if n_slots <= 0 or len(candidates) == 0:
         return []
 
@@ -287,12 +289,44 @@ def select_buys(candidates: pd.DataFrame, held_codes: set, sold_today: set,
     return available['code'].head(n_slots).tolist()
 
 
-def compute_buy_allocation(cash: float, n_buy: int) -> float:
-    """计算每只股票可分配的资金"""
-    if n_buy <= 0:
-        return 0.0
+def compute_weighted_allocation(cash: float, candidates: pd.DataFrame) -> dict:
+    """按质量加权分配资金
+
+    高优先级优化 #13: 根据预测收益和置信度加权分配资金
+
+    Args:
+        cash: 可用现金
+        candidates: 候选股票（必须包含 pred_return 和 confidence 列）
+
+    Returns:
+        {code: allocation_amount} 字典
+    """
+    if len(candidates) == 0:
+        return {}
+
+    # 计算每只股票的权重分数
+    candidates = candidates.copy()
+    candidates['weight_score'] = (
+        candidates['pred_return'] * (0.5 + 0.5 * candidates['confidence'])
+    )
+
+    # 归一化权重
+    total_score = candidates['weight_score'].sum()
+    if total_score <= 0:
+        # 如果所有分数都<=0，回退到等权分配
+        n = len(candidates)
+        equal_weight = 1.0 / n
+        candidates['weight'] = equal_weight
+    else:
+        candidates['weight'] = candidates['weight_score'] / total_score
+
+    # 分配资金（保留5%现金）
     available = cash * 0.95
-    return available / n_buy
+    allocation = {}
+    for _, row in candidates.iterrows():
+        allocation[row['code']] = available * row['weight']
+
+    return allocation
 
 
 def check_market_regime(daily_mkt_ret: pd.Series, current_date) -> float:

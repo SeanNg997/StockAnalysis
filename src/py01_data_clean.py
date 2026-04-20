@@ -14,6 +14,13 @@ STOCK_LIST_CSV = CONFIG['paths']['STOCK_LIST_CSV']
 TRADE_DAYS_TXT = CONFIG['paths']['TRADE_DAYS_TXT']
 CLEAN_PKL = CONFIG['paths']['CLEAN_PKL']
 MARKET_PKL = CONFIG['paths']['MARKET_PKL']
+BACKTEST_MARKET_PKL = CONFIG['paths'].get('BACKTEST_MARKET_PKL')
+
+BACKTEST_YEARS = CONFIG['model'].get('BACKTEST_YEARS', 3)
+BACKTEST_HISTORY_BUFFER_DAYS = max(
+    CONFIG['backtest'].get('MIN_PRICE_DAYS', 5),
+    30,  # 保留额外交易日，避免回测起始窗口因历史不足导致行为变化
+)
 
 
 def load_raw_data() -> pd.DataFrame:
@@ -45,7 +52,45 @@ def build_market_status(df: pd.DataFrame, end_date=None):
 
     os.makedirs(os.path.dirname(MARKET_PKL), exist_ok=True)
     market_df.to_pickle(MARKET_PKL)
+
+    if BACKTEST_MARKET_PKL:
+        backtest_market_df = _build_backtest_market_status(market_df)
+        os.makedirs(os.path.dirname(BACKTEST_MARKET_PKL), exist_ok=True)
+        backtest_market_df.to_pickle(BACKTEST_MARKET_PKL)
+
     return market_df
+
+
+def _build_backtest_market_status(market_df: pd.DataFrame) -> pd.DataFrame:
+    """构建回测专用市场状态快照（最近N年 + 历史缓冲交易日）"""
+    if len(market_df) == 0:
+        return market_df.copy()
+
+    max_date = market_df['date'].max()
+    cutoff_date = max_date - pd.DateOffset(years=BACKTEST_YEARS)
+
+    unique_dates = pd.DatetimeIndex(
+        np.sort(pd.to_datetime(market_df['date']).unique())
+    )
+    cutoff_idx = unique_dates.searchsorted(pd.Timestamp(cutoff_date), side='left')
+    start_idx = max(0, cutoff_idx - BACKTEST_HISTORY_BUFFER_DAYS)
+    start_date = unique_dates[start_idx]
+
+    backtest_market_df = market_df[market_df['date'] >= start_date].copy()
+    return backtest_market_df
+
+
+def _is_backtest_market_ready(required_max_date: pd.Timestamp) -> bool:
+    """检查回测市场快照是否存在且日期覆盖到 required_max_date。"""
+    if not BACKTEST_MARKET_PKL:
+        return True
+    if not os.path.exists(BACKTEST_MARKET_PKL):
+        return False
+    try:
+        bt_cached = pd.read_pickle(BACKTEST_MARKET_PKL)
+        return (not bt_cached.empty) and bt_cached['date'].max() >= required_max_date
+    except Exception:
+        return False
 
 
 def add_is_new_flag(df: pd.DataFrame) -> pd.DataFrame:
@@ -100,16 +145,7 @@ def handle_missing(df: pd.DataFrame) -> pd.DataFrame:
     for col in numeric_cols:
         # 保存原始数据的副本
         original_col = df[col].copy()
-        
-        # 计算连续缺失天数
-        def calculate_consecutive_missing(group):
-            missing_mask = group.isna()
-            consecutive_missing = missing_mask.astype(int).groupby((~missing_mask).cumsum()).cumsum()
-            return consecutive_missing
-        
-        # 计算每个股票的连续缺失天数
-        consecutive_missing = df.groupby('code')[col].transform(calculate_consecutive_missing)
-        
+
         # 前值填充所有缺失值
         df[col] = df.groupby('code')[col].transform(lambda x: x.ffill())
         
@@ -141,9 +177,6 @@ def handle_missing(df: pd.DataFrame) -> pd.DataFrame:
                 if group_length > 2:
                     df.loc[start:end, col] = 0
 
-    after_missing = df[numeric_cols].isna().sum().sum()
-    filled = before_missing - after_missing
-    
     # 处理可能的剩余缺失值（如股票的第一个值）
     df[numeric_cols] = df[numeric_cols].fillna(0)
     final_missing = df[numeric_cols].isna().sum().sum()
@@ -165,7 +198,8 @@ def run_pipeline(end_date=None) -> pd.DataFrame:
                     cached = cached[cached['date'] <= pd.Timestamp(end_date)]
                     if os.path.exists(MARKET_PKL):
                         mkt_cached = pd.read_pickle(MARKET_PKL)
-                        if mkt_cached['date'].max() >= pd.Timestamp(end_date):
+                        backtest_ready = _is_backtest_market_ready(pd.Timestamp(end_date))
+                        if mkt_cached['date'].max() >= pd.Timestamp(end_date) and backtest_ready:
                             print(f"✅ [缓存命中] mainboard_clean.pkl 已包含 {end_date}，跳过重新生成")
                             return cached
             else:
@@ -177,7 +211,8 @@ def run_pipeline(end_date=None) -> pd.DataFrame:
                     if cached_max == csv_max_date:
                         if os.path.exists(MARKET_PKL):
                             mkt_cached = pd.read_pickle(MARKET_PKL)
-                            if mkt_cached['date'].max() == csv_max_date:
+                            backtest_ready = _is_backtest_market_ready(csv_max_date)
+                            if mkt_cached['date'].max() == csv_max_date and backtest_ready:
                                 print(f"✅ [缓存命中] mainboard_clean.pkl 已是最新 ({cached_max.date()})，跳过重新生成")
                                 return cached
         except Exception as e:
@@ -198,6 +233,8 @@ def run_pipeline(end_date=None) -> pd.DataFrame:
     os.makedirs(os.path.dirname(CLEAN_PKL), exist_ok=True)
     df.to_pickle(CLEAN_PKL)
     print(f"\n✅ 市场状态快照已保存至 {MARKET_PKL}")
+    if BACKTEST_MARKET_PKL:
+        print(f"✅ 回测专用市场快照已保存至 {BACKTEST_MARKET_PKL} (最近{BACKTEST_YEARS}年+缓冲)")
     print(f"✅ 清洗完成! 保存至 {CLEAN_PKL}")
     print(f"  最终数据: {df.shape[0]:,} 行, {df['code'].nunique()} 只股票")
     print(f"  日期范围: {df['date'].min().date()} ~ {df['date'].max().date()}")

@@ -6,6 +6,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from matplotlib import font_manager
 import os
 import warnings
 
@@ -13,9 +14,36 @@ from config import CONFIG
 
 warnings.filterwarnings('ignore')
 
-plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'Noto Sans CJK SC',
-                                    'Noto Sans Mono CJK SC', 'SimHei']
-plt.rcParams['axes.unicode_minus'] = False
+PREFERRED_CJK_FONTS = [
+    'Hiragino Sans GB',
+    'PingFang SC',
+    'STHeiti',
+    'Songti SC',
+    'Arial Unicode MS',
+    'WenQuanYi Micro Hei',
+    'Noto Sans CJK SC',
+    'Noto Sans Mono CJK SC',
+    'SimHei',
+    'Microsoft YaHei',
+]
+
+
+def _configure_matplotlib_fonts():
+    available_fonts = {font.name for font in font_manager.fontManager.ttflist}
+    selected_fonts = [font for font in PREFERRED_CJK_FONTS if font in available_fonts]
+
+    # 动态选择本机存在的中文字体，避免反复触发 findfont 告警。
+    plt.rcParams['font.family'] = 'sans-serif'
+    plt.rcParams['font.sans-serif'] = selected_fonts + ['DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+
+    if selected_fonts:
+        print(f"使用中文字体: {selected_fonts[0]}")
+    else:
+        print("未找到本机中文字体，回退到 DejaVu Sans")
+
+
+_configure_matplotlib_fonts()
 
 BASE_DIR = CONFIG['paths']['BASE_DIR']
 BACKTEST_OUTPUT_DIR = CONFIG['paths']['BACKTEST_OUTPUT_DIR']
@@ -173,13 +201,24 @@ def plot_feature_importance(model_path=None):
                     'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM', 'label',
                     'isST', 'isTrading',
                     'ma_5', 'ma_10', 'ma_20', 'ma_60'}
-        feature_cols = [c for c in df.columns if c not in exclude]
+        candidate_cols = [c for c in recent.columns if c not in exclude]
+        numeric_cols = recent[candidate_cols].select_dtypes(include=[np.number, 'bool']).columns.tolist()
+        skipped_cols = [c for c in candidate_cols if c not in numeric_cols]
 
-        X = recent[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-        y = recent['label'].dropna()
-        valid = y.index.intersection(X.index)
-        X = X.loc[valid]
-        y = y.loc[valid]
+        if skipped_cols:
+            print(f"  跳过非数值特征: {', '.join(skipped_cols)}")
+
+        if not numeric_cols:
+            print("  无可用数值特征，跳过")
+            return
+
+        valid_rows = recent['label'].notna()
+        X = recent.loc[valid_rows, numeric_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+        y = recent.loc[valid_rows, 'label']
+
+        if X.empty or y.empty:
+            print("  缺少可训练样本，跳过")
+            return
 
         dtrain = lgb.Dataset(X, label=y)
         params = {
@@ -189,7 +228,7 @@ def plot_feature_importance(model_path=None):
         model = lgb.train(params, dtrain, num_boost_round=100)
 
         importance = pd.DataFrame({
-            'feature': feature_cols,
+            'feature': numeric_cols,
             'importance': model.feature_importance(importance_type='gain')
         }).sort_values('importance', ascending=True).tail(25)
 
@@ -211,6 +250,7 @@ def _load_trade_features():
     """加载卖出交易并关联买入日股票特征"""
     trade_path = os.path.join(BACKTEST_OUTPUT_DIR, 'trade_log.csv')
     trade_df = pd.read_csv(trade_path, parse_dates=['date'])
+    trade_df = trade_df.reset_index(drop=False).rename(columns={'index': '_seq'})
     sells = trade_df[trade_df['action'] == 'SELL'].copy()
     if sells.empty:
         return None
@@ -218,24 +258,33 @@ def _load_trade_features():
     price_df = pd.read_pickle(CLEAN_PKL)
     price_df['date'] = pd.to_datetime(price_df['date'])
 
-    pos_path = os.path.join(BACKTEST_OUTPUT_DIR, 'position_log.csv')
-    pos_df = pd.read_csv(pos_path, parse_dates=['date', 'buy_date'])
+    # 按交易流水为每笔 SELL 绑定其对应 BUY（同 code 的先买先卖）。
+    open_buys = {}
+    sell_buy_pairs = []
+    ordered_trades = trade_df.sort_values(['date', '_seq']).reset_index(drop=True)
+    for _, row in ordered_trades.iterrows():
+        code = row['code']
+        action = row['action']
+        if action == 'BUY':
+            open_buys.setdefault(code, []).append(row['date'])
+            continue
+        if action != 'SELL':
+            continue
 
-    # 去重，避免 merge_asof 报错
-    pos_df = pos_df.drop_duplicates(subset=['code', 'date'])
+        queue = open_buys.get(code, [])
+        buy_date = queue.pop(0) if queue else pd.NaT
+        if not queue and code in open_buys:
+            del open_buys[code]
+        sell_buy_pairs.append({'_seq': row['_seq'], 'buy_date': buy_date})
 
-    sell_with_buy = sells.merge(
-        pos_df.groupby('code').last()[['buy_date']].reset_index(),
-        on='code', how='left'
-    )
+    buy_map = pd.DataFrame(sell_buy_pairs, columns=['_seq', 'buy_date'])
+    sell_with_buy = sells.merge(buy_map, on='_seq', how='left')
     sell_with_buy['buy_date_approx'] = sell_with_buy['date'] - pd.to_timedelta(
         sell_with_buy['hold_days'].clip(lower=1), unit='D'
     )
     sell_with_buy['buy_date_final'] = sell_with_buy['buy_date'].fillna(
         sell_with_buy['buy_date_approx']
     )
-
-    price_indexed = price_df.set_index(['date', 'code'])
 
     # 向量化：用 merge_asof 匹配买入日最近的交易日数据
     buy_day_info = sell_with_buy[['code', 'buy_date_final']].drop_duplicates()

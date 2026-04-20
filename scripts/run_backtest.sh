@@ -11,6 +11,7 @@ set -e
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SRC_DIR="$PROJECT_DIR/src"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
 TODAY=$(date +%Y-%m-%d)
 START_TIME=$(date +%s)
@@ -23,37 +24,37 @@ echo "=============================================="
 # Step 1: 增量更新数据
 echo ""
 echo "[Step 1/7] 增量更新数据..."
-python "$SRC_DIR/py00_fetch_stock_data.py"
+"$PYTHON_BIN" "$SRC_DIR/py00_fetch_stock_data.py"
 
 # Step 2: 数据清洗（全量）
 echo ""
 echo "[Step 2/7] 数据清洗..."
-python "$SRC_DIR/py01_data_clean.py"
+"$PYTHON_BIN" "$SRC_DIR/py01_data_clean.py"
 
 # Step 3: 特征工程（全量）
 echo ""
 echo "[Step 3/7] 特征工程..."
-python "$SRC_DIR/py02_features.py"
+"$PYTHON_BIN" "$SRC_DIR/py02_features.py"
 
 # Step 4: 全量 walk-forward 训练 + 预测
 echo ""
 echo "[Step 4/7] Walk-Forward 训练与预测..."
-python "$SRC_DIR/py03_model.py"
+"$PYTHON_BIN" "$SRC_DIR/py03_model.py"
 
 # Step 5: 回测报告
 echo ""
 echo "[Step 5/7] 生成回测报告..."
-python "$SRC_DIR/py05_backtest.py"
+"$PYTHON_BIN" "$SRC_DIR/py05_backtest.py"
 
 # Step 6: 可视化图表
 echo ""
 echo "[Step 6/7] 生成可视化图表..."
-python "$SRC_DIR/py06_report.py"
+"$PYTHON_BIN" "$SRC_DIR/py06_report.py"
 
 # Step 7: 生成策略报告（含历史归档）
 echo ""
 echo "[Step 7/7] 生成今日交易策略报告..."
-python "$SRC_DIR/py04_today.py"
+"$PYTHON_BIN" "$SRC_DIR/py04_today.py"
 
 echo ""
 echo "=============================================="
