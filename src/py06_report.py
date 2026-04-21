@@ -232,10 +232,16 @@ def plot_monthly_returns(daily_df: pd.DataFrame):
     daily = daily_df.copy()
     daily['date'] = pd.to_datetime(daily['date'])
     daily['daily_return'] = daily['portfolio_value'].pct_change()
+    daily['year'] = daily['date'].dt.year
+    daily['month'] = daily['date'].dt.month
 
-    monthly = daily.groupby([daily['date'].dt.year, daily['date'].dt.month])['daily_return'].apply(
-        lambda x: (1 + x).prod() - 1
-    ).unstack(fill_value=0)
+    monthly = (
+        (1 + daily['daily_return'])
+        .groupby([daily['year'], daily['month']])
+        .prod()
+        .sub(1)
+        .unstack(fill_value=0)
+    )
 
     fig, ax = plt.subplots(figsize=(14, 5))
     im = ax.imshow(monthly.values * 100, cmap='RdYlGn_r', aspect='auto', vmin=-10, vmax=10)
@@ -324,36 +330,29 @@ def plot_feature_importance(model_path=None):
 def _load_trade_features():
     """加载卖出交易并关联买入日股票特征"""
     trade_path = os.path.join(BACKTEST_OUTPUT_DIR, 'trade_log.csv')
+    print("  读取交易日志...")
     trade_df = pd.read_csv(trade_path, parse_dates=['date'])
     trade_df = trade_df.reset_index(drop=False).rename(columns={'index': '_seq'})
     sells = trade_df[trade_df['action'] == 'SELL'].copy()
     if sells.empty:
         return None
 
-    price_df = pd.read_pickle(CLEAN_PKL)
-    price_df['date'] = pd.to_datetime(price_df['date'])
-
-    # 按交易流水为每笔 SELL 绑定其对应 BUY（同 code 的先买先卖）。
-    open_buys = {}
-    sell_buy_pairs = []
     ordered_trades = trade_df.sort_values(['date', '_seq']).reset_index(drop=True)
-    for _, row in ordered_trades.iterrows():
-        code = row['code']
-        action = row['action']
-        if action == 'BUY':
-            open_buys.setdefault(code, []).append(row['date'])
-            continue
-        if action != 'SELL':
-            continue
+    # 向量化：同一只股票按时间顺序，第 N 笔 SELL 对应第 N 笔 BUY（FIFO）。
+    buys = ordered_trades[ordered_trades['action'] == 'BUY'][['code', 'date']].copy()
+    buys['pair_idx'] = buys.groupby('code').cumcount()
+    buys = buys.rename(columns={'date': 'buy_date'})
 
-        queue = open_buys.get(code, [])
-        buy_date = queue.pop(0) if queue else pd.NaT
-        if not queue and code in open_buys:
-            del open_buys[code]
-        sell_buy_pairs.append({'_seq': row['_seq'], 'buy_date': buy_date})
+    sells_ordered = ordered_trades[ordered_trades['action'] == 'SELL'][['_seq', 'code']].copy()
+    sells_ordered['pair_idx'] = sells_ordered.groupby('code').cumcount()
 
-    buy_map = pd.DataFrame(sell_buy_pairs, columns=['_seq', 'buy_date'])
+    buy_map = sells_ordered.merge(
+        buys,
+        on=['code', 'pair_idx'],
+        how='left'
+    )[['_seq', 'buy_date']]
     sell_with_buy = sells.merge(buy_map, on='_seq', how='left')
+    sell_with_buy['code'] = sell_with_buy['code'].astype('string')
     sell_with_buy['buy_date_approx'] = sell_with_buy['date'] - pd.to_timedelta(
         sell_with_buy['hold_days'].clip(lower=1), unit='D'
     )
@@ -364,34 +363,65 @@ def _load_trade_features():
     # 向量化：用 merge_asof 匹配买入日最近的交易日数据
     buy_day_info = sell_with_buy[['code', 'buy_date_final']].drop_duplicates()
     buy_day_info = buy_day_info.rename(columns={'buy_date_final': 'date'})
+    if buy_day_info.empty:
+        return sell_with_buy
 
-    # merge_asof 要求 on 列全局有序，按 code 分组处理
-    price_subset = price_df[['code', 'date', 'turn', 'amount', 'peTTM', 'pbMRQ', 'close']].copy()
-    merged_parts = []
-    for code, grp in buy_day_info.groupby('code'):
-        grp_sorted = grp.sort_values('date')
-        price_code = price_subset[price_subset['code'] == code][['date', 'turn', 'amount', 'peTTM', 'pbMRQ', 'close']].sort_values('date')
-        part = pd.merge_asof(grp_sorted, price_code, on='date', direction='backward')
-        merged_parts.append(part)
-    merged_buy = pd.concat(merged_parts, ignore_index=True) if merged_parts else pd.DataFrame()
-    merged_buy = merged_buy.rename(columns={'date': 'buy_date_final'})
+    relevant_codes = buy_day_info['code'].dropna().unique().tolist()
+    lookup_end = buy_day_info['date'].max()
+    # 波动率需要向前保留一段缓冲窗口，避免 20 日滚动统计缺样本。
+    lookup_start = buy_day_info['date'].min() - pd.Timedelta(days=120)
+
+    print(
+        f"  加载买入日行情特征... {len(relevant_codes)} 只股票，"
+        f"{lookup_start.date()} ~ {lookup_end.date()}"
+    )
+    price_df = pd.read_pickle(CLEAN_PKL)
+    price_df = price_df[['code', 'date', 'turn', 'amount', 'peTTM', 'pbMRQ', 'close', 'pctChg']]
+    price_df['date'] = pd.to_datetime(price_df['date'])
+    price_df['code'] = price_df['code'].astype('string')
+    buy_day_info['code'] = buy_day_info['code'].astype('string')
+    price_df = price_df[
+        price_df['code'].isin(relevant_codes)
+        & price_df['date'].between(lookup_start, lookup_end)
+    ].sort_values(['date', 'code']).reset_index(drop=True)
+    buy_day_info = buy_day_info.sort_values(['date', 'code']).reset_index(drop=True)
+
+    if price_df.empty:
+        print("  未匹配到买入日行情特征，跳过交易分析")
+        return sell_with_buy
+
+    print(f"  行情样本裁剪后剩余 {len(price_df):,} 行")
+
+    price_lookup = price_df[['code', 'date', 'turn', 'amount', 'peTTM', 'pbMRQ', 'close']]
+    merged_buy = pd.merge_asof(
+        buy_day_info,
+        price_lookup,
+        on='date',
+        by='code',
+        direction='backward'
+    ).rename(columns={'date': 'buy_date_final'})
+    if merged_buy.empty:
+        print("  买入日未匹配到可用行情，跳过交易分析")
+        return sell_with_buy
 
     # 计算20日波动率（向量化）
-    vol_df = price_df.sort_values(['code', 'date']).copy()
-    vol_df['vol_20'] = vol_df.groupby('code')['pctChg'].transform(
+    print("  计算20日波动率...")
+    price_df['f_vol_20'] = price_df.groupby('code', sort=False)['pctChg'].transform(
         lambda x: x.rolling(20, min_periods=10).std()
     )
-    vol_subset = vol_df[['code', 'date', 'vol_20']].copy()
-    vol_subset = vol_subset.rename(columns={'date': 'buy_date_final', 'vol_20': 'f_vol_20'})
-
-    # merge_asof 要求 on 列全局有序，按 code 分组处理
-    vol_parts = []
-    for code, grp in merged_buy.groupby('code'):
-        grp_sorted = grp.sort_values('buy_date_final')
-        vol_code = vol_subset[vol_subset['code'] == code].sort_values('buy_date_final')
-        part = pd.merge_asof(grp_sorted, vol_code[['buy_date_final', 'f_vol_20']], on='buy_date_final', direction='backward')
-        vol_parts.append(part)
-    merged_buy = pd.concat(vol_parts, ignore_index=True) if vol_parts else pd.DataFrame()
+    vol_lookup = (
+        price_df[['code', 'date', 'f_vol_20']]
+        .rename(columns={'date': 'buy_date_final'})
+        .sort_values(['buy_date_final', 'code'])
+        .reset_index(drop=True)
+    )
+    merged_buy = pd.merge_asof(
+        merged_buy.sort_values(['buy_date_final', 'code']).reset_index(drop=True),
+        vol_lookup,
+        on='buy_date_final',
+        by='code',
+        direction='backward'
+    )
 
     merged_buy = merged_buy.rename(columns={
         'turn': 'f_turn', 'amount': 'f_amount',
@@ -409,11 +439,12 @@ def _plot_group_analysis(data, col, bins, labels, title, filename):
     """通用分组分析绘图"""
     data = data.copy()
     data['group'] = pd.cut(data[col], bins=bins, labels=labels, include_lowest=True)
+    data['is_win'] = data['profit_pct'] > 0
     data = data.dropna(subset=['group', 'profit_pct'])
 
     grouped = data.groupby('group', observed=True).agg(
         count=('profit_pct', 'size'),
-        win_rate=('profit_pct', lambda x: (x > 0).mean()),
+        win_rate=('is_win', 'mean'),
         avg_return=('profit_pct', 'mean'),
         avg_profit=('profit', 'mean'),
     ).reset_index()
@@ -528,9 +559,11 @@ def _plot_sell_reason_analysis(data):
     if 'reason' not in data.columns:
         return
 
-    grouped = data.groupby('reason').agg(
+    reason_df = data.copy()
+    reason_df['is_win'] = reason_df['profit_pct'] > 0
+    grouped = reason_df.groupby('reason').agg(
         count=('profit_pct', 'size'),
-        win_rate=('profit_pct', lambda x: (x > 0).mean()),
+        win_rate=('is_win', 'mean'),
         avg_return=('profit_pct', 'mean'),
         total_profit=('profit', 'sum'),
     ).sort_values('count', ascending=False).reset_index()
@@ -617,9 +650,10 @@ def _save_analysis_summary(data):
             continue
         tmp = data.copy()
         tmp['group'] = pd.cut(tmp[col], bins=bins, labels=labels, include_lowest=True)
+        tmp['is_win'] = tmp['profit_pct'] > 0
         tmp = tmp.dropna(subset=['group', 'profit_pct'])
         grp = tmp.groupby('group', observed=True).agg(
-            wr=('profit_pct', lambda x: (x > 0).mean()),
+            wr=('is_win', 'mean'),
             avg=('profit_pct', 'mean'),
             cnt=('profit_pct', 'size'),
         )
