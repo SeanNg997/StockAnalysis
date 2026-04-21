@@ -40,6 +40,18 @@ KLINE_FIELDS = (
     "date,open,high,low,close,preclose,volume,amount,turn,pctChg,"
     "isST,tradestatus,peTTM,pbMRQ,psTTM,pcfNcfTTM"
 )
+DIVIDEND_CACHE_REQUIRED_COLS = {
+    "code",
+    "dividOperateDate",
+    "dividPlanDate",
+    "dividCashPsBeforeTax",
+    "dividStocksPs",
+    "dividReserveToStockPs",
+}
+ADJUST_FACTOR_CACHE_REQUIRED_COLS = {
+    "code",
+    "dividOperateDate",
+}
 
 
 def get_expected_latest_date() -> str:
@@ -164,6 +176,13 @@ def save_action_cache(df: pd.DataFrame, path: str, subset: list[str]) -> None:
         return
     df = df.drop_duplicates(subset=subset, keep="last").sort_values(subset).reset_index(drop=True)
     df.to_pickle(path)
+
+
+def has_valid_action_cache(path: str, required_cols: set[str]) -> bool:
+    if not os.path.exists(path):
+        return False
+    df = load_action_cache(path)
+    return (df is not None) and (not df.empty) and required_cols.issubset(df.columns)
 
 
 def get_stock_list():
@@ -332,49 +351,58 @@ def _update_max_date(current: Optional[str], batch: pd.DataFrame) -> str:
     return batch_max if current is None else max(current, batch_max)
 
 
-def _refresh_action_tables(codes: list[str], expected_latest_date: str) -> None:
-    if not codes:
+def _refresh_action_tables(
+    codes: list[str],
+    expected_latest_date: str,
+    refresh_adjust_factors: bool = False,
+    refresh_dividends: bool = True,
+) -> None:
+    if not codes or (not refresh_adjust_factors and not refresh_dividends):
         return
 
     print("=" * 50)
     print("刷新复权因子与分红事件")
     print("=" * 50)
 
-    existing_factors = load_action_cache(ADJUST_FACTOR_PKL)
-    existing_dividends = load_action_cache(DIVIDEND_PKL)
+    existing_factors = load_action_cache(ADJUST_FACTOR_PKL) if refresh_adjust_factors else pd.DataFrame()
+    existing_dividends = load_action_cache(DIVIDEND_PKL) if refresh_dividends else pd.DataFrame()
     start_year = datetime.strptime(START_DATE, "%Y-%m-%d").year
     end_year = datetime.strptime(expected_latest_date, "%Y-%m-%d").year
 
     factor_chunks = []
     dividend_chunks = []
     for idx, code in enumerate(tqdm(codes, desc="公司行为数据", ncols=80), start=1):
-        factor_df = fetch_adjust_factors(code, start_date=START_DATE, end_date=expected_latest_date)
-        if not factor_df.empty:
-            factor_chunks.append(factor_df)
+        if refresh_adjust_factors:
+            factor_df = fetch_adjust_factors(code, start_date=START_DATE, end_date=expected_latest_date)
+            if not factor_df.empty:
+                factor_chunks.append(factor_df)
 
-        dividend_df = fetch_dividend_events(code, start_year=start_year, end_year=end_year)
-        if not dividend_df.empty:
-            dividend_chunks.append(dividend_df)
+        if refresh_dividends:
+            dividend_df = fetch_dividend_events(code, start_year=start_year, end_year=end_year)
+            if not dividend_df.empty:
+                dividend_chunks.append(dividend_df)
 
         if idx % SAVE_EVERY == 0:
-            if factor_chunks:
+            if refresh_adjust_factors and factor_chunks:
                 existing_factors = pd.concat([existing_factors, *factor_chunks], ignore_index=True)
                 factor_chunks = []
                 save_action_cache(existing_factors, ADJUST_FACTOR_PKL, ["code", "dividOperateDate"])
-            if dividend_chunks:
+            if refresh_dividends and dividend_chunks:
                 existing_dividends = pd.concat([existing_dividends, *dividend_chunks], ignore_index=True)
                 dividend_chunks = []
                 save_action_cache(existing_dividends, DIVIDEND_PKL, ["code", "dividOperateDate", "dividPlanDate"])
 
-    if factor_chunks:
+    if refresh_adjust_factors and factor_chunks:
         existing_factors = pd.concat([existing_factors, *factor_chunks], ignore_index=True)
-    if dividend_chunks:
+    if refresh_dividends and dividend_chunks:
         existing_dividends = pd.concat([existing_dividends, *dividend_chunks], ignore_index=True)
 
-    save_action_cache(existing_factors, ADJUST_FACTOR_PKL, ["code", "dividOperateDate"])
-    save_action_cache(existing_dividends, DIVIDEND_PKL, ["code", "dividOperateDate", "dividPlanDate"])
-    print(f"✅ 复权因子已保存至 {ADJUST_FACTOR_PKL}")
-    print(f"✅ 分红事件已保存至 {DIVIDEND_PKL}")
+    if refresh_adjust_factors:
+        save_action_cache(existing_factors, ADJUST_FACTOR_PKL, ["code", "dividOperateDate"])
+        print(f"✅ 复权因子已保存至 {ADJUST_FACTOR_PKL}")
+    if refresh_dividends:
+        save_action_cache(existing_dividends, DIVIDEND_PKL, ["code", "dividOperateDate", "dividPlanDate"])
+        print(f"✅ 分红事件已保存至 {DIVIDEND_PKL}")
 
 
 def _print_code_sample(title: str, codes: list[str], limit: int = 10) -> None:
@@ -437,8 +465,17 @@ def main(full: bool = False):
                 elif last_date < expected_latest_date:
                     pending_update.append((code, name, last_date))
 
-            needs_action_bootstrap = not os.path.exists(ADJUST_FACTOR_PKL) or not os.path.exists(DIVIDEND_PKL)
-            if not pending_update and not pending_full and not needs_action_bootstrap:
+            has_valid_dividend_cache = has_valid_action_cache(DIVIDEND_PKL, DIVIDEND_CACHE_REQUIRED_COLS)
+            has_valid_adjust_factor_cache = has_valid_action_cache(
+                ADJUST_FACTOR_PKL,
+                ADJUST_FACTOR_CACHE_REQUIRED_COLS,
+            )
+            needs_dividend_bootstrap = not has_valid_dividend_cache
+            if needs_dividend_bootstrap:
+                print("未检测到可用的分红事件缓存，将补抓 dividend_events.pkl")
+            elif not has_valid_adjust_factor_cache:
+                print("未检测到可用的复权因子缓存，但当前主流程不依赖它，跳过 adjust_factors.pkl 全量补抓")
+            if not pending_update and not pending_full and not needs_dividend_bootstrap:
                 print("✅ 所有股票已是最新状态，无需更新。")
                 save_dataset_meta(expected_latest_date)
                 return
@@ -503,10 +540,15 @@ def main(full: bool = False):
                 with open(os.path.join(DATA_DIR, ".last_date.txt"), "w", encoding="utf-8") as fp:
                     fp.write(str(max_new_date))
 
-            if needs_action_bootstrap:
+            if needs_dividend_bootstrap:
                 codes_for_actions = [code for code, _, _, _, is_delisted in stock_list if not is_delisted]
 
-            _refresh_action_tables(sorted(set(codes_for_actions)), expected_latest_date)
+            _refresh_action_tables(
+                sorted(set(codes_for_actions)),
+                expected_latest_date,
+                refresh_adjust_factors=has_valid_adjust_factor_cache,
+                refresh_dividends=True,
+            )
             save_dataset_meta(expected_latest_date)
             print(f"\n✅ 增量更新完成! 成功更新股票 {update_count} 只, 新增股票 {new_count} 只")
             if skip_delisted_no_data:
@@ -558,7 +600,12 @@ def main(full: bool = False):
                 fp.write(str(latest))
 
         active_codes = [code for code, _, _, _, is_delisted in stock_list if not is_delisted]
-        _refresh_action_tables(active_codes, expected_latest_date)
+        _refresh_action_tables(
+            active_codes,
+            expected_latest_date,
+            refresh_adjust_factors=True,
+            refresh_dividends=True,
+        )
         save_dataset_meta(expected_latest_date)
 
         files = sorted(glob.glob(os.path.join(DATA_DIR, "Stock_dailyK_*.csv")))

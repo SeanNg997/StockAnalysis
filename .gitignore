@@ -14,6 +14,9 @@ data/.download_status.txt
 # 保留追踪
 !data/.gitkeep
 !data/.last_date.txt
+!data/.dataset_meta.json
+!data/dividend_events.pkl
+!data/adjust_factors.pkl
 
 # Claude Code 本地环境
 .claude/
