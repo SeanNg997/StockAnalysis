@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib import font_manager
 import os
+from pathlib import Path
 import warnings
 
 from config import CONFIG
@@ -18,19 +19,88 @@ PREFERRED_CJK_FONTS = [
     'Hiragino Sans GB',
     'PingFang SC',
     'STHeiti',
+    'Heiti SC',
     'Songti SC',
     'Arial Unicode MS',
     'WenQuanYi Micro Hei',
     'Noto Sans CJK SC',
     'Noto Sans Mono CJK SC',
+    'Source Han Sans SC',
+    'Source Han Serif SC',
     'SimHei',
     'Microsoft YaHei',
+    'Microsoft YaHei UI',
+    'SimSun',
+]
+
+PREFERRED_CJK_FONT_PATHS = [
+    # macOS
+    '/System/Library/Fonts/PingFang.ttc',
+    '/System/Library/Fonts/Hiragino Sans GB.ttc',
+    '/System/Library/Fonts/STHeiti Light.ttc',
+    '/System/Library/Fonts/STHeiti Medium.ttc',
+    '/System/Library/Fonts/Supplemental/Songti.ttc',
+    '/System/Library/Fonts/Supplemental/Arial Unicode.ttf',
+    # Windows
+    'C:/Windows/Fonts/msyh.ttc',
+    'C:/Windows/Fonts/msyhbd.ttc',
+    'C:/Windows/Fonts/msyhl.ttc',
+    'C:/Windows/Fonts/simhei.ttf',
+    'C:/Windows/Fonts/simsun.ttc',
+    # WSL / mounted Windows fonts
+    '/mnt/c/Windows/Fonts/msyh.ttc',
+    '/mnt/c/Windows/Fonts/msyhbd.ttc',
+    '/mnt/c/Windows/Fonts/msyhl.ttc',
+    '/mnt/c/Windows/Fonts/simhei.ttf',
+    '/mnt/c/Windows/Fonts/simsun.ttc',
+    # Linux
+    '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+    '/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc',
+    '/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc',
+    '/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc',
+    '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
+    '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
 ]
 
 
+def _iter_cjk_font_paths():
+    env_paths = os.environ.get('REPORT_CJK_FONT_PATHS', '')
+    candidates = [p for p in env_paths.split(os.pathsep) if p] + PREFERRED_CJK_FONT_PATHS
+    seen = set()
+
+    for raw_path in candidates:
+        path = Path(raw_path).expanduser()
+        normalized = str(path)
+        if normalized in seen or not path.exists():
+            continue
+        seen.add(normalized)
+        yield path
+
+
+def _register_cjk_fonts():
+    font_sources = {}
+
+    for font_path in _iter_cjk_font_paths():
+        try:
+            font_manager.fontManager.addfont(str(font_path))
+            font_name = font_manager.FontProperties(fname=str(font_path)).get_name()
+        except Exception as exc:
+            print(f"跳过字体文件 {font_path}: {exc}")
+            continue
+
+        font_sources.setdefault(font_name, str(font_path))
+
+    return font_sources
+
+
 def _configure_matplotlib_fonts():
+    font_sources = _register_cjk_fonts()
     available_fonts = {font.name for font in font_manager.fontManager.ttflist}
-    selected_fonts = [font for font in PREFERRED_CJK_FONTS if font in available_fonts]
+    selected_fonts = []
+
+    for font_name in list(font_sources) + PREFERRED_CJK_FONTS:
+        if font_name in available_fonts and font_name not in selected_fonts:
+            selected_fonts.append(font_name)
 
     # 动态选择本机存在的中文字体，避免反复触发 findfont 告警。
     plt.rcParams['font.family'] = 'sans-serif'
@@ -38,7 +108,12 @@ def _configure_matplotlib_fonts():
     plt.rcParams['axes.unicode_minus'] = False
 
     if selected_fonts:
-        print(f"使用中文字体: {selected_fonts[0]}")
+        selected_font = selected_fonts[0]
+        selected_source = font_sources.get(selected_font)
+        if selected_source:
+            print(f"使用中文字体: {selected_font} ({selected_source})")
+        else:
+            print(f"使用中文字体: {selected_font}")
     else:
         print("未找到本机中文字体，回退到 DejaVu Sans")
 
