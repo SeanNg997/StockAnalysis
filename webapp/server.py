@@ -82,7 +82,7 @@ TASKS: dict[str, TaskDefinition] = {
     "train_model": TaskDefinition(
         id="train_model",
         name="训练模型",
-        description="运行 py03，执行 Walk-Forward 训练和预测。",
+        description="运行 py03，按 config 中的固定回测起点执行 Walk-Forward 训练和预测。",
         category="模型与策略",
         accent="blue",
         command=_python_task("py03_model.py"),
@@ -98,7 +98,7 @@ TASKS: dict[str, TaskDefinition] = {
     "run_backtest": TaskDefinition(
         id="run_backtest",
         name="运行回测",
-        description="运行 py05，并在页面中实时刷新收益曲线。",
+        description="运行 py05，按 config 中的固定回测起点回测，并在页面中实时刷新收益曲线。",
         category="回测与报告",
         accent="rose",
         command=_python_task("py05_backtest.py"),
@@ -115,7 +115,7 @@ TASKS: dict[str, TaskDefinition] = {
     "full_pipeline": TaskDefinition(
         id="full_pipeline",
         name="完整回测流水线",
-        description="依次执行：抓数据 → 清洗 → 特征 → 训练 → 回测 → 图表。",
+        description="依次执行：抓数据 → 清洗 → 特征 → 训练 → 回测 → 图表，回测区间由 config 中的起始年份控制。",
         category="一键任务",
         accent="crimson",
         steps=["fetch_data", "clean_data", "build_features", "train_model", "run_backtest", "build_report"],

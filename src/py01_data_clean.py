@@ -1,252 +1,348 @@
-"""数据加载与清洗 — 加载CSV、剔除ST/停牌/新股、流动性过滤"""
+"""数据加载与清洗 — 原始行情主表 + 市场执行快照"""
 
-import pandas as pd
-import numpy as np
+from __future__ import annotations
+
+import gc
+import glob
+import json
 import os
 import warnings
-import gc
+
+import numpy as np
+import pandas as pd
+
 from config import CONFIG
-warnings.filterwarnings('ignore')
 
-BASE_DIR = CONFIG['paths']['BASE_DIR']
-DATA_DIR = CONFIG['paths']['DATA_DIR']
-STOCK_LIST_CSV = CONFIG['paths']['STOCK_LIST_CSV']
-TRADE_DAYS_TXT = CONFIG['paths']['TRADE_DAYS_TXT']
-CLEAN_PKL = CONFIG['paths']['CLEAN_PKL']
-MARKET_PKL = CONFIG['paths']['MARKET_PKL']
-BACKTEST_MARKET_PKL = CONFIG['paths'].get('BACKTEST_MARKET_PKL')
+warnings.filterwarnings("ignore")
 
-BACKTEST_YEARS = CONFIG['model'].get('BACKTEST_YEARS', 3)
+DATA_DIR = CONFIG["paths"]["DATA_DIR"]
+STOCK_LIST_CSV = CONFIG["paths"]["STOCK_LIST_CSV"]
+TRADE_DAYS_TXT = CONFIG["paths"]["TRADE_DAYS_TXT"]
+CLEAN_PKL = CONFIG["paths"]["CLEAN_PKL"]
+MARKET_PKL = CONFIG["paths"]["MARKET_PKL"]
+BACKTEST_MARKET_PKL = CONFIG["paths"].get("BACKTEST_MARKET_PKL")
+DATA_META_JSON = CONFIG["paths"].get("DATA_META_JSON")
+
+BACKTEST_START_YEAR = int(CONFIG["model"].get("BACKTEST_START_YEAR", 2023))
 BACKTEST_HISTORY_BUFFER_DAYS = max(
-    CONFIG['backtest'].get('MIN_PRICE_DAYS', 5),
-    30,  # 保留额外交易日，避免回测起始窗口因历史不足导致行为变化
+    int(CONFIG["backtest"].get("MIN_PRICE_DAYS", 5)),
+    30,
 )
+
+REQUIRED_RAW_COLS = {
+    "code",
+    "name",
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "preclose",
+    "volume",
+    "amount",
+    "turn",
+    "pctChg",
+    "isST",
+    "isTrading",
+    "peTTM",
+    "pbMRQ",
+    "psTTM",
+    "pcfNcfTTM",
+}
 
 
 def load_raw_data() -> pd.DataFrame:
-    """加载所有月度CSV合并返回"""
-    import glob as _glob
-    print("[1/3] 加载月度CSV数据...")
-    files = sorted(_glob.glob(os.path.join(DATA_DIR, 'Stock_dailyK_*.csv')))
+    """加载所有月度 CSV 并合并。"""
+    print("[1/4] 加载月度 CSV 数据...")
+    files = sorted(glob.glob(os.path.join(DATA_DIR, "Stock_dailyK_*.csv")))
     if not files:
-        raise FileNotFoundError(f"未找到月度CSV文件 (Stock_dailyK_*.csv) in {DATA_DIR}")
-    
-    dfs = [pd.read_csv(f, encoding='utf-8-sig') for f in files]
+        raise FileNotFoundError(f"未找到月度 CSV 文件: {DATA_DIR}/Stock_dailyK_*.csv")
+
+    dfs = [pd.read_csv(path, encoding="utf-8-sig") for path in files]
     df = pd.concat(dfs, ignore_index=True)
     del dfs
     gc.collect()
-    
-    print(f"  共读取到 {len(files)} 个月度文件（共 {df['code'].nunique()} 只股票）")
-    print(f"  交易日范围: {df['date'].min()} ~ {df['date'].max()}")
+
+    missing = REQUIRED_RAW_COLS.difference(df.columns)
+    if missing:
+        raise ValueError(
+            "原始行情缺少字段: "
+            f"{sorted(missing)}。当前本地 CSV 仍是旧版前复权数据，"
+            "请先运行 `python src/py00_fetch_stock_data.py` 让程序自动切换到原始行情重建。"
+        )
+
+    print(f"  共读取 {len(files)} 个月度文件")
+    print(f"  股票数: {df['code'].nunique()} 只")
+    print(f"  日期范围: {df['date'].min()} ~ {df['date'].max()}")
     return df
 
 
-def build_market_status(df: pd.DataFrame, end_date=None):
-    """生成市场状态快照（不做过滤），用于执行日验证"""
-    cols = ['code', 'date', 'isST', 'isTrading', 'open', 'close', 'volume', 'amount']
-    market_df = df[cols].copy()
-    market_df['date'] = pd.to_datetime(market_df['date'])
+def _cache_has_required_schema(df: pd.DataFrame, required_cols: set[str]) -> bool:
+    return (df is not None) and (not df.empty) and required_cols.issubset(df.columns)
+
+
+def _load_dataset_meta() -> dict:
+    if not DATA_META_JSON or not os.path.exists(DATA_META_JSON):
+        return {}
+    try:
+        with open(DATA_META_JSON, "r", encoding="utf-8") as fp:
+            return json.load(fp)
+    except Exception:
+        return {}
+
+
+def _latest_csv_date() -> pd.Timestamp | None:
+    files = sorted(glob.glob(os.path.join(DATA_DIR, "Stock_dailyK_*.csv")))
+    if not files:
+        return None
+    latest = pd.read_csv(files[-1], encoding="utf-8-sig", usecols=["date"])
+    if latest.empty:
+        return None
+    return pd.to_datetime(latest["date"].max())
+
+
+def _expected_backtest_market_start_date(date_values) -> pd.Timestamp | None:
+    unique_dates = pd.DatetimeIndex(np.sort(pd.to_datetime(pd.Series(date_values)).dropna().unique()))
+    if len(unique_dates) == 0:
+        return None
+
+    target_start = pd.Timestamp(f"{BACKTEST_START_YEAR}-01-01")
+    start_trade_idx = unique_dates.searchsorted(target_start, side="left")
+    if start_trade_idx >= len(unique_dates):
+        return None
+
+    start_idx = max(0, start_trade_idx - BACKTEST_HISTORY_BUFFER_DAYS)
+    return unique_dates[start_idx]
+
+
+def _build_backtest_market_status(market_df: pd.DataFrame) -> pd.DataFrame:
+    """按固定回测起始年份构建执行市场快照，并保留少量历史缓冲。"""
+    if market_df.empty:
+        return market_df.copy()
+
+    expected_start = _expected_backtest_market_start_date(market_df["date"])
+    if expected_start is None:
+        raise ValueError(
+            f"配置的 BACKTEST_START_YEAR={BACKTEST_START_YEAR} 超出数据范围，"
+            f"当前最新交易日为 {pd.to_datetime(market_df['date']).max().date()}"
+        )
+
+    return market_df.loc[market_df["date"] >= expected_start].copy()
+
+
+def build_market_status(raw_df: pd.DataFrame, end_date=None) -> pd.DataFrame:
+    """生成执行层市场状态快照，保留原始价格口径。"""
+    print("[2/4] 生成市场状态快照...")
+    cols = ["code", "date", "isST", "isTrading", "open", "close", "preclose", "volume", "amount"]
+    market_df = raw_df[cols].copy()
+    market_df["date"] = pd.to_datetime(market_df["date"])
 
     if end_date is not None:
-        market_df = market_df[market_df['date'] <= pd.Timestamp(end_date)]
+        market_df = market_df.loc[market_df["date"] <= pd.Timestamp(end_date)].copy()
 
+    market_df = market_df.sort_values(["date", "code"]).reset_index(drop=True)
     os.makedirs(os.path.dirname(MARKET_PKL), exist_ok=True)
     market_df.to_pickle(MARKET_PKL)
 
     if BACKTEST_MARKET_PKL:
-        backtest_market_df = _build_backtest_market_status(market_df)
+        bt_market_df = _build_backtest_market_status(market_df)
         os.makedirs(os.path.dirname(BACKTEST_MARKET_PKL), exist_ok=True)
-        backtest_market_df.to_pickle(BACKTEST_MARKET_PKL)
+        bt_market_df.to_pickle(BACKTEST_MARKET_PKL)
 
+    print(f"  市场快照: {len(market_df):,} 行")
     return market_df
 
 
-def _build_backtest_market_status(market_df: pd.DataFrame) -> pd.DataFrame:
-    """构建回测专用市场状态快照（最近N年 + 历史缓冲交易日）"""
-    if len(market_df) == 0:
-        return market_df.copy()
-
-    max_date = market_df['date'].max()
-    cutoff_date = max_date - pd.DateOffset(years=BACKTEST_YEARS)
-
-    unique_dates = pd.DatetimeIndex(
-        np.sort(pd.to_datetime(market_df['date']).unique())
-    )
-    cutoff_idx = unique_dates.searchsorted(pd.Timestamp(cutoff_date), side='left')
-    start_idx = max(0, cutoff_idx - BACKTEST_HISTORY_BUFFER_DAYS)
-    start_date = unique_dates[start_idx]
-
-    backtest_market_df = market_df[market_df['date'] >= start_date].copy()
-    return backtest_market_df
-
-
-def _is_backtest_market_ready(required_max_date: pd.Timestamp) -> bool:
-    """检查回测市场快照是否存在且日期覆盖到 required_max_date。"""
-    if not BACKTEST_MARKET_PKL:
-        return True
-    if not os.path.exists(BACKTEST_MARKET_PKL):
-        return False
-    try:
-        bt_cached = pd.read_pickle(BACKTEST_MARKET_PKL)
-        return (not bt_cached.empty) and bt_cached['date'].max() >= required_max_date
-    except Exception:
-        return False
-
-
 def add_is_new_flag(df: pd.DataFrame) -> pd.DataFrame:
-    """添加isNew字段，新股上市前30个交易日标记为1，其他为0"""
-    print("[2/3] 添加isNew字段...")
+    """添加新股标记，并补充行业字段。"""
+    print("[3/4] 添加 isNew 与行业字段...")
+    stock_list_df = pd.read_csv(STOCK_LIST_CSV, encoding="utf-8-sig")
+    stock_list_df["list_date"] = pd.to_datetime(stock_list_df["list_date"], errors="coerce")
 
-    stock_list_df = pd.read_csv(STOCK_LIST_CSV, encoding='utf-8-sig')
-    stock_list_df['list_date'] = pd.to_datetime(stock_list_df['list_date'])
-    trade_days = pd.read_csv(TRADE_DAYS_TXT, header=None, names=['date'])
-    trade_days['date'] = pd.to_datetime(trade_days['date'])
-    df['date'] = pd.to_datetime(df['date'])
-    
-    # Merge stock_list_df with industry columns
-    df = df.merge(stock_list_df[['code', 'list_date', 'industry', 'industryClassification']], on='code', how='left')
+    trade_days = pd.read_csv(TRADE_DAYS_TXT, header=None, names=["date"])
+    trade_days["date"] = pd.to_datetime(trade_days["date"], errors="coerce")
+    trade_dates = trade_days["date"].dropna().to_numpy()
 
-    # 向量化计算 cutoff_date
-    trade_dates = trade_days['date'].values
-    valid_mask = stock_list_df['list_date'].notna()
-    indices = trade_dates.searchsorted(stock_list_df.loc[valid_mask, 'list_date'].values, side='left')
-    # 第30个交易日的索引 = idx + 29
-    valid_indices = indices + 29
-    has_enough = valid_indices < len(trade_dates)
-    cutoff_dates = np.full(len(stock_list_df), None, dtype='datetime64[ns]')
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.merge(
+        stock_list_df[["code", "list_date", "industry", "industryClassification"]],
+        on="code",
+        how="left",
+    )
+
+    valid_mask = stock_list_df["list_date"].notna()
+    indices = trade_dates.searchsorted(stock_list_df.loc[valid_mask, "list_date"].to_numpy(), side="left")
+    cutoff_indices = indices + 29
+    cutoff_dates = np.full(len(stock_list_df), np.datetime64("NaT"), dtype="datetime64[ns]")
     valid_rows = stock_list_df.index[valid_mask]
-    cutoff_dates[valid_rows[has_enough]] = trade_dates[valid_indices[has_enough]]
+    in_range = cutoff_indices < len(trade_dates)
+    cutoff_dates[valid_rows[in_range]] = trade_dates[cutoff_indices[in_range]]
+    stock_list_df["cutoff_date"] = cutoff_dates
 
-    stock_list_df['cutoff_date'] = cutoff_dates
-    df = df.merge(stock_list_df[['code', 'cutoff_date']], on='code', how='left')
-    
-    # 添加isNew字段：前30个交易日标记为1，其他为0
-    df['isNew'] = 0
-    mask = df['cutoff_date'].notna() & (df['date'] <= df['cutoff_date'])
-    df.loc[mask, 'isNew'] = 1
-    
-    df = df.drop(columns=['list_date', 'cutoff_date'])
+    df = df.merge(stock_list_df[["code", "cutoff_date"]], on="code", how="left")
+    df["isNew"] = ((df["cutoff_date"].notna()) & (df["date"] <= df["cutoff_date"])).astype("int8")
+    df = df.drop(columns=["list_date", "cutoff_date"])
 
-    print(f"  isNew=1 的行数：{df['isNew'].sum():,} 行")
+    print(f"  isNew=1 行数: {int(df['isNew'].sum()):,}")
     return df
+
+
+def _ffill_with_long_gap_zero(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
+    """连续缺失 <=2 天前值填充，超过 2 天整段置 0。"""
+    out = df.sort_values(["code", "date"]).copy()
+    group = out.groupby("code", sort=False)
+
+    for col in numeric_cols:
+        original_missing = out[col].isna()
+        filled = group[col].transform(lambda s: s.ffill())
+        out[col] = filled
+
+        prev_not_missing = (~original_missing).groupby(out["code"]).cumsum()
+        miss_run_len = original_missing.groupby([out["code"], prev_not_missing]).transform("sum")
+        long_gap_mask = original_missing & (miss_run_len > 2)
+        out.loc[long_gap_mask, col] = 0.0
+
+    out[numeric_cols] = out[numeric_cols].fillna(0.0)
+    return out
 
 
 def handle_missing(df: pd.DataFrame) -> pd.DataFrame:
-    """缺失值处理：连续缺失小于等于2天用前值，否则全部设置为0"""
-    print("[3/3] 处理缺失值...")
-    numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount',
-                    'turn', 'pctChg', 'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM']
+    print("[4/4] 处理数值缺失...")
+    core_numeric_cols = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "amount",
+        "turn",
+        "pctChg",
+        "peTTM",
+        "pbMRQ",
+        "psTTM",
+        "pcfNcfTTM",
+    ]
+    tracked_cols = core_numeric_cols + ["preclose"]
+    before_missing = int(df[tracked_cols].isna().sum().sum())
+    df = _ffill_with_long_gap_zero(df, core_numeric_cols)
 
-    df = df.sort_values(['code', 'date'])
+    # preclose 用于涨跌停参考价与公司行为识别，缺失时宁可保留为空/置0，
+    # 不做前值填充，避免把除权日参考价错误传播到后续逻辑。
+    df["preclose"] = pd.to_numeric(df["preclose"], errors="coerce").fillna(0.0)
 
-    before_missing = df[numeric_cols].isna().sum().sum()
-    
-    # 对每个股票分组处理
-    for col in numeric_cols:
-        # 保存原始数据的副本
-        original_col = df[col].copy()
-
-        # 前值填充所有缺失值
-        df[col] = df.groupby('code')[col].transform(lambda x: x.ffill())
-        
-        # 找出所有连续缺失超过2天的缺失值组
-        # 对每个股票分组处理
-        for code, group in df.groupby('code'):
-            # 找出该股票的缺失值位置
-            missing_indices = group[original_col.isna()].index
-            if len(missing_indices) == 0:
-                continue
-            
-            # 计算连续缺失的起始和结束位置
-            consecutive_groups = []
-            current_start = missing_indices[0]
-            current_end = missing_indices[0]
-            
-            for i in range(1, len(missing_indices)):
-                if missing_indices[i] == missing_indices[i-1] + 1:
-                    current_end = missing_indices[i]
-                else:
-                    consecutive_groups.append((current_start, current_end))
-                    current_start = missing_indices[i]
-                    current_end = missing_indices[i]
-            consecutive_groups.append((current_start, current_end))
-            
-            # 对于连续缺失超过2天的组，将整个组设置为0
-            for start, end in consecutive_groups:
-                group_length = end - start + 1
-                if group_length > 2:
-                    df.loc[start:end, col] = 0
-
-    # 处理可能的剩余缺失值（如股票的第一个值）
-    df[numeric_cols] = df[numeric_cols].fillna(0)
-    final_missing = df[numeric_cols].isna().sum().sum()
-
+    after_missing = int(df[tracked_cols].isna().sum().sum())
     print(f"  原始缺失值: {before_missing:,}")
-    print(f"  处理后缺失值: {final_missing}")
+    print(f"  处理后缺失值: {after_missing:,}")
     return df
+
+
+def _cache_hit(end_date=None) -> pd.DataFrame | None:
+    if not (os.path.exists(CLEAN_PKL) and os.path.exists(MARKET_PKL)):
+        return None
+
+    try:
+        clean_df = pd.read_pickle(CLEAN_PKL)
+        market_df = pd.read_pickle(MARKET_PKL)
+    except Exception as exc:
+        print(f"  [缓存读取失败: {exc}]，继续重建...")
+        return None
+
+    required_clean_cols = REQUIRED_RAW_COLS.union({"industry", "industryClassification", "isNew"})
+    required_market_cols = {"code", "date", "isST", "isTrading", "open", "close", "preclose", "amount"}
+    if not _cache_has_required_schema(clean_df, required_clean_cols):
+        return None
+    if not _cache_has_required_schema(market_df, required_market_cols):
+        return None
+
+    if not pd.api.types.is_datetime64_any_dtype(clean_df["date"]):
+        clean_df["date"] = pd.to_datetime(clean_df["date"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(market_df["date"]):
+        market_df["date"] = pd.to_datetime(market_df["date"], errors="coerce")
+
+    meta = _load_dataset_meta()
+    if meta.get("dataset_version") and meta.get("dataset_version") != "raw_price_pt_v2":
+        return None
+
+    if end_date is not None:
+        target = pd.Timestamp(end_date)
+        if clean_df["date"].max() < target or market_df["date"].max() < target:
+            return None
+        if BACKTEST_MARKET_PKL and not os.path.exists(BACKTEST_MARKET_PKL):
+            return None
+        return clean_df.loc[clean_df["date"] <= target].copy()
+
+    latest_csv_date = _latest_csv_date()
+    if latest_csv_date is None:
+        return None
+    if clean_df["date"].max() != latest_csv_date:
+        return None
+    if market_df["date"].max() != latest_csv_date:
+        return None
+    if BACKTEST_MARKET_PKL:
+        if not os.path.exists(BACKTEST_MARKET_PKL):
+            return None
+        try:
+            bt_market_df = pd.read_pickle(BACKTEST_MARKET_PKL)
+            if not _cache_has_required_schema(bt_market_df, required_market_cols):
+                return None
+            if not pd.api.types.is_datetime64_any_dtype(bt_market_df["date"]):
+                bt_market_df["date"] = pd.to_datetime(bt_market_df["date"], errors="coerce")
+            if bt_market_df["date"].max() < latest_csv_date:
+                return None
+            expected_bt_start = _expected_backtest_market_start_date(market_df["date"])
+            if expected_bt_start is None:
+                return None
+            if bt_market_df["date"].min() > expected_bt_start:
+                return None
+        except Exception:
+            return None
+    return clean_df
 
 
 def run_pipeline(end_date=None) -> pd.DataFrame:
-    """执行完整数据清洗流水线"""
-    if os.path.exists(CLEAN_PKL):
-        try:
-            cached = pd.read_pickle(CLEAN_PKL)
-            cached_max = cached['date'].max()
+    cached = _cache_hit(end_date=end_date)
+    if cached is not None:
+        if end_date is not None:
+            print(f"✅ [缓存命中] {os.path.basename(CLEAN_PKL)} 已覆盖 {end_date}，跳过重建")
+        else:
+            max_date = pd.to_datetime(cached["date"]).max().date()
+            print(f"✅ [缓存命中] {os.path.basename(CLEAN_PKL)} 已是最新 ({max_date})，跳过重建")
+        return cached.sort_values(["date", "code"]).reset_index(drop=True)
 
-            if end_date is not None:
-                if cached_max >= pd.Timestamp(end_date):
-                    cached = cached[cached['date'] <= pd.Timestamp(end_date)]
-                    if os.path.exists(MARKET_PKL):
-                        mkt_cached = pd.read_pickle(MARKET_PKL)
-                        backtest_ready = _is_backtest_market_ready(pd.Timestamp(end_date))
-                        if mkt_cached['date'].max() >= pd.Timestamp(end_date) and backtest_ready:
-                            print(f"✅ [缓存命中] mainboard_clean.pkl 已包含 {end_date}，跳过重新生成")
-                            return cached
-            else:
-                import glob as _glob
-                csv_files = sorted(_glob.glob(os.path.join(DATA_DIR, 'Stock_dailyK_*.csv')))
-                if csv_files:
-                    latest_csv = pd.read_csv(csv_files[-1], encoding='utf-8-sig')
-                    csv_max_date = pd.to_datetime(latest_csv['date'].max())
-                    if cached_max == csv_max_date:
-                        if os.path.exists(MARKET_PKL):
-                            mkt_cached = pd.read_pickle(MARKET_PKL)
-                            backtest_ready = _is_backtest_market_ready(csv_max_date)
-                            if mkt_cached['date'].max() == csv_max_date and backtest_ready:
-                                print(f"✅ [缓存命中] mainboard_clean.pkl 已是最新 ({cached_max.date()})，跳过重新生成")
-                                return cached
-        except Exception as e:
-            print(f"  [缓存读取失败: {e}]，继续重新生成...")
-            pass
+    raw_df = load_raw_data()
+    raw_df["date"] = pd.to_datetime(raw_df["date"], errors="coerce")
+    raw_df = raw_df.sort_values(["date", "code"]).reset_index(drop=True)
 
-    df = load_raw_data()
-    build_market_status(df, end_date=end_date)
-    df = add_is_new_flag(df) 
+    build_market_status(raw_df, end_date=end_date)
+
+    df = add_is_new_flag(raw_df)
     df = handle_missing(df)
-    df = df.sort_values(['date', 'code']).reset_index(drop=True)
-    df['date'] = pd.to_datetime(df['date'])
 
     if end_date is not None:
-        df = df[df['date'] <= pd.Timestamp(end_date)].copy()
-        print(f"  [date filter] 数据截断至 {end_date}")
+        target = pd.Timestamp(end_date)
+        df = df.loc[df["date"] <= target].copy()
+        print(f"  [date filter] 数据截断至 {target.date()}")
 
+    df = df.sort_values(["date", "code"]).reset_index(drop=True)
     os.makedirs(os.path.dirname(CLEAN_PKL), exist_ok=True)
     df.to_pickle(CLEAN_PKL)
-    print(f"\n✅ 市场状态快照已保存至 {MARKET_PKL}")
+
+    print(f"\n✅ 清洗完成，保存至 {CLEAN_PKL}")
+    print(f"✅ 市场快照已保存至 {MARKET_PKL}")
     if BACKTEST_MARKET_PKL:
-        print(f"✅ 回测专用市场快照已保存至 {BACKTEST_MARKET_PKL} (最近{BACKTEST_YEARS}年+缓冲)")
-    print(f"✅ 清洗完成! 保存至 {CLEAN_PKL}")
+        print(f"✅ 回测市场快照已保存至 {BACKTEST_MARKET_PKL}")
     print(f"  最终数据: {df.shape[0]:,} 行, {df['code'].nunique()} 只股票")
     print(f"  日期范围: {df['date'].min().date()} ~ {df['date'].max().date()}")
-
     return df
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import sys as _sys
+
     _end_date = None
     _args = _sys.argv[1:]
-    if '--date' in _args:
-        _idx = _args.index('--date')
+    if "--date" in _args:
+        _idx = _args.index("--date")
         _end_date = _args[_idx + 1]
     run_pipeline(end_date=_end_date)

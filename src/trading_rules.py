@@ -239,7 +239,16 @@ def decide_sells(positions: dict, decision_data: pd.DataFrame) -> list:
 
         row = dec_by_code.loc[code]
         current_price = row['close']
-        profit_pct = (current_price - pos['buy_price']) / pos['buy_price']
+        basis_amount = float(pos.get('basis_amount', pos['shares'] * pos.get('buy_price', 0)))
+        buy_cost = float(pos.get('buy_cost', 0.0))
+        dividend_cash = float(pos.get('cash_dividends_received', 0.0))
+        total_basis = basis_amount + buy_cost
+        if total_basis > 0:
+            position_value = float(pos['shares']) * float(current_price) + dividend_cash
+            profit_pct = (position_value - total_basis) / total_basis
+        else:
+            buy_price = float(pos.get('buy_price', 0) or 0)
+            profit_pct = (current_price - buy_price) / buy_price if buy_price > 0 else 0.0
 
         # 优先级：止损 > 止盈 > 到期 > 信号反转
         if profit_pct <= STOP_LOSS:

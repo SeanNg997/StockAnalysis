@@ -32,8 +32,12 @@ OUTPUT_DIR = CONFIG["paths"]["OUTPUT_DIR"]
 
 TRAIN_YEARS = CONFIG["model"]["TRAIN_YEARS"]
 RETRAIN_DAYS = CONFIG["model"]["RETRAIN_DAYS"]
-BACKTEST_YEARS = CONFIG["model"]["BACKTEST_YEARS"]
+BACKTEST_START_YEAR = int(CONFIG["model"]["BACKTEST_START_YEAR"])
 HOLD_DAYS = CONFIG["model"]["HOLD_DAYS"]
+LGB_BASE_PARAMS = CONFIG["model"]["LGB_PARAMS"]
+LGB_FORMAL_CFG = CONFIG["model"]["LGB_FORMAL"]
+LGB_FAST_CFG = CONFIG["model"]["LGB_FAST"]
+LGB_FALLBACK_CFG = CONFIG["model"]["LGB_FALLBACK"]
 
 TOTAL_CPU = max(1, os.cpu_count() or 1)
 CPU_BUDGET = max(1, math.floor(TOTAL_CPU * 2 / 3))
@@ -139,6 +143,7 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
         "high",
         "low",
         "close",
+        "preclose",
         "volume",
         "amount",
         "turn",
@@ -156,6 +161,7 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
         "ma_10",
         "ma_20",
         "ma_60",
+        "pt_adjust_factor",
     }
     return [
         col for col in df.columns
@@ -360,7 +366,7 @@ def _build_lgb_params(
     fallback_mode: bool = False,
     n_jobs: Optional[int] = None,
 ) -> tuple[dict, int, Optional[int]]:
-    params = CONFIG["model"]["LGB_PARAMS"].copy()
+    params = LGB_BASE_PARAMS.copy()
     params.update({
         "metric": "mae",
         "n_jobs": n_jobs or CPU_BUDGET,
@@ -368,46 +374,42 @@ def _build_lgb_params(
         "seed": seed,
         "feature_fraction_seed": seed + 17,
         "bagging_seed": seed + 37,
+        "data_random_seed": seed + 57,
+        "drop_seed": seed + 77,
     })
 
+    mode_cfg = LGB_FORMAL_CFG
     if fast_mode:
-        params.update({
-            "learning_rate": 0.03,
-            "num_leaves": 31,
-            "max_depth": 5,
-            "feature_fraction": 0.72,
-            "bagging_fraction": 0.78,
-            "bagging_freq": 4,
-            "min_child_samples": 160,
-            "lambda_l1": 0.4,
-            "lambda_l2": 0.8,
-            "min_gain_to_split": 0.0,
-        })
-        return params, 320, 50
+        mode_cfg = LGB_FAST_CFG
+    elif fallback_mode:
+        mode_cfg = LGB_FALLBACK_CFG
 
-    if fallback_mode:
-        params.update({
-            "learning_rate": 0.05,
-            "feature_fraction": 0.85,
-            "bagging_fraction": 0.85,
-            "bagging_freq": 4,
-            "min_child_samples": 40,
-            "lambda_l1": 0.1,
-            "lambda_l2": 0.2,
-            "min_gain_to_split": 0.0,
-        })
-        return params, FALLBACK_BOOST_ROUNDS, None
+    params.update(mode_cfg.get("params", {}))
+    return (
+        params,
+        int(mode_cfg["num_boost_round"]),
+        mode_cfg.get("early_stopping_rounds"),
+    )
 
-    params.update({
-        "learning_rate": 0.015,
-        "feature_fraction": 0.72,
-        "bagging_fraction": 0.78,
-        "bagging_freq": 4,
-        "min_child_samples": 180,
-        "lambda_l1": 0.6,
-        "lambda_l2": 0.9,
-    })
-    return params, 2200, 160
+
+def resolve_backtest_start(
+    all_dates: list[pd.Timestamp],
+    logger: Optional[ProgressLogger] = None,
+) -> tuple[int, pd.Timestamp]:
+    target_start = pd.Timestamp(f"{BACKTEST_START_YEAR}-01-01")
+    idx = pd.Index(all_dates).searchsorted(target_start, side="left")
+    if idx >= len(all_dates):
+        raise ValueError(
+            f"配置的 BACKTEST_START_YEAR={BACKTEST_START_YEAR} 超出特征数据范围，"
+            f"当前最新交易日为 {all_dates[-1].date()}"
+        )
+    actual_start = all_dates[idx]
+    if logger is not None:
+        logger.log(
+            f"固定回测起始年份={BACKTEST_START_YEAR}，"
+            f"实际首个交易日={actual_start.date()}"
+        )
+    return idx, actual_start
 
 
 def _prepare_normalized_labels(y_train: pd.Series, y_val: pd.Series) -> tuple[pd.Series, pd.Series, float, float]:
@@ -1181,11 +1183,9 @@ def walk_forward_predict(
     checkpoint_every: int = DEFAULT_CHECKPOINT_EVERY,
 ) -> pd.DataFrame:
     logger.section("全量 Walk-Forward 模式")
-    max_date = pd.Timestamp(max(all_dates))
-    bt_start = max_date - pd.DateOffset(years=BACKTEST_YEARS)
-    bt_start_idx = next(i for i, d in enumerate(all_dates) if d >= bt_start)
+    bt_start_idx, bt_start_date = resolve_backtest_start(all_dates, logger=logger)
     logger.log(
-        f"回测预测区间: {all_dates[bt_start_idx].date()} ~ {all_dates[-1].date()} | "
+        f"回测预测区间: {bt_start_date.date()} ~ {all_dates[-1].date()} | "
         f"共 {len(all_dates) - bt_start_idx} 个交易日"
     )
 

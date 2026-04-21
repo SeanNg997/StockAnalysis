@@ -196,11 +196,11 @@ def plot_feature_importance(model_path=None):
         df = pd.read_pickle(FEATURE_PKL)
         recent = df[df['date'] >= '2024-01-01'].copy()
 
-        exclude = {'code', 'name', 'date', 'open', 'high', 'low', 'close',
+        exclude = {'code', 'name', 'date', 'open', 'high', 'low', 'close', 'preclose',
                     'volume', 'amount', 'turn', 'pctChg',
                     'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM', 'label',
                     'isST', 'isTrading',
-                    'ma_5', 'ma_10', 'ma_20', 'ma_60'}
+                    'ma_5', 'ma_10', 'ma_20', 'ma_60', 'pt_adjust_factor'}
         candidate_cols = [c for c in recent.columns if c not in exclude]
         numeric_cols = recent[candidate_cols].select_dtypes(include=[np.number, 'bool']).columns.tolist()
         skipped_cols = [c for c in candidate_cols if c not in numeric_cols]

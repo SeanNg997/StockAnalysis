@@ -1,0 +1,7 @@
+{
+  "dataset_version": "raw_price_pt_v2",
+  "adjustflag": "3",
+  "price_mode": "raw",
+  "expected_latest_date": "2026-04-20",
+  "updated_at": "2026-04-21 04:42:09"
+}
