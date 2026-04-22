@@ -101,14 +101,43 @@ def load_dataset_meta() -> dict:
         return {}
 
 
-def save_dataset_meta(expected_latest_date: str) -> None:
-    payload = {
-        "dataset_version": DATASET_VERSION,
-        "adjustflag": ADJUST_FLAG,
-        "price_mode": "raw",
-        "expected_latest_date": expected_latest_date,
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
+def _normalize_meta_date(value: Optional[str]) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts.strftime("%Y-%m-%d")
+
+
+def _meta_date_reaches(value: Optional[str], expected_latest_date: str) -> bool:
+    normalized = _normalize_meta_date(value)
+    return normalized is not None and normalized >= expected_latest_date
+
+
+def save_dataset_meta(
+    expected_latest_date: str,
+    *,
+    kline_latest_date: Optional[str] = None,
+    dividend_refresh_through: Optional[str] = None,
+    adjust_factor_refresh_through: Optional[str] = None,
+) -> None:
+    payload = load_dataset_meta()
+    payload.update(
+        {
+            "dataset_version": DATASET_VERSION,
+            "adjustflag": ADJUST_FLAG,
+            "price_mode": "raw",
+            "expected_latest_date": expected_latest_date,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+    if kline_latest_date is not None:
+        payload["kline_latest_date"] = _normalize_meta_date(kline_latest_date)
+    if dividend_refresh_through is not None:
+        payload["dividend_refresh_through"] = _normalize_meta_date(dividend_refresh_through)
+    if adjust_factor_refresh_through is not None:
+        payload["adjust_factor_refresh_through"] = _normalize_meta_date(adjust_factor_refresh_through)
     with open(DATA_META_JSON, "w", encoding="utf-8") as fp:
         json.dump(payload, fp, ensure_ascii=False, indent=2)
 
@@ -465,19 +494,34 @@ def main(full: bool = False):
                 elif last_date < expected_latest_date:
                     pending_update.append((code, name, last_date))
 
+            meta = load_dataset_meta()
             has_valid_dividend_cache = has_valid_action_cache(DIVIDEND_PKL, DIVIDEND_CACHE_REQUIRED_COLS)
             has_valid_adjust_factor_cache = has_valid_action_cache(
                 ADJUST_FACTOR_PKL,
                 ADJUST_FACTOR_CACHE_REQUIRED_COLS,
             )
             needs_dividend_bootstrap = not has_valid_dividend_cache
+            needs_dividend_refresh = needs_dividend_bootstrap or not _meta_date_reaches(
+                meta.get("dividend_refresh_through"),
+                expected_latest_date,
+            )
+            needs_adjust_refresh = has_valid_adjust_factor_cache and not _meta_date_reaches(
+                meta.get("adjust_factor_refresh_through"),
+                expected_latest_date,
+            )
             if needs_dividend_bootstrap:
                 print("未检测到可用的分红事件缓存，将补抓 dividend_events.pkl")
+            elif needs_dividend_refresh:
+                last_refresh = meta.get("dividend_refresh_through") or "未知"
+                print(f"分红事件缓存刷新日期停留在 {last_refresh}，将补抓 dividend_events.pkl")
             elif not has_valid_adjust_factor_cache:
                 print("未检测到可用的复权因子缓存，但当前主流程不依赖它，跳过 adjust_factors.pkl 全量补抓")
-            if not pending_update and not pending_full and not needs_dividend_bootstrap:
+            elif needs_adjust_refresh:
+                last_refresh = meta.get("adjust_factor_refresh_through") or "未知"
+                print(f"复权因子缓存刷新日期停留在 {last_refresh}，将补抓 adjust_factors.pkl")
+            if not pending_update and not pending_full and not needs_dividend_refresh and not needs_adjust_refresh:
                 print("✅ 所有股票已是最新状态，无需更新。")
-                save_dataset_meta(expected_latest_date)
+                save_dataset_meta(expected_latest_date, kline_latest_date=expected_latest_date)
                 return
 
             print(
@@ -540,16 +584,21 @@ def main(full: bool = False):
                 with open(os.path.join(DATA_DIR, ".last_date.txt"), "w", encoding="utf-8") as fp:
                     fp.write(str(max_new_date))
 
-            if needs_dividend_bootstrap:
+            if needs_dividend_refresh or needs_adjust_refresh:
                 codes_for_actions = [code for code, _, _, _, is_delisted in stock_list if not is_delisted]
 
             _refresh_action_tables(
                 sorted(set(codes_for_actions)),
                 expected_latest_date,
-                refresh_adjust_factors=has_valid_adjust_factor_cache,
-                refresh_dividends=True,
+                refresh_adjust_factors=has_valid_adjust_factor_cache and needs_adjust_refresh,
+                refresh_dividends=needs_dividend_refresh,
             )
-            save_dataset_meta(expected_latest_date)
+            save_dataset_meta(
+                expected_latest_date,
+                kline_latest_date=expected_latest_date,
+                dividend_refresh_through=expected_latest_date if needs_dividend_refresh else None,
+                adjust_factor_refresh_through=expected_latest_date if (has_valid_adjust_factor_cache and needs_adjust_refresh) else None,
+            )
             print(f"\n✅ 增量更新完成! 成功更新股票 {update_count} 只, 新增股票 {new_count} 只")
             if skip_delisted_no_data:
                 print(f"    退市无数据(已跳过): {skip_delisted_no_data} 只")
@@ -606,7 +655,12 @@ def main(full: bool = False):
             refresh_adjust_factors=True,
             refresh_dividends=True,
         )
-        save_dataset_meta(expected_latest_date)
+        save_dataset_meta(
+            expected_latest_date,
+            kline_latest_date=existing_df["date"].max() if not existing_df.empty else None,
+            dividend_refresh_through=expected_latest_date,
+            adjust_factor_refresh_through=expected_latest_date,
+        )
 
         files = sorted(glob.glob(os.path.join(DATA_DIR, "Stock_dailyK_*.csv")))
         total_stocks = len(existing_df["code"].unique())
