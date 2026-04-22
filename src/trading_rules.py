@@ -215,8 +215,15 @@ def filter_stock_pool(candidates: pd.DataFrame,
 
     stats['最终候选'] = len(merged)
 
+    # mkt_amount 保留为 amount（供 tie-breaking 用），若原始已有 amount 则不覆盖
+    if 'mkt_amount' in merged.columns:
+        if 'amount' not in merged.columns:
+            merged = merged.rename(columns={'mkt_amount': 'amount'})
+        else:
+            merged = merged.drop(columns=['mkt_amount'])
+
     # 清理临时列
-    drop_cols = [c for c in ['isST', 'isTrading', 'mkt_amount', 'mkt_close', 'consecutive_suspend'] if c in merged.columns]
+    drop_cols = [c for c in ['isST', 'isTrading', 'mkt_close', 'consecutive_suspend'] if c in merged.columns]
     merged = merged.drop(columns=drop_cols)
 
     if return_stats:
@@ -281,7 +288,17 @@ def score_candidates(candidates: pd.DataFrame, method: str = 'confidence_weighte
         df['score'] = df['pred_return'] / (pred_std + 1e-10)
     else:
         df['score'] = df['pred_return']
-    return df.sort_values('score', ascending=False)
+    sort_cols = ['score']
+    sort_asc = [False]
+    if 'pred_std' in df.columns:
+        sort_cols.append('pred_std')
+        sort_asc.append(True)   # pred_std 越小越好
+    if 'amount' in df.columns:
+        sort_cols.append('amount')
+        sort_asc.append(False)  # amount 越大越好
+    sort_cols.append('code')
+    sort_asc.append(True)
+    return df.sort_values(sort_cols, ascending=sort_asc)
 
 
 def select_buys(candidates: pd.DataFrame, held_codes: set, sold_today: set,

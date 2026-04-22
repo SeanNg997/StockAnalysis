@@ -312,6 +312,10 @@ def generate_today_strategy(target_date=None, portfolio_path=None):
     known_days_set = set(known_days)
     exec_date = next_trading_day(latest_date.date(), known_trading_days=known_days_set)
 
+    # 市场择时（与回测一致）
+    daily_mkt_ret = pred_df.groupby('date')['pred_return'].mean().sort_index()
+    mkt_factor = rules.check_market_regime(daily_mkt_ret, latest_date)
+
     # 加载持仓
     positions = {}
     sell_list = []
@@ -355,16 +359,13 @@ def generate_today_strategy(target_date=None, portfolio_path=None):
 
     qualified_top20 = qualified.head(20)
 
-    # 买入推荐：排除已持仓，考虑仓位限制
-    if has_portfolio:
-        n_after_sell = len(positions) - len(sell_codes)
-        n_empty = rules.MAX_POSITIONS - n_after_sell
-        available_for_buy = qualified[~qualified['code'].isin(set(positions.keys()))]
-        buy_candidates = available_for_buy.head(max(n_empty, 0)) if n_empty > 0 else pd.DataFrame()
-    else:
-        buy_candidates = qualified.head(5)
+    # 买入推荐：与回测一致，使用 compute_buy_slots + select_buys
+    n_slots = rules.compute_buy_slots(len(positions), mkt_factor)
+    buy_codes = rules.select_buys(qualified, set(positions.keys()), sell_codes, n_slots)
+    buy_candidates = qualified.loc[qualified['code'].isin(buy_codes)].copy() if buy_codes else pd.DataFrame()
 
     n_buy = len(buy_candidates)
+    mkt_factor_pct = int(mkt_factor * 100)
 
     # Markdown 报告
     lines = []
@@ -391,7 +392,7 @@ def generate_today_strategy(target_date=None, portfolio_path=None):
     lines.append("|------|-----:|------|-----:|")
     lines.append(f"| 可预测股票数 | {n_total:,} 只 | 市场情绪 | {sentiment} |")
     lines.append(f"| 预测收益率 > 0 | {n_positive:,} 只（{bullish_pct:.0%}） | 全市场预测均值 | {mkt_mean:+.4%} |")
-    lines.append(f"| 全市场预测中位数 | {mkt_median:+.4%} | | |\n")
+    lines.append(f"| 全市场预测中位数 | {mkt_median:+.4%} | 择时仓位系数 | {mkt_factor_pct}%（可买 {n_slots} 槽） |\n")
     lines.append("---\n")
 
     # 票池筛选统计
@@ -467,7 +468,9 @@ def generate_today_strategy(target_date=None, portfolio_path=None):
     # 推荐买入
     lines.append("## 今日推荐买入\n")
     if n_buy == 0:
-        if has_portfolio and rules.MAX_POSITIONS - (len(positions) - len(sell_codes)) <= 0:
+        if n_slots <= 0 and mkt_factor < 1.0:
+            lines.append(f"> **市场择时缩仓**：当前市场环境较弱（仓位系数 {mkt_factor_pct}%），暂停新买入\n")
+        elif has_portfolio and rules.MAX_POSITIONS - (len(positions) - len(sell_codes)) <= 0:
             lines.append("> 仓位已满，无需新买入\n")
         else:
             lines.append(f"> **建议空仓**：当前无股票满足买入条件"
