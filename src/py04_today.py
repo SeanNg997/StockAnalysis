@@ -22,7 +22,7 @@ TODAY_PRICE_CACHE_PKL = os.path.join(OUTPUT_DIR, 'tmp', 'today_price_view.pkl')
 TODAY_PREDICT_CACHE_PKL = os.path.join(OUTPUT_DIR, 'tmp', 'today_predict_view.pkl')
 TODAY_MARKET_CACHE_PKL = os.path.join(OUTPUT_DIR, 'tmp', 'today_market_view.pkl')
 
-PRICE_VIEW_COLS = ['code', 'name', 'date', 'open', 'close', 'volume', 'amount']
+PRICE_VIEW_COLS = ['code', 'name', 'date', 'open', 'close', 'pctChg', 'preclose', 'volume', 'amount']
 PREDICT_VIEW_COLS = ['date', 'code', 'pred_return', 'pred_std', 'confidence']
 MARKET_VIEW_COLS = ['code', 'date', 'isST', 'isTrading', 'open', 'close', 'amount']
 
@@ -53,16 +53,22 @@ def normalize_stock_code(code):
     raise ValueError(f"无法识别股票代码: {code}，请输入6位主板代码（如 600000 或 002202）")
 
 
-def _cache_is_fresh(cache_path, source_path):
-    return (
-        os.path.exists(cache_path) and
-        os.path.getmtime(cache_path) >= os.path.getmtime(source_path)
-    )
+def _cache_is_fresh(cache_path, source_path, required_cols=None):
+    if not os.path.exists(cache_path) or os.path.getmtime(cache_path) < os.path.getmtime(source_path):
+        return False
+    if required_cols is not None:
+        try:
+            cached = pd.read_pickle(cache_path)
+            if not all(c in cached.columns for c in required_cols):
+                return False
+        except Exception:
+            return False
+    return True
 
 
 def _ensure_view_cache(cache_path, source_path, required_cols, preprocess=None):
     """为大体量原始 pkl 构建轻量视图，避免每次读取整表后再裁剪。"""
-    if not _cache_is_fresh(cache_path, source_path):
+    if not _cache_is_fresh(cache_path, source_path, required_cols):
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         df = pd.read_pickle(source_path)[required_cols].copy()
         if preprocess is not None:
@@ -156,14 +162,14 @@ def _load_latest_data(target_date=None):
     price_df = _load_price_view()
     latest_price = price_df.loc[price_df['date'] == latest_date, PRICE_VIEW_COLS].copy()
 
-    latest = latest_pred.merge(latest_price, on='code', how='left')
+    latest = latest_pred.merge(latest_price, on='code', how='inner')
     latest = latest.sort_values('pred_return', ascending=False)
 
     market_df = _load_market_view()
     market_day = market_df.loc[market_df['date'] == latest_date].copy()
     market_history = _build_market_history_tail(market_df, latest_date)
 
-    return latest, latest_date, pred_df, market_day, market_history
+    return latest, latest_date, pred_df, price_df, market_day, market_history
 
 
 def generate_stock_report(stock_code, target_date=None):
@@ -171,7 +177,7 @@ def generate_stock_report(stock_code, target_date=None):
     full_code = normalize_stock_code(stock_code)
     short_code = full_code.split('.')[1]
     print(f"生成 {full_code} 的交易决策...")
-    latest, latest_date, pred_df, market_day, _market_history = _load_latest_data(target_date)
+    latest, latest_date, pred_df, _price_df, market_day, _market_history = _load_latest_data(target_date)
     latest_by_code, latest_records = _build_latest_indexes(latest)
 
     if full_code not in latest_records:
@@ -284,7 +290,7 @@ def generate_stock_report(stock_code, target_date=None):
 def generate_today_strategy(target_date=None, portfolio_path=None):
     """生成全市场实盘交易决策（可选持仓分析）"""
     print("生成今日交易决策...")
-    latest, latest_date, pred_df, market_day, market_history = _load_latest_data(target_date)
+    latest, latest_date, pred_df, price_df, market_day, market_history = _load_latest_data(target_date)
     latest_by_code, latest_records = _build_latest_indexes(latest)
 
     hold_days = CONFIG['backtest']['HOLD_DAYS']
@@ -298,11 +304,8 @@ def generate_today_strategy(target_date=None, portfolio_path=None):
             latest, market_day, return_stats=True, market_history=market_history
         )
     else:
-        qualified = latest[
-            (latest['pred_return'] > min_pred_return) &
-            (latest['confidence'] > min_confidence)
-        ].copy()
-        pool_stats = {'总候选': n_total, '最终候选': len(qualified)}
+        qualified = pd.DataFrame(columns=latest.columns)
+        pool_stats = {'总候选': n_total, '最终候选': 0, '原因': '无市场状态数据'}
 
     # 评分排序
     if len(qualified) > 0:
@@ -312,8 +315,8 @@ def generate_today_strategy(target_date=None, portfolio_path=None):
     known_days_set = set(known_days)
     exec_date = next_trading_day(latest_date.date(), known_trading_days=known_days_set)
 
-    # 市场择时（与回测一致）
-    daily_mkt_ret = pred_df.groupby('date')['pred_return'].mean().sort_index()
+    # 市场择时（与回测一致：使用实际涨跌幅）
+    daily_mkt_ret = price_df.groupby('date')['pctChg'].mean().sort_index()
     mkt_factor = rules.check_market_regime(daily_mkt_ret, latest_date)
 
     # 加载持仓
