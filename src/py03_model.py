@@ -976,11 +976,87 @@ def collect_checkpoint_predictions(buffer_df: pd.DataFrame) -> pd.DataFrame:
     return pred_df
 
 
-def save_predictions(pred_df: pd.DataFrame, end_date: Optional[str], logger: ProgressLogger) -> pd.DataFrame:
+def detect_resume_index(
+    all_dates: list[pd.Timestamp],
+    start_idx: int,
+    logger: ProgressLogger,
+) -> tuple[int, Optional[pd.Timestamp]]:
+    if not os.path.exists(PREDICT_PKL):
+        logger.log("未检测到历史 predictions.pkl，将从回测起点全量生成")
+        return start_idx, None
+
+    try:
+        old_pred = pd.read_pickle(PREDICT_PKL)
+    except Exception as exc:
+        logger.log(f"读取历史 predictions.pkl 失败，将从回测起点全量生成: {exc}")
+        return start_idx, None
+
+    if old_pred.empty or "date" not in old_pred.columns:
+        logger.log("历史 predictions.pkl 为空或缺少 date 列，将从回测起点全量生成")
+        return start_idx, None
+
+    if not pd.api.types.is_datetime64_any_dtype(old_pred["date"]):
+        old_pred["date"] = pd.to_datetime(old_pred["date"], errors="coerce")
+    old_pred = old_pred.loc[old_pred["date"].notna()].copy()
+    if old_pred.empty:
+        logger.log("历史 predictions.pkl 日期无效，将从回测起点全量生成")
+        return start_idx, None
+
+    covered_dates = set(old_pred["date"].unique())
+    last_complete_idx = start_idx - 1
+    for idx in range(start_idx, len(all_dates)):
+        if all_dates[idx] in covered_dates:
+            last_complete_idx = idx
+            continue
+        break
+
+    resume_idx = last_complete_idx + 1
+    if resume_idx <= start_idx:
+        logger.log("历史 predictions.pkl 未覆盖回测区间，将从回测起点全量生成")
+        return start_idx, None
+
+    if resume_idx >= len(all_dates):
+        logger.log(
+            f"历史 predictions.pkl 已覆盖到最新交易日 {all_dates[last_complete_idx].date()}，无需新增预测"
+        )
+        return len(all_dates), all_dates[last_complete_idx]
+
+    resume_start = all_dates[resume_idx]
+    logger.log(
+        f"检测到历史 predictions.pkl 已覆盖至 {all_dates[last_complete_idx].date()}，"
+        f"本次从 {resume_start.date()} 继续增量更新"
+    )
+    return resume_idx, resume_start
+
+
+def save_predictions(
+    pred_df: pd.DataFrame,
+    end_date: Optional[str],
+    logger: ProgressLogger,
+    resume_start: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
     pred_df = pred_df.sort_values(["date", "code"]).reset_index(drop=True)
     os.makedirs(os.path.dirname(PREDICT_PKL), exist_ok=True)
 
-    if end_date is not None and os.path.exists(PREDICT_PKL):
+    if resume_start is not None:
+        resume_ts = pd.Timestamp(resume_start)
+        if not pred_df.empty and pred_df["date"].min() < resume_ts:
+            raise ValueError(
+                f"增量保存失败：新预测包含 {resume_ts.date()} 之前的数据，"
+                f"最早日期为 {pred_df['date'].min().date()}"
+            )
+        if os.path.exists(PREDICT_PKL):
+            old_pred = pd.read_pickle(PREDICT_PKL)
+            if not pd.api.types.is_datetime64_any_dtype(old_pred["date"]):
+                old_pred["date"] = pd.to_datetime(old_pred["date"], errors="coerce")
+            old_prefix = old_pred.loc[old_pred["date"] < resume_ts].copy()
+            old_prefix_rows = len(old_prefix)
+            pred_df = pd.concat([old_prefix, pred_df], ignore_index=True)
+            pred_df = pred_df.sort_values(["date", "code"]).reset_index(drop=True)
+            merged_prefix_rows = int((pred_df["date"] < resume_ts).sum())
+            if merged_prefix_rows != old_prefix_rows:
+                raise ValueError("增量保存失败：历史预测前缀记录数发生变化")
+    elif end_date is not None and os.path.exists(PREDICT_PKL):
         old_pred = pd.read_pickle(PREDICT_PKL)
         old_pred = old_pred[~old_pred["date"].isin(pred_df["date"].unique())]
         pred_df = pd.concat([old_pred, pred_df], ignore_index=True)
@@ -1181,6 +1257,7 @@ def walk_forward_predict(
     logger: ProgressLogger,
     max_train_rows: Optional[int] = None,
     checkpoint_every: int = DEFAULT_CHECKPOINT_EVERY,
+    resume: bool = True,
 ) -> pd.DataFrame:
     logger.section("全量 Walk-Forward 模式")
     bt_start_idx, bt_start_date = resolve_backtest_start(all_dates, logger=logger)
@@ -1204,6 +1281,14 @@ def walk_forward_predict(
     df_model = prune_dataframe(df, selected_features)
     all_dates = pd.Index(df_model["date"].unique()).sort_values().tolist()
     day_frame_cache = build_day_frame_cache(df_model)
+    bt_start_idx, _ = resolve_backtest_start(all_dates, logger=None)
+
+    resume_start = None
+    start_idx = bt_start_idx
+    if resume:
+        start_idx, resume_start = detect_resume_index(all_dates, bt_start_idx, logger)
+        if start_idx >= len(all_dates):
+            return pd.read_pickle(PREDICT_PKL)
 
     if os.path.exists(PREDICT_CHECKPOINT_PKL):
         os.remove(PREDICT_CHECKPOINT_PKL)
@@ -1213,13 +1298,14 @@ def walk_forward_predict(
     metrics_records: list[dict] = []
     ensemble: Optional[EnsembleBundle] = None
     last_train_idx = -10**9
+    total_steps = len(all_dates) - start_idx
 
-    for offset, day_idx in enumerate(range(bt_start_idx, len(all_dates)), start=1):
+    for offset, day_idx in enumerate(range(start_idx, len(all_dates)), start=1):
         current_date = all_dates[day_idx]
         need_retrain = ensemble is None or (day_idx - last_train_idx >= RETRAIN_DAYS)
 
         if need_retrain:
-            logger.log(f"[{current_date.date()}] 触发重训练 ({offset}/{len(all_dates) - bt_start_idx})")
+            logger.log(f"[{current_date.date()}] 触发重训练 ({offset}/{total_steps})")
             train_df, val_df = build_train_val_split(df_model, all_dates, day_idx)
             ensemble, metrics_records = fit_lightgbm_ensemble(
                 train_df=train_df,
@@ -1245,7 +1331,7 @@ def walk_forward_predict(
 
         if offset % 10 == 0 or offset == 1:
             logger.log(
-                f"[{current_date.date()}] 已完成 {offset}/{len(all_dates) - bt_start_idx} 个交易日预测，"
+                f"[{current_date.date()}] 已完成 {offset}/{total_steps} 个交易日预测，"
                 f"当日股票数={len(day_df):,}"
             )
 
@@ -1260,7 +1346,7 @@ def walk_forward_predict(
     if pred_df.empty:
         raise RuntimeError("walk-forward 未生成任何预测结果")
 
-    final_df = save_predictions(pred_df, end_date=None, logger=logger)
+    final_df = save_predictions(pred_df, end_date=None, logger=logger, resume_start=resume_start)
     if os.path.exists(PREDICT_CHECKPOINT_PKL):
         os.remove(PREDICT_CHECKPOINT_PKL)
         logger.log(f"已删除 checkpoint 文件: {PREDICT_CHECKPOINT_PKL}")

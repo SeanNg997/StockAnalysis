@@ -39,13 +39,17 @@ scripts\run_web_console.bat
 ## 3 命令行用法
 
 ```bash
-# 增量更新数据
+# 1) 增量更新数据
 python src/py00_fetch_stock_data.py
 
-# 数据清洗 → 特征工程 → 单日预测 → 生成策略
+# 2) 数据清洗与特征工程
 python src/py01_data_clean.py
 python src/py02_features.py
+
+# 3) 单日预测（用于查看某个交易日的模型输出，不会跑完整回测）
 python src/py03_model.py --date 2026-04-17
+
+# 4) 生成下个交易日策略建议
 python src/py04_today.py
 
 # 指定持仓文件生成策略（也可把 portfolio.json 放在 output/ 下自动检测）
@@ -54,11 +58,168 @@ python src/py04_today.py --portfolio output/portfolio.json
 # 查看单只股票决策
 python src/py04_today.py 002202
 
-# Walk-Forward 全量训练 + 回测 + 报告
+# 5) Walk-Forward 训练/预测
+# 第一次运行：会从 BACKTEST_START_YEAR 开始全量生成 output/tmp/predictions.pkl
+python src/py03_model.py
+
+# 后续再次运行：如果 predictions.pkl 已存在，会自动识别最后已完成日期，
+# 只从下一交易日继续增量生成后面的预测，不会覆盖旧日期前缀
+python src/py03_model.py
+
+# 6) 回测
+# 第一次运行：全量回测，并生成 backtest_state.json
+python src/py05_backtest.py
+
+# 后续再次运行：
+# - 若共同区间预测未变化，会读取 backtest_state.json 中的现金/持仓状态，
+#   从下一交易日继续增量回测；
+# - 若共同区间预测发生变化，会直接报错，要求先全量重跑训练/回测
+python src/py05_backtest.py
+
+# 7) 生成报告
+python src/py06_report.py
+```
+
+### 3.1 推荐的完整使用流程
+
+#### 场景 A：首次全量运行
+
+```bash
+python src/py00_fetch_stock_data.py --full
+python src/py01_data_clean.py
+python src/py02_features.py
 python src/py03_model.py
 python src/py05_backtest.py
 python src/py06_report.py
 ```
+
+适用于：
+- 首次使用项目
+- 切换到当前“原始行情 + 点时研究价”版本后第一次重建
+- 需要从头生成完整预测与完整回测结果
+
+#### 场景 B：日常增量更新
+
+```bash
+python src/py00_fetch_stock_data.py
+python src/py01_data_clean.py
+python src/py02_features.py
+python src/py03_model.py
+python src/py05_backtest.py
+python src/py06_report.py
+```
+
+适用于：
+- 已经跑过一次全量
+- 新增了后续几个交易日的数据
+- 希望只补后续日期，而不是从头重跑整个训练和回测
+
+#### 场景 C：只看某天预测，不做完整回测
+
+```bash
+python src/py01_data_clean.py
+python src/py02_features.py
+python src/py03_model.py --date 2026-04-17
+python src/py04_today.py --portfolio output/portfolio.json
+```
+
+适用于：
+- 只查看指定交易日的模型预测
+- 只生成下一交易日的操作建议
+- 不需要完整历史回测
+
+### 3.2 增量训练 / 增量回测的工作方式
+
+#### py03 增量训练
+
+`src/py03_model.py` 当前支持自动续跑：
+
+- 第一次运行时，会从 `config.py` 中 `model.BACKTEST_START_YEAR` 指定的起点开始，完整跑一遍 Walk-Forward，输出：
+  - `output/tmp/predictions.pkl`
+  - `output/tmp/predictions_checkpoint.pkl`（中间 checkpoint，结束后会自动清理）
+- 第二次及之后运行时，如果 `output/tmp/predictions.pkl` 已存在：
+  - 程序会自动识别历史预测已覆盖到哪一天；
+  - 从下一交易日继续生成后续预测；
+  - 保存时只拼接新日期，不覆盖旧日期前缀。
+
+注意：
+- 这不是 LightGBM 模型参数级别的“继续训练”；
+- 而是“目标日期级别的增量更新”：旧日期预测保留，只为新增日期重新做 Walk-Forward 训练与预测。
+
+#### py05 增量回测
+
+`src/py05_backtest.py` 当前支持真正基于历史持仓状态续跑：
+
+- 第一次运行时：
+  - 从回测起点开始完整回放；
+  - 输出：
+    - `output/backtest/backtest_daily.csv`
+    - `output/backtest/trade_log.csv`
+    - `output/backtest/position_log.csv`
+    - `output/backtest/corp_action_log.csv`
+    - `output/backtest/backtest_metrics.md`
+    - `output/backtest/backtest_state.json`
+- 后续运行时：
+  - 会先检查共同区间预测是否与上次一致；
+  - 如果一致，则读取 `backtest_state.json` 中保存的：
+    - 当前现金
+    - 当前持仓
+    - 每个持仓的成本、持有天数、累计分红等状态
+  - 然后从下一交易日继续回放新增区间；
+  - 最后把旧结果前缀保留，把新增区间结果拼接到后面。
+
+这意味着增量回测不是“默认空仓重新买 5 只”，而是基于上次回测结束时的真实持仓继续推进。
+
+### 3.3 什么时候必须全量重跑
+
+出现以下情况时，不建议直接走增量：
+
+1. 修改了模型参数、交易规则、回测参数或特征逻辑；
+2. 历史行情、市场状态、分红送转数据发生修正；
+3. `py05_backtest.py` 检测到共同区间预测发生变化；
+4. 想确认新的代码版本对整个历史区间的完整影响。
+
+此时建议删除旧产物后重新全量运行：
+
+```bash
+python src/py00_fetch_stock_data.py --full   # 只有需要重拉全量原始行情时才执行
+python src/py01_data_clean.py
+python src/py02_features.py
+python src/py03_model.py
+python src/py05_backtest.py
+python src/py06_report.py
+```
+
+### 3.4 关键输出文件说明
+
+#### 训练 / 预测输出
+
+- `output/tmp/features.pkl`：特征数据
+- `output/tmp/predictions.pkl`：Walk-Forward 预测结果
+- `output/tmp/predictions_checkpoint.pkl`：训练中间 checkpoint
+- `output/model_selection/`：训练日志、指标、特征选择结果
+
+#### 回测输出
+
+- `output/backtest/backtest_daily.csv`：每日资产与持仓数
+- `output/backtest/trade_log.csv`：交易日志
+- `output/backtest/position_log.csv`：每日持仓快照
+- `output/backtest/corp_action_log.csv`：分红送转处理日志
+- `output/backtest/backtest_metrics.md`：回测指标摘要
+- `output/backtest/backtest_state.json`：增量回测续跑状态
+
+#### `backtest_state.json` 的用途
+
+这个文件是增量回测的关键状态文件，用于保存上次回测结束时的：
+- 现金
+- 当前持仓
+- 持仓成本
+- 持仓股数
+- 持有天数
+- 累计现金分红
+- 最近一个决策日 / 执行日
+
+如果这个文件丢失，程序就无法从历史持仓状态继续补跑，只能重新做全量回测。
 
 ## 4 项目结构
 

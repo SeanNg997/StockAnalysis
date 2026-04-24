@@ -22,6 +22,11 @@ MARKET_PKL = CONFIG["paths"]["MARKET_PKL"]
 BACKTEST_MARKET_PKL = CONFIG["paths"].get("BACKTEST_MARKET_PKL", MARKET_PKL)
 DIVIDEND_PKL = CONFIG["paths"].get("DIVIDEND_PKL")
 OUTPUT_DIR = CONFIG["paths"]["BACKTEST_OUTPUT_DIR"]
+BACKTEST_DAILY_CSV = os.path.join(OUTPUT_DIR, "backtest_daily.csv")
+BACKTEST_TRADE_CSV = os.path.join(OUTPUT_DIR, "trade_log.csv")
+BACKTEST_POSITION_CSV = os.path.join(OUTPUT_DIR, "position_log.csv")
+BACKTEST_CORP_ACTION_CSV = os.path.join(OUTPUT_DIR, "corp_action_log.csv")
+BACKTEST_STATE_JSON = os.path.join(OUTPUT_DIR, "backtest_state.json")
 INITIAL_CAPITAL = float(CONFIG["backtest"]["INITIAL_CAPITAL"])
 LIVE_PROGRESS_FILE = os.environ.get("STOCK_ANALYSIS_PROGRESS_FILE")
 MAX_OPEN_TRADE_AMOUNT_RATIO = float(CONFIG["backtest"].get("MAX_OPEN_TRADE_AMOUNT_RATIO", 0.02))
@@ -368,7 +373,151 @@ def _build_position_record(date, code, pos, price_cache: dict, primary_date, fal
     }
 
 
-def run_backtest(merged: pd.DataFrame, market_df: pd.DataFrame, action_lookup: dict, scoring_method="confidence_weighted") -> dict:
+def _serialize_positions(positions: dict[str, dict]) -> dict[str, dict]:
+    payload = {}
+    for code, pos in positions.items():
+        payload[code] = {
+            "shares": float(pos["shares"]),
+            "buy_price": float(pos["buy_price"]),
+            "ref_price": float(pos.get("ref_price", pos["buy_price"])),
+            "basis_amount": float(pos.get("basis_amount", 0.0)),
+            "buy_cost": float(pos.get("buy_cost", 0.0)),
+            "buy_date": pd.Timestamp(pos["buy_date"]).isoformat(),
+            "current_price": float(pos.get("current_price", pos["buy_price"])),
+            "hold_days": int(pos.get("hold_days", 0)),
+            "cash_dividends_received": float(pos.get("cash_dividends_received", 0.0)),
+        }
+    return payload
+
+
+def _deserialize_positions(payload: dict | None) -> dict[str, dict]:
+    if not payload:
+        return {}
+    positions: dict[str, dict] = {}
+    for code, pos in payload.items():
+        positions[code] = {
+            "shares": float(pos["shares"]),
+            "buy_price": float(pos["buy_price"]),
+            "ref_price": float(pos.get("ref_price", pos["buy_price"])),
+            "basis_amount": float(pos.get("basis_amount", 0.0)),
+            "buy_cost": float(pos.get("buy_cost", 0.0)),
+            "buy_date": pd.Timestamp(pos["buy_date"]),
+            "current_price": float(pos.get("current_price", pos["buy_price"])),
+            "hold_days": int(pos.get("hold_days", 0)),
+            "cash_dividends_received": float(pos.get("cash_dividends_received", 0.0)),
+        }
+    return positions
+
+
+def _build_initial_state(first_date: pd.Timestamp) -> dict:
+    return {
+        "cash": INITIAL_CAPITAL,
+        "positions": {},
+        "daily_records": [
+            {
+                "date": first_date,
+                "cash": INITIAL_CAPITAL,
+                "portfolio_value": INITIAL_CAPITAL,
+                "n_positions": 0,
+                "n_trades": 0,
+            }
+        ],
+        "trade_log": [],
+        "position_log": [],
+        "corp_action_log": [],
+        "last_decision_date": None,
+        "last_exec_date": None,
+    }
+
+
+def _load_backtest_state() -> dict | None:
+    if not os.path.exists(BACKTEST_STATE_JSON):
+        return None
+    with open(BACKTEST_STATE_JSON, "r", encoding="utf-8") as fp:
+        payload = json.load(fp)
+    return {
+        "cash": float(payload["cash"]),
+        "positions": _deserialize_positions(payload.get("positions")),
+        "daily_records": [],
+        "trade_log": [],
+        "position_log": [],
+        "corp_action_log": [],
+        "last_decision_date": pd.Timestamp(payload["last_decision_date"]) if payload.get("last_decision_date") else None,
+        "last_exec_date": pd.Timestamp(payload["last_exec_date"]) if payload.get("last_exec_date") else None,
+    }
+
+
+def _save_backtest_state(state: dict) -> None:
+    payload = {
+        "cash": float(state["cash"]),
+        "positions": _serialize_positions(state.get("positions", {})),
+        "last_decision_date": pd.Timestamp(state["last_decision_date"]).isoformat() if state.get("last_decision_date") is not None else None,
+        "last_exec_date": pd.Timestamp(state["last_exec_date"]).isoformat() if state.get("last_exec_date") is not None else None,
+    }
+    with open(BACKTEST_STATE_JSON, "w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=False, default=_json_default, indent=2)
+
+
+def _read_backtest_csv(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    df = pd.read_csv(path)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    if "buy_date" in df.columns:
+        df["buy_date"] = pd.to_datetime(df["buy_date"], errors="coerce")
+    return df
+
+
+def _merge_backtest_outputs(prefix_df: pd.DataFrame, suffix_df: pd.DataFrame, sort_cols: list[str]) -> pd.DataFrame:
+    frames = [df for df in [prefix_df, suffix_df] if df is not None and not df.empty]
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    out = out.sort_values(sort_cols).reset_index(drop=True)
+    return out
+
+
+def _prepare_resume_state(merged: pd.DataFrame) -> tuple[dict | None, int, pd.Timestamp | None]:
+    state = _load_backtest_state()
+    if state is None or state.get("last_exec_date") is None:
+        return None, 0, None
+
+    all_dates = sorted(merged["date"].unique())
+    last_exec_date = pd.Timestamp(state["last_exec_date"])
+    if last_exec_date not in all_dates:
+        return None, 0, None
+
+    last_idx = all_dates.index(last_exec_date)
+    resume_idx = last_idx + 1
+    if resume_idx >= len(all_dates):
+        return state, len(all_dates), None
+    return state, resume_idx, all_dates[resume_idx]
+
+
+def _prefix_before_date(path: str, resume_date: pd.Timestamp) -> pd.DataFrame:
+    df = _read_backtest_csv(path)
+    if df.empty or "date" not in df.columns:
+        return df
+    return df.loc[df["date"] < resume_date].copy()
+
+
+def _write_backtest_outputs(daily_df: pd.DataFrame, trade_df: pd.DataFrame, position_df: pd.DataFrame, corp_action_df: pd.DataFrame) -> None:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    daily_df.to_csv(BACKTEST_DAILY_CSV, index=False)
+    trade_df.to_csv(BACKTEST_TRADE_CSV, index=False)
+    position_df.to_csv(BACKTEST_POSITION_CSV, index=False)
+    corp_action_df.to_csv(BACKTEST_CORP_ACTION_CSV, index=False)
+
+
+def run_backtest_range(
+    merged: pd.DataFrame,
+    market_df: pd.DataFrame,
+    action_lookup: dict,
+    scoring_method="confidence_weighted",
+    start_idx: int = 0,
+    state: dict | None = None,
+) -> dict:
     all_dates = sorted(merged["date"].unique())
     print(f"回测期间: {all_dates[0].date()} ~ {all_dates[-1].date()}, 共 {len(all_dates)} 个交易日")
 
@@ -391,27 +540,21 @@ def run_backtest(merged: pd.DataFrame, market_df: pd.DataFrame, action_lookup: d
         for date, group in market_df.groupby("date", sort=False)
     }
 
-    cash = INITIAL_CAPITAL
-    positions: dict[str, dict] = {}
-    daily_records = []
-    trade_log = []
-    position_log = []
-    corp_action_log = []
+    state = _build_initial_state(all_dates[0]) if state is None else state
+    cash = float(state["cash"])
+    positions: dict[str, dict] = state["positions"]
+    daily_records = state["daily_records"]
+    trade_log = state["trade_log"]
+    position_log = state["position_log"]
+    corp_action_log = state["corp_action_log"]
 
-    daily_records.append(
-        {
-            "date": all_dates[0],
-            "cash": INITIAL_CAPITAL,
-            "portfolio_value": INITIAL_CAPITAL,
-            "n_positions": 0,
-            "n_trades": 0,
-        }
-    )
-    _emit_live_event("equity", _build_live_snapshot(daily_records[-1], 0.0, len(all_dates), 0))
+    if start_idx == 0:
+        _emit_live_event("equity", _build_live_snapshot(daily_records[-1], 0.0, len(all_dates), 0))
 
     print("开始回测模拟...")
-    progress_interval = max(1, len(all_dates) // 20)
-    for day_idx, decision_date in enumerate(all_dates):
+    progress_interval = max(1, max(len(all_dates) - start_idx, 1) // 20)
+    for day_idx in range(start_idx, len(all_dates)):
+        decision_date = all_dates[day_idx]
         exec_date = next_date_map.get(decision_date)
 
         try:
@@ -439,6 +582,10 @@ def run_backtest(merged: pd.DataFrame, market_df: pd.DataFrame, action_lookup: d
                 )
                 progress_pct = (day_idx + 1) / len(all_dates) * 100
                 _emit_live_event("equity", _build_live_snapshot(daily_records[-1], progress_pct, len(all_dates), day_idx + 1))
+            state["cash"] = cash
+            state["positions"] = positions
+            state["last_decision_date"] = decision_date
+            state["last_exec_date"] = decision_date
             continue
 
         for code in positions:
@@ -717,12 +864,17 @@ def run_backtest(merged: pd.DataFrame, market_df: pd.DataFrame, action_lookup: d
         progress_pct = (day_idx + 1) / len(all_dates) * 100
         _emit_live_event("equity", _build_live_snapshot(daily_records[-1], progress_pct, len(all_dates), day_idx + 1))
 
-        if day_idx % progress_interval == 0 or day_idx == len(all_dates) - 1:
+        if (day_idx - start_idx) % progress_interval == 0 or day_idx == len(all_dates) - 1:
             ret = (total_value / INITIAL_CAPITAL - 1) * 100
             print(
                 f"  进度: {progress_pct:.1f}% ({day_idx + 1}/{len(all_dates)}) | "
                 f"日期: {decision_date.date()} | 收益: {ret:+.2f}% | 持仓: {len(positions)}只"
             )
+
+        state["cash"] = cash
+        state["positions"] = positions
+        state["last_decision_date"] = decision_date
+        state["last_exec_date"] = exec_date
 
     daily_df = pd.DataFrame(daily_records)
     trade_df = pd.DataFrame(trade_log)
@@ -736,7 +888,13 @@ def run_backtest(merged: pd.DataFrame, market_df: pd.DataFrame, action_lookup: d
         "corp_actions": corp_action_df,
         "final_value": daily_df.iloc[-1]["portfolio_value"],
         "positions": positions,
+        "state": state,
+        "all_dates": all_dates,
     }
+
+
+def run_backtest(merged: pd.DataFrame, market_df: pd.DataFrame, action_lookup: dict, scoring_method="confidence_weighted") -> dict:
+    return run_backtest_range(merged, market_df, action_lookup, scoring_method=scoring_method, start_idx=0, state=None)
 
 
 def compute_metrics(daily_df: pd.DataFrame) -> dict:
@@ -831,17 +989,90 @@ def compute_trade_metrics(trade_df: pd.DataFrame) -> dict:
     return result
 
 
+def _assert_prediction_prefix_stable(pred_df: pd.DataFrame) -> None:
+    trade_log_path = os.path.join(OUTPUT_DIR, "trade_log.csv")
+    if not os.path.exists(PREDICT_PKL) or not os.path.exists(trade_log_path):
+        return
+
+    old_pred = pd.read_pickle(PREDICT_PKL)
+    if old_pred.empty or pred_df.empty or "date" not in old_pred.columns:
+        return
+
+    if not pd.api.types.is_datetime64_any_dtype(old_pred["date"]):
+        old_pred["date"] = pd.to_datetime(old_pred["date"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(pred_df["date"]):
+        pred_df["date"] = pd.to_datetime(pred_df["date"], errors="coerce")
+
+    old_pred = old_pred.loc[old_pred["date"].notna()].copy()
+    pred_df = pred_df.loc[pred_df["date"].notna()].copy()
+    overlap_end = min(old_pred["date"].max(), pred_df["date"].max())
+    old_overlap = old_pred.loc[old_pred["date"] <= overlap_end, ["date", "code", "pred_return", "pred_std", "confidence"]].copy()
+    new_overlap = pred_df.loc[pred_df["date"] <= overlap_end, ["date", "code", "pred_return", "pred_std", "confidence"]].copy()
+    if old_overlap.empty or new_overlap.empty:
+        return
+
+    old_overlap = old_overlap.sort_values(["date", "code"]).drop_duplicates(subset=["date", "code"], keep="last").reset_index(drop=True)
+    new_overlap = new_overlap.sort_values(["date", "code"]).drop_duplicates(subset=["date", "code"], keep="last").reset_index(drop=True)
+
+    old_keyed = old_overlap.set_index(["date", "code"])
+    new_keyed = new_overlap.set_index(["date", "code"])
+    if not old_keyed.index.equals(new_keyed.index):
+        raise RuntimeError("预测历史区间发生变化：重叠区间股票集合不一致，请先全量重跑训练/回测")
+
+    numeric_cols = ["pred_return", "pred_std", "confidence"]
+    if not np.allclose(old_keyed[numeric_cols].values, new_keyed[numeric_cols].values, equal_nan=True):
+        changed_mask = ~np.isclose(old_keyed["pred_return"].values, new_keyed["pred_return"].values, equal_nan=True)
+        changed_dates = old_keyed.index.get_level_values("date")[changed_mask]
+        changed_start = changed_dates.min().date() if len(changed_dates) > 0 else overlap_end.date()
+        raise RuntimeError(
+            f"检测到历史预测在 {changed_start} 起发生变化，共同区间交易记录将不再稳定，请先全量重跑训练/回测"
+        )
+
+
 def run_pipeline(scoring_method="confidence_weighted"):
     _reset_live_progress()
     _emit_live_event("status", {"stage": "load_data", "message": "开始加载回测数据"})
     merged, market_df, action_lookup = load_data()
-    _emit_live_event("status", {"stage": "backtest", "message": "开始执行回测模拟"})
-    results = run_backtest(merged, market_df, action_lookup, scoring_method=scoring_method)
+    _assert_prediction_prefix_stable(merged[["date", "code", "pred_return", "pred_std", "confidence"]].copy())
 
-    daily_df = results["daily"]
-    trade_df = results["trades"]
-    position_df = results["positions_log"]
-    corp_action_df = results["corp_actions"]
+    resume_state, resume_idx, resume_date = _prepare_resume_state(merged)
+    if resume_state is not None and resume_idx >= len(sorted(merged["date"].unique())):
+        print("历史回测已覆盖到最新交易日，无需增量回测")
+        return {
+            "daily": _read_backtest_csv(BACKTEST_DAILY_CSV),
+            "trades": _read_backtest_csv(BACKTEST_TRADE_CSV),
+            "positions_log": _read_backtest_csv(BACKTEST_POSITION_CSV),
+            "corp_actions": _read_backtest_csv(BACKTEST_CORP_ACTION_CSV),
+        }, compute_metrics(_read_backtest_csv(BACKTEST_DAILY_CSV)), compute_trade_metrics(_read_backtest_csv(BACKTEST_TRADE_CSV))
+
+    if resume_state is not None and resume_date is not None:
+        print(f"检测到历史持仓状态，将从 {resume_date.date()} 继续增量回测")
+        _emit_live_event("status", {"stage": "backtest", "message": f"从 {resume_date.date()} 继续执行增量回测"})
+        results = run_backtest_range(
+            merged,
+            market_df,
+            action_lookup,
+            scoring_method=scoring_method,
+            start_idx=resume_idx,
+            state=resume_state,
+        )
+
+        daily_prefix = _prefix_before_date(BACKTEST_DAILY_CSV, resume_date)
+        trade_prefix = _prefix_before_date(BACKTEST_TRADE_CSV, resume_date)
+        position_prefix = _prefix_before_date(BACKTEST_POSITION_CSV, resume_date)
+        corp_prefix = _prefix_before_date(BACKTEST_CORP_ACTION_CSV, resume_date)
+
+        daily_df = _merge_backtest_outputs(daily_prefix, results["daily"], ["date"])
+        trade_df = _merge_backtest_outputs(trade_prefix, results["trades"], ["date", "code", "action"])
+        position_df = _merge_backtest_outputs(position_prefix, results["positions_log"], ["date", "code"])
+        corp_action_df = _merge_backtest_outputs(corp_prefix, results["corp_actions"], ["date", "code", "action"])
+    else:
+        _emit_live_event("status", {"stage": "backtest", "message": "开始执行全量回测模拟"})
+        results = run_backtest(merged, market_df, action_lookup, scoring_method=scoring_method)
+        daily_df = results["daily"]
+        trade_df = results["trades"]
+        position_df = results["positions_log"]
+        corp_action_df = results["corp_actions"]
 
     metrics = compute_metrics(daily_df)
     trade_metrics = compute_trade_metrics(trade_df)
@@ -855,11 +1086,8 @@ def run_pipeline(scoring_method="confidence_weighted"):
     for k, v in trade_metrics.items():
         print(f"  {k}: {v}")
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    daily_df.to_csv(os.path.join(OUTPUT_DIR, "backtest_daily.csv"), index=False)
-    trade_df.to_csv(os.path.join(OUTPUT_DIR, "trade_log.csv"), index=False)
-    position_df.to_csv(os.path.join(OUTPUT_DIR, "position_log.csv"), index=False)
-    corp_action_df.to_csv(os.path.join(OUTPUT_DIR, "corp_action_log.csv"), index=False)
+    _write_backtest_outputs(daily_df, trade_df, position_df, corp_action_df)
+    _save_backtest_state(results["state"])
 
     md_path = os.path.join(OUTPUT_DIR, "backtest_metrics.md")
     with open(md_path, "w", encoding="utf-8") as f:
@@ -896,6 +1124,7 @@ def run_pipeline(scoring_method="confidence_weighted"):
     print("   - position_log.csv    (每日持仓快照)")
     print("   - corp_action_log.csv (公司行为处理日志)")
     print("   - backtest_metrics.md (回测指标)")
+    print("   - backtest_state.json (增量回测状态)")
     _emit_live_event(
         "summary",
         {
@@ -906,7 +1135,12 @@ def run_pipeline(scoring_method="confidence_weighted"):
         },
     )
 
-    return results, metrics, trade_metrics
+    return {
+        "daily": daily_df,
+        "trades": trade_df,
+        "positions_log": position_df,
+        "corp_actions": corp_action_df,
+    }, metrics, trade_metrics
 
 
 if __name__ == "__main__":
