@@ -50,8 +50,9 @@ PREDICT_CHECKPOINT_PKL = PREDICT_PKL.replace(".pkl", "_checkpoint.pkl")
 
 DEFAULT_CHECKPOINT_EVERY = max(10, RETRAIN_DAYS)
 SEED_LIST = [42, 2024, 3407]
+FIXED_TRAIN_ROWS = 1_000_000
 MIN_FORMAL_TRAIN_ROWS = 480_000
-MAX_FORMAL_TRAIN_ROWS = 960_000
+MAX_FORMAL_TRAIN_ROWS = 1_000_000
 MAX_SELECTOR_ROWS = 640_000
 MAX_FEATURES = 48
 MAX_VAL_ROWS = 100_000
@@ -594,62 +595,10 @@ def probe_sample_capacity(
     max_train_rows_override: Optional[int] = None,
 ) -> int:
     logger.section("Step 2/6 样本量探针")
-    if max_train_rows_override is not None:
-        chosen = min(len(train_df), max_train_rows_override)
-        logger.log(f"检测到手动限制 max_train_rows={max_train_rows_override:,}，直接采用 {chosen:,} 行")
-        return chosen
-
-    ladder = build_sample_ladder(len(train_df))
-    selector_val = recent_sample(selector_val_df, min(len(selector_val_df), 80_000))
-    selector_X = selector_val[feature_cols]
-    selector_y = selector_val["label"]
-    selector_dates = selector_val["date"].values
-    selector_date_groups = build_date_group_indices(selector_dates)
-    records = []
-
-    for rows in ladder:
-        probe_train = recent_sample(train_df, rows)
-        train_weight = build_sample_weights(probe_train)
-        start_time = time.time()
-        model = train_lightgbm_model(
-            probe_train[feature_cols],
-            probe_train["label"],
-            selector_X,
-            selector_y,
-            selector_dates,
-            train_weight=train_weight,
-            seed=7,
-            fast_mode=True,
-            val_date_groups=selector_date_groups,
-        )
-        pred = model.booster.predict(selector_X) * model.label_std + model.label_mean
-        metrics = compute_prediction_metrics(
-            selector_y.values,
-            pred,
-            selector_dates,
-            date_groups=selector_date_groups,
-        )
-        score = compute_probe_score(metrics)
-        elapsed = time.time() - start_time
-        record = {"rows": rows, "elapsed_sec": round(elapsed, 3), "probe_score": round(score, 6), **metrics}
-        records.append(record)
-        logger.log(
-            f"样本量 {rows:,} 行 | score={score:.4f} | MAE={metrics['mae']:.6f} | "
-            f"RankIC={metrics['rank_ic']:.4f} | Top20Mean={metrics['top20_mean_return']:.4%} | "
-            f"耗时={elapsed:.1f}s"
-        )
-
-    save_records(records, os.path.join(MODEL_INFO_DIR, "sample_probe.csv"))
-    probe_df = pd.DataFrame(records)
-    best_score = probe_df["probe_score"].max()
-    candidate_df = probe_df[probe_df["probe_score"] >= best_score * 0.985].copy()
-    if candidate_df.empty:
-        candidate_df = probe_df.sort_values("probe_score", ascending=False).head(1)
-    chosen_rows = int(candidate_df.sort_values("rows", ascending=False).iloc[0]["rows"])
-    chosen_rows = max(chosen_rows, MIN_FORMAL_TRAIN_ROWS)
-    chosen_rows = min(chosen_rows, MAX_FORMAL_TRAIN_ROWS, len(train_df))
-    logger.log(f"样本量探针完成，正式训练上限采用 {chosen_rows:,} 行")
-    return chosen_rows
+    fixed = max_train_rows_override if max_train_rows_override is not None else FIXED_TRAIN_ROWS
+    chosen = min(len(train_df), fixed)
+    logger.log(f"固定训练样本量={fixed:,}，实际可用={len(train_df):,}，采用 {chosen:,} 行")
+    return chosen
 
 
 def compute_feature_stability_scores(
