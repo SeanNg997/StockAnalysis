@@ -22,14 +22,6 @@ MARKET_REGIME_LOOKBACK = _BT['MARKET_REGIME_LOOKBACK']
 MIN_PRICE_DAYS = _BT.get('MIN_PRICE_DAYS', 5)  # 连续低于MIN_STOCK_PRICE的天数阈值
 MIN_PRICE_CONSECUTIVE = _BT.get('MIN_PRICE_CONSECUTIVE', True)  # 是否要求连续
 ALLOW_ST_BUY = _BT.get('ALLOW_ST_BUY', True)
-ENABLE_TREND_RISK_FILTER = _BT.get('ENABLE_TREND_RISK_FILTER', True)
-TREND_RISK_RET_20D = _BT.get('TREND_RISK_RET_20D', -0.15)
-TREND_RISK_RET_60D = _BT.get('TREND_RISK_RET_60D', -0.25)
-TREND_RISK_DRAWDOWN_20D = _BT.get('TREND_RISK_DRAWDOWN_20D', -0.20)
-TREND_RISK_MA_BIAS_20 = _BT.get('TREND_RISK_MA_BIAS_20', -0.08)
-TREND_STABILIZE_RET_5D = _BT.get('TREND_STABILIZE_RET_5D', 0.0)
-TREND_SCORE_PENALTY = _BT.get('TREND_SCORE_PENALTY', 0.35)
-TREND_RISK_LOOKBACK_DAYS = max(MIN_PRICE_DAYS, 61)
 
 
 def calc_buy_cost(amount: float) -> float:
@@ -117,72 +109,6 @@ def _compute_low_price_risk_codes(market_history: pd.DataFrame,
     return set(flagged[flagged].index)
 
 
-def _build_trend_risk_features(market_history: pd.DataFrame,
-                               current_date,
-                               candidate_codes=None) -> pd.DataFrame:
-    """计算趋势风险字段，用于过滤深跌且无企稳信号的股票。"""
-    cols = [
-        'code',
-        'trend_ret_5d',
-        'trend_ret_20d',
-        'trend_ret_60d',
-        'trend_drawdown_20d',
-        'trend_ma_bias_20',
-        'trend_risk_flag',
-        'trend_score_penalty',
-    ]
-    if market_history is None or len(market_history) == 0 or current_date is None:
-        return pd.DataFrame(columns=cols)
-
-    history_cols = ['code', 'date', 'close']
-    if not set(history_cols).issubset(market_history.columns):
-        return pd.DataFrame(columns=cols)
-
-    history = market_history.loc[
-        market_history['date'] <= current_date, history_cols
-    ].copy()
-    if history.empty:
-        return pd.DataFrame(columns=cols)
-
-    if candidate_codes is not None:
-        history = history[history['code'].isin(candidate_codes)]
-        if history.empty:
-            return pd.DataFrame(columns=cols)
-
-    history = history.sort_values(['code', 'date'])
-    close_by_code = history.groupby('code')['close']
-    for period in [5, 20, 60]:
-        history[f'trend_ret_{period}d'] = close_by_code.pct_change(period)
-
-    rolling_max_20 = close_by_code.transform(lambda x: x.rolling(20, min_periods=5).max())
-    ma20 = close_by_code.transform(lambda x: x.rolling(20, min_periods=5).mean())
-    history['trend_drawdown_20d'] = history['close'] / rolling_max_20 - 1.0
-    history['trend_ma_bias_20'] = history['close'] / ma20 - 1.0
-
-    latest = history.groupby('code', group_keys=False).tail(1).copy()
-    deep_20d = (
-        latest['trend_ret_20d'].le(TREND_RISK_RET_20D)
-        & latest['trend_ret_5d'].le(TREND_STABILIZE_RET_5D)
-    )
-    deep_60d = (
-        latest['trend_ret_60d'].le(TREND_RISK_RET_60D)
-        & latest['trend_ma_bias_20'].le(TREND_RISK_MA_BIAS_20)
-    )
-    deep_drawdown = (
-        latest['trend_drawdown_20d'].le(TREND_RISK_DRAWDOWN_20D)
-        & latest['trend_ret_5d'].le(TREND_STABILIZE_RET_5D)
-    )
-    latest['trend_risk_flag'] = deep_20d | deep_60d | deep_drawdown
-    latest['trend_score_penalty'] = 0.0
-    penalty_mask = (
-        latest['trend_ret_20d'].le(TREND_RISK_RET_20D * 0.7)
-        | latest['trend_ret_60d'].le(TREND_RISK_RET_60D * 0.7)
-        | latest['trend_drawdown_20d'].le(TREND_RISK_DRAWDOWN_20D * 0.7)
-    )
-    latest.loc[penalty_mask, 'trend_score_penalty'] = TREND_SCORE_PENALTY
-    return latest[cols]
-
-
 def filter_stock_pool(candidates: pd.DataFrame,
                       market_day: pd.DataFrame,
                       return_stats: bool = False,
@@ -268,33 +194,20 @@ def filter_stock_pool(candidates: pd.DataFrame,
         merged = merged[~new_mask]
         stats['排除新股'] = int(n_new)
 
-    # 9. 排除深度下跌且无短期企稳信号的股票
-    if ENABLE_TREND_RISK_FILTER and market_history is not None and len(merged) > 0:
-        current_date = market_day['date'].iloc[0] if 'date' in market_day.columns else None
-        trend_features = _build_trend_risk_features(
-            market_history, current_date, candidate_codes=merged['code'].unique()
-        )
-        if not trend_features.empty:
-            merged = merged.merge(trend_features, on='code', how='left')
-            trend_risk_mask = merged['trend_risk_flag'].fillna(False)
-            n_trend_risk = trend_risk_mask.sum()
-            merged = merged[~trend_risk_mask]
-            stats['排除趋势破位'] = int(n_trend_risk)
-
-    # 10. 动态调整预测收益阈值（高优先级优化 #9）
+    # 9. 动态调整预测收益阈值（高优先级优化 #9）
     if use_dynamic_threshold:
         dynamic_threshold = compute_dynamic_threshold(merged, MIN_PRED_RETURN)
         stats['动态收益阈值'] = f"{dynamic_threshold:.4f}"
     else:
         dynamic_threshold = MIN_PRED_RETURN
 
-    # 11. 排除低预测收益
+    # 10. 排除低预测收益
     low_ret_mask = merged['pred_return'] <= dynamic_threshold
     n_low_ret = low_ret_mask.sum()
     merged = merged[~low_ret_mask]
     stats['低于收益阈值'] = int(n_low_ret)
 
-    # 12. 排除低置信度
+    # 11. 排除低置信度
     low_conf_mask = merged['confidence'] <= MIN_CONFIDENCE
     n_low_conf = low_conf_mask.sum()
     merged = merged[~low_conf_mask]
@@ -375,11 +288,6 @@ def score_candidates(candidates: pd.DataFrame, method: str = 'confidence_weighte
         df['score'] = df['pred_return'] / (pred_std + 1e-10)
     else:
         df['score'] = df['pred_return']
-
-    if 'trend_score_penalty' in df.columns:
-        penalty = df['trend_score_penalty'].fillna(0).clip(0, 0.9)
-        df['score'] = df['score'] * (1.0 - penalty)
-
     sort_cols = ['score']
     sort_asc = [False]
     if 'pred_std' in df.columns:
@@ -427,9 +335,6 @@ def compute_weighted_allocation(cash: float, candidates: pd.DataFrame) -> dict:
     candidates['weight_score'] = (
         candidates['pred_return'] * (0.5 + 0.5 * candidates['confidence'])
     )
-    if 'trend_score_penalty' in candidates.columns:
-        penalty = candidates['trend_score_penalty'].fillna(0).clip(0, 0.9)
-        candidates['weight_score'] = candidates['weight_score'] * (1.0 - penalty)
 
     # 归一化权重
     total_score = candidates['weight_score'].sum()

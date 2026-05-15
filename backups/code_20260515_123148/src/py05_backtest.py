@@ -128,7 +128,7 @@ def _prepare_market_for_backtest(market_df: pd.DataFrame, all_dates: list[pd.Tim
         return market_df.iloc[0:0].copy()
 
     needed_dates = set(all_dates)
-    buffer_days = max(int(rules.TREND_RISK_LOOKBACK_DAYS) - 1, 0)
+    buffer_days = max(int(rules.MIN_PRICE_DAYS) - 1, 0)
     if buffer_days > 0:
         first_date = all_dates[0]
         market_dates = np.sort(market_df["date"].unique())

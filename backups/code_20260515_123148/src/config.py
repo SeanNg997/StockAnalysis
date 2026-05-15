@@ -102,13 +102,6 @@ CONFIG = {
         'MIN_STOCK_PRICE': 3.0,    # 最低股价(元)，过滤低质量股
         'MIN_PRICE_DAYS': 5,       # 连续N个交易日低于MIN_STOCK_PRICE视为高风险
         'MIN_PRICE_CONSECUTIVE': True,  # True=连续N天，False=最近N天内任意N天
-        'ENABLE_TREND_RISK_FILTER': True,  # 过滤无企稳信号的深度下跌票
-        'TREND_RISK_RET_20D': -0.15,
-        'TREND_RISK_RET_60D': -0.25,
-        'TREND_RISK_DRAWDOWN_20D': -0.20,
-        'TREND_RISK_MA_BIAS_20': -0.08,
-        'TREND_STABILIZE_RET_5D': 0.0,
-        'TREND_SCORE_PENALTY': 0.35,
     },
 
     'paths': {

@@ -2,9 +2,9 @@
   "dataset_version": "raw_price_pt_v2",
   "adjustflag": "3",
   "price_mode": "raw",
-  "expected_latest_date": "2026-05-06",
-  "updated_at": "2026-05-06 23:44:16",
-  "kline_latest_date": "2026-05-06",
-  "dividend_refresh_through": "2026-05-06",
-  "adjust_factor_refresh_through": "2026-05-06"
+  "expected_latest_date": "2026-05-15",
+  "updated_at": "2026-05-15 22:58:43",
+  "kline_latest_date": "2026-05-15",
+  "dividend_refresh_through": "2026-05-15",
+  "adjust_factor_refresh_through": "2026-05-15"
 }

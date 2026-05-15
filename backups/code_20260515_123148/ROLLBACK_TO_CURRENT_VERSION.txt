@@ -1,0 +1,45 @@
+回退说明：恢复到 2026-05-15 12:31:48 修改前版本
+
+备份范围：
+- 已备份当前 src 目录
+- 备份路径：/mnt/d/WorkSpace/StockAnalysis/backups/code_20260515_123148/src
+
+备份时 Git 状态：
+- 仓库：/mnt/d/WorkSpace/StockAnalysis
+- 分支：main
+- HEAD：773f5b4
+- 当时 src 目录无未提交修改
+- 当时 data 目录存在未提交变动，本备份未包含 data
+
+如何回退本次代码修改：
+
+方法一：使用备份目录恢复 src
+1. 进入项目目录：
+   cd /mnt/d/WorkSpace/StockAnalysis
+
+2. 如需保留当前已修改版本，可先另存：
+   cp -a src backups/src_before_rollback_$(date +%Y%m%d_%H%M%S)
+
+3. 删除当前 src，并恢复备份：
+   rm -rf src
+   cp -a backups/code_20260515_123148/src ./src
+
+4. 检查差异：
+   git status --short
+   git diff -- src
+
+方法二：如果只想回退本次改动过的文件
+1. 进入项目目录：
+   cd /mnt/d/WorkSpace/StockAnalysis
+
+2. 从备份中恢复文件：
+   cp backups/code_20260515_123148/src/config.py src/config.py
+   cp backups/code_20260515_123148/src/trading_rules.py src/trading_rules.py
+
+3. 检查差异：
+   git diff -- src/config.py src/trading_rules.py
+
+注意：
+- 本说明用于回退到“添加趋势风险过滤/惩罚之前”的代码状态。
+- 不会恢复 data、output、backups 目录里的运行产物。
+- 如果后续我又修改了更多 src 文件，优先使用方法一恢复整个 src。

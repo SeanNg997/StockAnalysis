@@ -117,7 +117,7 @@ def _load_market_view():
 
 
 def _build_market_history_tail(market_df: pd.DataFrame, latest_date: pd.Timestamp) -> pd.DataFrame:
-    """只保留每只股票截至 latest_date 的风险判断窗口。"""
+    """只保留每只股票截至 latest_date 最近 N 天的低价判断窗口。"""
     history = market_df.loc[
         market_df['date'] <= latest_date, ['code', 'date', 'close']
     ].copy()
@@ -126,7 +126,7 @@ def _build_market_history_tail(market_df: pd.DataFrame, latest_date: pd.Timestam
     return (
         history.sort_values(['code', 'date'])
         .groupby('code', group_keys=False)
-        .tail(rules.TREND_RISK_LOOKBACK_DAYS)
+        .tail(rules.MIN_PRICE_DAYS)
         .reset_index(drop=True)
     )
 
