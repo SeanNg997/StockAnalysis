@@ -244,7 +244,7 @@ def build_train_val_split(
     train_date_set = set(train_dates[:val_split_idx])
     val_date_set = set(train_dates[val_start_idx:])
     if len(val_date_set) < 10:
-        val_date_set = set(train_dates[val_split_idx:])
+        val_date_set = set(train_dates[min(val_split_idx + HOLD_DAYS + 1, len(train_dates)):])
 
     train_df = filter_trainable_rows(df[df["date"].isin(train_date_set)])
     val_df = filter_trainable_rows(df[df["date"].isin(val_date_set)])
@@ -891,18 +891,34 @@ def build_prediction_frame(
     return result
 
 
+def _safe_read_pickle(path: str) -> pd.DataFrame | None:
+    """安全读取pickle文件，损坏时返回None而非抛异常"""
+    if not os.path.exists(path):
+        return None
+    try:
+        return pd.read_pickle(path)
+    except Exception as exc:
+        print(f"  [警告] {path} 读取失败({exc})，将忽略旧checkpoint")
+        return None
+
+
 def flush_prediction_checkpoint(pred_df: pd.DataFrame, logger: ProgressLogger) -> None:
     if pred_df.empty:
         return
 
     pred_df = pred_df.sort_values(["date", "code"]).reset_index(drop=True)
-    if os.path.exists(PREDICT_CHECKPOINT_PKL):
-        old_df = pd.read_pickle(PREDICT_CHECKPOINT_PKL)
+    old_df = _safe_read_pickle(PREDICT_CHECKPOINT_PKL)
+    if old_df is not None:
         pred_df = pd.concat([old_df, pred_df], ignore_index=True)
         pred_df = pred_df.drop_duplicates(subset=["date", "code"], keep="last")
         pred_df = pred_df.sort_values(["date", "code"]).reset_index(drop=True)
 
-    pred_df.to_pickle(PREDICT_CHECKPOINT_PKL)
+    # 先写临时文件再重命名，避免写入中断导致文件损坏
+    tmp_path = PREDICT_CHECKPOINT_PKL + ".tmp"
+    pred_df.to_pickle(tmp_path)
+    if os.path.exists(PREDICT_CHECKPOINT_PKL):
+        os.remove(PREDICT_CHECKPOINT_PKL)
+    os.rename(tmp_path, PREDICT_CHECKPOINT_PKL)
     logger.log(
         f"checkpoint 已写入 {PREDICT_CHECKPOINT_PKL} | "
         f"rows={len(pred_df):,} | dates={pred_df['date'].nunique():,}"
@@ -911,8 +927,9 @@ def flush_prediction_checkpoint(pred_df: pd.DataFrame, logger: ProgressLogger) -
 
 def collect_checkpoint_predictions(buffer_df: pd.DataFrame) -> pd.DataFrame:
     frames = []
-    if os.path.exists(PREDICT_CHECKPOINT_PKL):
-        frames.append(pd.read_pickle(PREDICT_CHECKPOINT_PKL))
+    old_df = _safe_read_pickle(PREDICT_CHECKPOINT_PKL)
+    if old_df is not None:
+        frames.append(old_df)
     if buffer_df is not None and not buffer_df.empty:
         frames.append(buffer_df)
 
@@ -923,6 +940,23 @@ def collect_checkpoint_predictions(buffer_df: pd.DataFrame) -> pd.DataFrame:
     pred_df = pred_df.drop_duplicates(subset=["date", "code"], keep="last")
     pred_df = pred_df.sort_values(["date", "code"]).reset_index(drop=True)
     return pred_df
+
+
+def _model_config_hash() -> str:
+    """模型配置哈希，参数变化时强制重训"""
+    import hashlib, json
+    model_cfg = CONFIG["model"]
+    feat_cfg = CONFIG["features"]
+    snapshot = {
+        "HOLD_DAYS": model_cfg.get("HOLD_DAYS"),
+        "LGB_FORMAL": model_cfg.get("LGB_FORMAL"),
+        "TRAIN_YEARS": model_cfg.get("TRAIN_YEARS"),
+        "RETRAIN_DAYS": model_cfg.get("RETRAIN_DAYS"),
+        "LABEL_WINSORIZE_MIN": feat_cfg.get("LABEL_WINSORIZE_MIN"),
+        "LABEL_WINSORIZE_MAX": feat_cfg.get("LABEL_WINSORIZE_MAX"),
+    }
+    raw = json.dumps(snapshot, sort_keys=True, default=str)
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
 def detect_resume_index(
@@ -938,6 +972,13 @@ def detect_resume_index(
         old_pred = pd.read_pickle(PREDICT_PKL)
     except Exception as exc:
         logger.log(f"读取历史 predictions.pkl 失败，将从回测起点全量生成: {exc}")
+        return start_idx, None
+
+    # 模型配置变更检测
+    cached_hash = old_pred.attrs.get("model_config_hash", "")
+    current_hash = _model_config_hash()
+    if cached_hash != current_hash:
+        logger.log(f"检测到模型参数变更 (旧={cached_hash}, 新={current_hash})，将全量重训")
         return start_idx, None
 
     if old_pred.empty or "date" not in old_pred.columns:
@@ -1011,6 +1052,7 @@ def save_predictions(
         pred_df = pd.concat([old_pred, pred_df], ignore_index=True)
         pred_df = pred_df.sort_values(["date", "code"]).reset_index(drop=True)
 
+    pred_df.attrs["model_config_hash"] = _model_config_hash()
     pred_df.to_pickle(PREDICT_PKL)
     logger.log(f"预测结果已保存至 {PREDICT_PKL}")
     logger.log(

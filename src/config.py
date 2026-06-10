@@ -84,12 +84,14 @@ CONFIG = {
         'COMMISSION_RATE': 0.000085,
         'MIN_COMMISSION': 1.0,
         'STAMP_TAX': 0.0005,
-        'MAX_POSITIONS': 5,
-        'MIN_PRED_RETURN': 0.002,
-        'MIN_CONFIDENCE': 0.5,
-        'HOLD_DAYS': 4,
-        'STOP_LOSS': -0.05,
-        'TAKE_PROFIT': 0.08,
+        'MAX_POSITIONS': 15,
+        'MIN_PRED_RETURN': 0.003,
+        'MIN_CONFIDENCE': 0.50,
+        'HOLD_DAYS': 9,
+        'STOP_LOSS': -0.08,
+        'TAKE_PROFIT': 0.15,
+        'TRAILING_STOP_ACTIVATE': 0.05,   # 利润超过5%时激活追踪止盈
+        'TRAILING_STOP_DRAWDOWN': 0.07,   # 从最高利润回落7%时触发卖出
         'INITIAL_CAPITAL': 100_000,
         'MAX_DAILY_BUY': 5,
         'MARKET_REGIME_LOOKBACK': 10,
@@ -103,12 +105,12 @@ CONFIG = {
         'MIN_PRICE_DAYS': 5,       # 连续N个交易日低于MIN_STOCK_PRICE视为高风险
         'MIN_PRICE_CONSECUTIVE': True,  # True=连续N天，False=最近N天内任意N天
         'ENABLE_TREND_RISK_FILTER': True,  # 过滤无企稳信号的深度下跌票
-        'TREND_RISK_RET_20D': -0.15,
-        'TREND_RISK_RET_60D': -0.25,
-        'TREND_RISK_DRAWDOWN_20D': -0.20,
-        'TREND_RISK_MA_BIAS_20': -0.08,
-        'TREND_STABILIZE_RET_5D': 0.0,
-        'TREND_SCORE_PENALTY': 0.35,
+        'TREND_RISK_RET_20D': -0.20,
+        'TREND_RISK_RET_60D': -0.35,
+        'TREND_RISK_DRAWDOWN_20D': -0.25,
+        'TREND_RISK_MA_BIAS_20': -0.12,
+        'TREND_STABILIZE_RET_5D': -0.02,
+        'TREND_SCORE_PENALTY': 0.25,
     },
 
     'paths': {

@@ -30,6 +30,8 @@ TREND_RISK_MA_BIAS_20 = _BT.get('TREND_RISK_MA_BIAS_20', -0.08)
 TREND_STABILIZE_RET_5D = _BT.get('TREND_STABILIZE_RET_5D', 0.0)
 TREND_SCORE_PENALTY = _BT.get('TREND_SCORE_PENALTY', 0.35)
 TREND_RISK_LOOKBACK_DAYS = max(MIN_PRICE_DAYS, 61)
+TRAILING_STOP_ACTIVATE = _BT.get('TRAILING_STOP_ACTIVATE', 0.03)
+TRAILING_STOP_DRAWDOWN = _BT.get('TRAILING_STOP_DRAWDOWN', 0.05)
 
 
 def calc_buy_cost(amount: float) -> float:
@@ -77,7 +79,7 @@ def compute_dynamic_threshold(candidates: pd.DataFrame, base_threshold: float = 
     if median_return > 0.005:  # 中位数>0.5%，牛市
         return max(base_threshold, pct_25)  # 至少25分位数
     elif median_return < -0.002:  # 中位数<-0.2%，熊市
-        return max(base_threshold * 0.5, pct_75)  # 降低阈值但取75分位数
+        return min(base_threshold * 0.5, pct_75)  # 降低阈值，取两者较小值
     else:  # 震荡市
         return base_threshold
 
@@ -344,15 +346,18 @@ def decide_sells(positions: dict, decision_data: pd.DataFrame) -> list:
             buy_price = float(pos.get('buy_price', 0) or 0)
             profit_pct = (current_price - buy_price) / buy_price if buy_price > 0 else 0.0
 
-        # 优先级：止损 > 止盈 > 到期 > 信号反转
+        # 优先级：止损 > 止盈 > 追踪止盈 > 到期
         if profit_pct <= STOP_LOSS:
             sell_list.append((code, 'STOP_LOSS'))
         elif profit_pct >= TAKE_PROFIT:
             sell_list.append((code, 'TAKE_PROFIT'))
         elif pos['hold_days'] >= HOLD_DAYS:
             sell_list.append((code, 'HOLD_EXPIRE'))
-        elif pos['hold_days'] >= 3 and row.get('pred_return', 0) < -0.001:
-            sell_list.append((code, 'SIGNAL_REVERSE'))
+        else:
+            max_profit_pct = float(pos.get('max_profit_pct', 0))
+            if (max_profit_pct >= TRAILING_STOP_ACTIVATE
+                    and profit_pct < max_profit_pct - TRAILING_STOP_DRAWDOWN):
+                sell_list.append((code, 'TRAILING_STOP'))
 
     return sell_list
 
@@ -360,7 +365,7 @@ def decide_sells(positions: dict, decision_data: pd.DataFrame) -> list:
 def score_candidates(candidates: pd.DataFrame, method: str = 'confidence_weighted') -> pd.DataFrame:
     """计算综合评分并按score降序排列
 
-    高优先级优化 #6: 默认使用置信度加权评分
+    综合模型预测 + 动量 + 趋势质量
     """
     df = candidates.copy()
     if method == 'default':
@@ -368,13 +373,20 @@ def score_candidates(candidates: pd.DataFrame, method: str = 'confidence_weighte
     elif method == 'return_only':
         df['score'] = df['pred_return']
     elif method == 'confidence_weighted':
-        # 置信度加权：基础权重0.5 + 置信度贡献0.5
         df['score'] = df['pred_return'] * (0.5 + 0.5 * df['confidence'])
     elif method == 'sharpe_like':
         pred_std = (1.0 / (df['confidence'] + 1e-10) - 1.0) / 100.0
         df['score'] = df['pred_return'] / (pred_std + 1e-10)
     else:
         df['score'] = df['pred_return']
+
+    # 动量加成：近期上涨的股票获得额外加分
+    if 'trend_ret_5d' in df.columns:
+        mom_5d = df['trend_ret_5d'].fillna(0).clip(-0.1, 0.1)
+        df['score'] = df['score'] + mom_5d * 0.3
+    if 'trend_ret_20d' in df.columns:
+        mom_20d = df['trend_ret_20d'].fillna(0).clip(-0.2, 0.2)
+        df['score'] = df['score'] + mom_20d * 0.15
 
     if 'trend_score_penalty' in df.columns:
         penalty = df['trend_score_penalty'].fillna(0).clip(0, 0.9)
@@ -408,21 +420,10 @@ def select_buys(candidates: pd.DataFrame, held_codes: set, sold_today: set,
 
 
 def compute_weighted_allocation(cash: float, candidates: pd.DataFrame) -> dict:
-    """按质量加权分配资金
-
-    高优先级优化 #13: 根据预测收益和置信度加权分配资金
-
-    Args:
-        cash: 可用现金
-        candidates: 候选股票（必须包含 pred_return 和 confidence 列）
-
-    Returns:
-        {code: allocation_amount} 字典
-    """
+    """按质量加权分配资金"""
     if len(candidates) == 0:
         return {}
 
-    # 计算每只股票的权重分数
     candidates = candidates.copy()
     candidates['weight_score'] = (
         candidates['pred_return'] * (0.5 + 0.5 * candidates['confidence'])
@@ -431,18 +432,15 @@ def compute_weighted_allocation(cash: float, candidates: pd.DataFrame) -> dict:
         penalty = candidates['trend_score_penalty'].fillna(0).clip(0, 0.9)
         candidates['weight_score'] = candidates['weight_score'] * (1.0 - penalty)
 
-    # 归一化权重
     total_score = candidates['weight_score'].sum()
     if total_score <= 0:
-        # 如果所有分数都<=0，回退到等权分配
         n = len(candidates)
         equal_weight = 1.0 / n
         candidates['weight'] = equal_weight
     else:
         candidates['weight'] = candidates['weight_score'] / total_score
 
-    # 分配资金（保留5%现金）
-    available = cash * 0.95
+    available = cash * 0.98
     allocation = {}
     for _, row in candidates.iterrows():
         allocation[row['code']] = available * row['weight']
@@ -451,18 +449,38 @@ def compute_weighted_allocation(cash: float, candidates: pd.DataFrame) -> dict:
 
 
 def check_market_regime(daily_mkt_ret: pd.Series, current_date) -> float:
-    """根据近期市场环境返回仓位系数 0.0~1.0"""
-    recent = daily_mkt_ret[daily_mkt_ret.index <= current_date].tail(MARKET_REGIME_LOOKBACK)
-    if len(recent) < 5:
+    """根据近期及中期市场环境返回仓位系数 0.0~1.0
+
+    短期（10日）+ 中期（20日）双重判断，避免极端熊市重仓
+    """
+    hist = daily_mkt_ret[daily_mkt_ret.index <= current_date]
+    if len(hist) < 10:
         return 1.0
 
-    mkt_ret = recent.mean()
-    down_ratio = (recent < 0).mean()
+    # 短期（10日）
+    short = hist.tail(MARKET_REGIME_LOOKBACK)
+    short_ret = short.mean()
+    short_down = (short < 0).mean()
 
-    if mkt_ret < -0.01 and down_ratio > 0.7:
-        return 0.4
-    if mkt_ret < -0.005 and down_ratio > 0.6:
+    # 中期（20日）
+    mid = hist.tail(20)
+    mid_ret = mid.mean()
+    mid_down = (mid < 0).mean()
+    cum_ret_mid = mid.sum()
+
+    # 极端熊市：短期急跌 + 中期也差
+    if short_ret < -0.012 and mid_ret < -0.004:
+        return 0.3
+    # 强熊市：短期急跌
+    if short_ret < -0.012 and short_down > 0.75:
+        return 0.5
+    # 中度熊市：中期持续下跌
+    if mid_ret < -0.004 and mid_down > 0.6 and cum_ret_mid < -0.025:
         return 0.6
+    # 轻度偏弱
+    if short_ret < -0.006 and short_down > 0.65:
+        return 0.8
+
     return 1.0
 
 

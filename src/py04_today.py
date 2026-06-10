@@ -177,7 +177,7 @@ def generate_stock_report(stock_code, target_date=None):
     full_code = normalize_stock_code(stock_code)
     short_code = full_code.split('.')[1]
     print(f"生成 {full_code} 的交易决策...")
-    latest, latest_date, pred_df, _price_df, market_day, _market_history = _load_latest_data(target_date)
+    latest, latest_date, pred_df, price_df, market_day, market_history = _load_latest_data(target_date)
     latest_by_code, latest_records = _build_latest_indexes(latest)
 
     if full_code not in latest_records:
@@ -242,6 +242,25 @@ def generate_stock_report(stock_code, target_date=None):
 
     if warnings_list:
         lines.append("\n> **风险提示**：" + "；".join(warnings_list) + "\n")
+
+    # 市场环境
+    daily_mkt_ret = price_df.groupby('date')['pctChg'].mean().sort_index()
+    mkt_factor = rules.check_market_regime(daily_mkt_ret, latest_date)
+    mkt_factor_pct = int(mkt_factor * 100)
+    if mkt_factor <= 0.3:
+        regime_label = "极端熊市"
+    elif mkt_factor <= 0.5:
+        regime_label = "强熊市"
+    elif mkt_factor <= 0.6:
+        regime_label = "中度熊市"
+    elif mkt_factor <= 0.8:
+        regime_label = "轻度偏弱"
+    elif mkt_factor < 1.0:
+        regime_label = "中性偏多"
+    else:
+        regime_label = "正常/偏多"
+
+    lines.append(f"\n> **市场环境**：{regime_label}（仓位系数 {mkt_factor_pct}%）\n")
 
     lines.append("---\n")
     lines.append("## 预测摘要\n")
@@ -390,12 +409,40 @@ def generate_today_strategy(target_date=None, portfolio_path=None):
     else:
         sentiment = "偏空"
 
+    # 市场环境判断
+    short_ret = daily_mkt_ret.tail(CONFIG['backtest']['MARKET_REGIME_LOOKBACK']).mean()
+    mid_ret = daily_mkt_ret.tail(20).mean()
+    mid_down = (daily_mkt_ret.tail(20) < 0).mean()
+    short_down = (daily_mkt_ret.tail(CONFIG['backtest']['MARKET_REGIME_LOOKBACK']) < 0).mean()
+
+    if mkt_factor <= 0.3:
+        regime_label = "极端熊市"
+        regime_desc = "短期急跌且中期趋势极差，建议大幅减仓或空仓"
+    elif mkt_factor <= 0.5:
+        regime_label = "强熊市"
+        regime_desc = "短期市场急跌，下跌股票占比极高，建议轻仓防守"
+    elif mkt_factor <= 0.6:
+        regime_label = "中度熊市"
+        regime_desc = "中期持续下跌，趋势偏弱，建议半仓以下操作"
+    elif mkt_factor <= 0.8:
+        regime_label = "轻度偏弱"
+        regime_desc = "短期市场偏弱，下跌居多，建议适当控制仓位"
+    elif mkt_factor < 1.0:
+        regime_label = "中性偏多"
+        regime_desc = "市场整体平稳，可正常操作"
+    else:
+        regime_label = "正常/偏多"
+        regime_desc = "市场环境良好，可满仓操作"
+
     lines.append("## 市场概况\n")
+    lines.append(f"> **当前市场环境：{regime_label}** — {regime_desc}\n")
     lines.append("| 指标 | 数值 | 指标 | 数值 |")
     lines.append("|------|-----:|------|-----:|")
     lines.append(f"| 可预测股票数 | {n_total:,} 只 | 市场情绪 | {sentiment} |")
     lines.append(f"| 预测收益率 > 0 | {n_positive:,} 只（{bullish_pct:.0%}） | 全市场预测均值 | {mkt_mean:+.4%} |")
-    lines.append(f"| 全市场预测中位数 | {mkt_median:+.4%} | 择时仓位系数 | {mkt_factor_pct}%（可买 {n_slots} 槽） |\n")
+    lines.append(f"| 全市场预测中位数 | {mkt_median:+.4%} | 择时仓位系数 | **{mkt_factor_pct}%**（可买 {n_slots} 槽） |")
+    lines.append(f"| 短期10日均收益 | {short_ret:+.4%} | 中期20日均收益 | {mid_ret:+.4%} |")
+    lines.append(f"| 短期下跌天数占比 | {short_down:.0%} | 中期下跌天数占比 | {mid_down:.0%} |\n")
     lines.append("---\n")
 
     # 票池筛选统计

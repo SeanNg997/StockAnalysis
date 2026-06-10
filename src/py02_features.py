@@ -376,6 +376,15 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _features_config_hash() -> str:
+    """特征配置哈希，参数变化时强制重算"""
+    import hashlib, json
+    feat_cfg = CONFIG["features"]
+    snapshot = {k: feat_cfg.get(k) for k in ["HOLD_DAYS", "LABEL_WINSORIZE_MIN", "LABEL_WINSORIZE_MAX"]}
+    raw = json.dumps(snapshot, sort_keys=True, default=str)
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
 def _cache_hit(end_date=None) -> pd.DataFrame | None:
     if not (os.path.exists(FEATURE_PKL) and os.path.exists(CLEAN_PKL)):
         return None
@@ -384,6 +393,13 @@ def _cache_hit(end_date=None) -> pd.DataFrame | None:
         clean_df = pd.read_pickle(CLEAN_PKL)
     except Exception as exc:
         print(f"  [缓存读取失败: {exc}]，继续重算...")
+        return None
+
+    # 配置变更检测
+    cached_hash = cached.attrs.get("config_hash", "")
+    current_hash = _features_config_hash()
+    if cached_hash != current_hash:
+        print(f"  [配置变更] 特征参数已变化 (旧={cached_hash}, 新={current_hash})，强制重算...")
         return None
 
     if "pt_adjust_factor" not in cached.columns:
@@ -425,6 +441,7 @@ def run_pipeline(end_date=None):
     df = compute_all_features(df)
 
     os.makedirs(os.path.dirname(FEATURE_PKL), exist_ok=True)
+    df.attrs["config_hash"] = _features_config_hash()
     df.to_pickle(FEATURE_PKL)
     print(f"保存至 {FEATURE_PKL}")
     print(f"特征列数: {len(get_feature_columns(df))}")
