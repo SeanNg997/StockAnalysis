@@ -10,6 +10,7 @@ from functools import lru_cache
 from datetime import date, timedelta
 
 from config import CONFIG
+from notify_feishu import send_feishu_message
 import trading_rules as rules
 
 warnings.filterwarnings('ignore')
@@ -21,6 +22,8 @@ OUTPUT_DIR = CONFIG['paths']['OUTPUT_DIR']
 TODAY_PRICE_CACHE_PKL = os.path.join(OUTPUT_DIR, 'tmp', 'today_price_view.pkl')
 TODAY_PREDICT_CACHE_PKL = os.path.join(OUTPUT_DIR, 'tmp', 'today_predict_view.pkl')
 TODAY_MARKET_CACHE_PKL = os.path.join(OUTPUT_DIR, 'tmp', 'today_market_view.pkl')
+PORTFOLIO_META_JSON = os.path.join(OUTPUT_DIR, 'portfolio_meta.json')
+LOT_SIZE = 100
 
 PRICE_VIEW_COLS = ['code', 'name', 'date', 'open', 'close', 'pctChg', 'preclose', 'volume', 'amount']
 PREDICT_VIEW_COLS = ['date', 'code', 'pred_return', 'pred_std', 'confidence']
@@ -129,6 +132,129 @@ def _build_market_history_tail(market_df: pd.DataFrame, latest_date: pd.Timestam
         .tail(rules.TREND_RISK_LOOKBACK_DAYS)
         .reset_index(drop=True)
     )
+
+
+def _load_available_cash(meta_path=PORTFOLIO_META_JSON):
+    """读取前端保存的可用金额；无效值返回 None，保持原报告模式。"""
+    if not os.path.exists(meta_path):
+        return None
+    try:
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        amount = float(payload.get('available_cash'))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError, AttributeError):
+        return None
+    return amount if np.isfinite(amount) and amount > 0 else None
+
+
+def _build_buy_cash_plan(available_cash, buy_candidates):
+    if available_cash is None or available_cash <= 0 or buy_candidates.empty:
+        return []
+
+    allocation = rules.compute_weighted_allocation(available_cash, buy_candidates)
+    plan = []
+    for _, row in buy_candidates.iterrows():
+        code = row['code']
+        estimated_price = float(row.get('close', 0) or 0)
+        allocated_cash = float(allocation.get(code, 0) or 0)
+        shares = 0
+        if estimated_price > 0 and allocated_cash > 0:
+            shares = int(allocated_cash / estimated_price / LOT_SIZE) * LOT_SIZE
+        buy_amount = shares * estimated_price
+        buy_cost = rules.calc_buy_cost(buy_amount) if shares > 0 else 0.0
+        plan.append({
+            'name': row.get('name', 'N/A'),
+            'code': code,
+            'estimated_price': estimated_price,
+            'allocated_cash': allocated_cash,
+            'shares': shares,
+            'buy_amount': buy_amount,
+            'buy_cost': buy_cost,
+            'total_cost': buy_amount + buy_cost,
+        })
+    return plan
+
+
+def _send_today_notification(
+    exec_date,
+    regime_label,
+    n_slots,
+    positions,
+    latest_records,
+    sell_reasons,
+    available_cash,
+    buy_cash_plan,
+):
+    lines = [
+        "【每日决策】",
+        "",
+        "一、背景信息",
+        f"执行日期：{exec_date}",
+        f"市场环境：{regime_label}",
+        f"择时仓位：{n_slots}/{rules.MAX_POSITIONS}",
+        "",
+        "二、持仓及卖出情况",
+    ]
+
+    reason_names = {
+        "STOP_LOSS": "触发止损",
+        "TAKE_PROFIT": "触发止盈",
+        "HOLD_EXPIRE": "持有到期",
+        "TRAILING_STOP": "触发追踪止盈",
+        "DELIST_FORCE_SELL": "退市/长期无数据强制清仓",
+    }
+    if not positions:
+        lines.append("当前无持仓")
+    else:
+        for code, pos in positions.items():
+            row = latest_records.get(code)
+            name = row.get("name", "N/A") if row is not None else "N/A"
+            market_value = (
+                float(pos["shares"]) * float(pos["current_price"])
+                + float(pos.get("cash_dividends_received", 0.0))
+            )
+            profit_pct = _calc_position_profit_pct(pos)
+            buy_date = pd.Timestamp(pos["buy_date"]).date()
+            reason = sell_reasons.get(code)
+            advice = f"卖出：{reason_names.get(reason, reason)}" if reason else "继续持有"
+            lines.extend(
+                [
+                    f"{name}（{code}）",
+                    f"股数：{int(pos['shares']):,}",
+                    f"市值：¥{market_value:,.2f}",
+                    f"当前盈亏率：{profit_pct:+.2%}",
+                    f"买入日期：{buy_date}",
+                    f"建议：{advice}",
+                    "",
+                ]
+            )
+
+    lines.extend(["", "三、可用金额与买入计划"])
+    if available_cash is None:
+        lines.append("可用金额：未设置")
+        lines.append("买入计划：未生成")
+    else:
+        executable_plan = [item for item in buy_cash_plan if item["shares"] >= LOT_SIZE]
+        total_cost = sum(item["total_cost"] for item in executable_plan)
+        remaining_cash = available_cash - total_cost
+        lines.append(f"可用金额：¥{available_cash:,.2f}")
+        if not executable_plan:
+            lines.append("买入计划：当前配额不足以买入任一推荐股的一手")
+        else:
+            for item in executable_plan:
+                lines.extend(
+                    [
+                        f"{item['name']}（{item['code']}）",
+                        f"股价：¥{item['estimated_price']:.2f}",
+                        f"建议股数：{item['shares']:,}",
+                        f"预计占用：¥{item['total_cost']:,.2f}",
+                        "",
+                    ]
+                )
+        lines.append(f"预计总占用：¥{total_cost:,.2f}")
+        lines.append(f"预计剩余现金：¥{remaining_cash:,.2f}")
+
+    send_feishu_message("\n".join(lines).rstrip())
 
 
 def _build_latest_indexes(latest: pd.DataFrame):
@@ -353,6 +479,8 @@ def generate_today_strategy(target_date=None, portfolio_path=None):
                 row = latest_records.get(code)
                 if row is not None:
                     pos['current_price'] = row.get('close', pos['buy_price'])
+            # 回算 max_profit_pct（与回测一致）
+            _calc_max_profit_pct(positions, price_df, latest_date)
             decision_data = latest_by_code.reindex(list(positions.keys())).dropna(how='all').reset_index(drop=True)
             sell_list = rules.decide_sells(positions, decision_data)
             sell_codes = {code for code, _ in sell_list}
@@ -388,6 +516,8 @@ def generate_today_strategy(target_date=None, portfolio_path=None):
 
     n_buy = len(buy_candidates)
     mkt_factor_pct = int(mkt_factor * 100)
+    available_cash = _load_available_cash()
+    buy_cash_plan = _build_buy_cash_plan(available_cash, buy_candidates)
 
     # Markdown 报告
     lines = []
@@ -466,8 +596,14 @@ def generate_today_strategy(target_date=None, portfolio_path=None):
             'DELIST_FORCE_SELL': '退市/长期无数据强制清仓',
         }
 
-        total_cost = sum(p['shares'] * p['buy_price'] for p in positions.values())
-        total_value = sum(p['shares'] * p['current_price'] for p in positions.values())
+        total_cost = sum(
+            p.get('basis_amount', p['shares'] * p['buy_price']) + p.get('buy_cost', 0.0)
+            for p in positions.values()
+        )
+        total_value = sum(
+            p['shares'] * p['current_price'] + p.get('cash_dividends_received', 0.0)
+            for p in positions.values()
+        )
         total_profit = total_value - total_cost
         total_profit_pct = total_profit / total_cost if total_cost > 0 else 0
 
@@ -486,7 +622,7 @@ def generate_today_strategy(target_date=None, portfolio_path=None):
             stock_name = row.get('name', 'N/A') if row is not None else 'N/A'
             pred_return = row['pred_return'] if row is not None else np.nan
             confidence = row['confidence'] if row is not None else np.nan
-            profit_pct = (pos['current_price'] - pos['buy_price']) / pos['buy_price']
+            profit_pct = _calc_position_profit_pct(pos)
 
             if code in sell_codes:
                 action = f"**卖出**（{REASON_CN.get(sell_reasons[code], sell_reasons[code])}）"
@@ -545,6 +681,32 @@ def generate_today_strategy(target_date=None, portfolio_path=None):
                 f" | {row['confidence']:.1%}"
                 f" | {weight:.0%} |"
             )
+        if available_cash is not None:
+            executable_plan = [item for item in buy_cash_plan if item['shares'] >= LOT_SIZE]
+            lines.append("")
+            lines.append("### 可用金额预计买入计划\n")
+            lines.append(
+                f"> 可用金额 **¥{available_cash:,.2f}**，按回测同款加权分配原则估算；"
+                "价格使用今日收盘价，实际成交以明日开盘为准。\n"
+            )
+            if not executable_plan:
+                lines.append("> 当前可用金额按推荐权重分配后，不足以买入任一推荐股的一手，暂不生成买入股数。\n")
+            else:
+                total_plan_cost = sum(item['total_cost'] for item in executable_plan)
+                remaining_cash = available_cash - total_plan_cost
+                lines.append("| 名称 | 代码 | 估算价 | 分配资金 | 建议股数 | 预计买入额 | 预计手续费 | 预计占用 |")
+                lines.append("|:----:|:----:|-------:|---------:|---------:|-----------:|-----------:|---------:|")
+                for item in executable_plan:
+                    lines.append(
+                        f"| {item['name']} | `{item['code']}`"
+                        f" | ¥{item['estimated_price']:.2f}"
+                        f" | ¥{item['allocated_cash']:,.0f}"
+                        f" | **{item['shares']:,}**"
+                        f" | ¥{item['buy_amount']:,.0f}"
+                        f" | ¥{item['buy_cost']:,.2f}"
+                        f" | ¥{item['total_cost']:,.2f} |"
+                    )
+                lines.append(f"\n> 预计合计占用 **¥{total_plan_cost:,.2f}**，预计剩余现金 **¥{remaining_cash:,.2f}**。")
     lines.append("\n---\n")
 
     # TOP20 详细列表
@@ -606,11 +768,35 @@ def generate_today_strategy(target_date=None, portfolio_path=None):
     print(f"\n策略已保存至 {report_path}")
     print(f"历史归档: {archive_path}")
 
+    _send_today_notification(
+        exec_date=exec_date,
+        regime_label=regime_label,
+        n_slots=n_slots,
+        positions=positions,
+        latest_records=latest_records,
+        sell_reasons=sell_reasons,
+        available_cash=available_cash,
+        buy_cash_plan=buy_cash_plan,
+    )
+
     return report
 
 
+def _calc_position_profit_pct(pos):
+    """计算持仓利润率（与回测 decide_sells 一致）"""
+    basis_amount = float(pos.get('basis_amount', pos['shares'] * pos.get('buy_price', 0)))
+    buy_cost = float(pos.get('buy_cost', 0.0))
+    dividend_cash = float(pos.get('cash_dividends_received', 0.0))
+    total_basis = basis_amount + buy_cost
+    if total_basis > 0:
+        position_value = float(pos['shares']) * float(pos['current_price']) + dividend_cash
+        return (position_value - total_basis) / total_basis
+    buy_price = float(pos.get('buy_price', 0) or 0)
+    return (float(pos['current_price']) - buy_price) / buy_price if buy_price > 0 else 0.0
+
+
 def _load_portfolio(portfolio_path):
-    """加载持仓文件（JSON格式）"""
+    """加载持仓文件（JSON格式），补全回测所需字段"""
     with open(portfolio_path, 'r', encoding='utf-8') as f:
         raw = json.load(f)
 
@@ -618,14 +804,49 @@ def _load_portfolio(portfolio_path):
     for item in raw:
         code = normalize_stock_code(str(item['code']))
         buy_date = pd.Timestamp(item['buy_date'])
+        buy_price = float(item['buy_price'])
+        shares = int(item['shares'])
+        basis_amount = float(item.get('basis_amount', shares * buy_price))
+        buy_cost = float(item.get('buy_cost', rules.calc_buy_cost(basis_amount)))
+        cash_dividends = float(item.get('cash_dividends_received', 0.0))
+        max_profit_pct = float(item.get('max_profit_pct', 0.0))
         positions[code] = {
-            'buy_price': float(item['buy_price']),
+            'buy_price': buy_price,
             'buy_date': buy_date,
-            'shares': int(item['shares']),
-            'current_price': float(item['buy_price']),
-            'hold_days': 0,  # 稍后根据交易日历计算
+            'shares': shares,
+            'current_price': buy_price,
+            'hold_days': 0,
+            'basis_amount': basis_amount,
+            'buy_cost': buy_cost,
+            'cash_dividends_received': cash_dividends,
+            'max_profit_pct': max_profit_pct,
         }
     return positions
+
+
+def _calc_max_profit_pct(positions, price_df, latest_date):
+    """从历史价格回算每只持仓股的最大利润率（与回测一致）"""
+    for code, pos in positions.items():
+        if pos.get('max_profit_pct', 0) > 0:
+            continue
+        buy_date = pos['buy_date']
+        hist = price_df.loc[
+            (price_df['code'] == code) &
+            (price_df['date'] > buy_date) &
+            (price_df['date'] <= latest_date),
+            ['date', 'close']
+        ].sort_values('date')
+        if hist.empty:
+            continue
+        basis_amount = float(pos.get('basis_amount', pos['shares'] * pos['buy_price']))
+        buy_cost = float(pos.get('buy_cost', 0.0))
+        total_basis = basis_amount + buy_cost
+        if total_basis <= 0:
+            continue
+        dividend_cash = float(pos.get('cash_dividends_received', 0.0))
+        position_values = float(pos['shares']) * hist['close'].values + dividend_cash
+        profit_pcts = (position_values - total_basis) / total_basis
+        pos['max_profit_pct'] = float(profit_pcts.max())
 
 
 def _calc_hold_days(buy_date, latest_date, known_trading_days, exec_date=None):

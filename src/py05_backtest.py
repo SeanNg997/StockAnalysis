@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from config import CONFIG
+from notify_feishu import send_feishu_message
 from price_adjust import load_dividend_events
 import trading_rules as rules
 
@@ -77,10 +78,10 @@ def _build_live_snapshot(record: dict, progress_pct: float, total_days: int, cur
     }
 
 
-def _max_buy_fill_shares(exec_row: dict, exec_price: float) -> int:
+def _max_buy_fill_shares(capacity_row: dict, exec_price: float) -> int:
     if exec_price <= 0:
         return 0
-    amount = float(exec_row.get("amount", 0) or 0)
+    amount = float(capacity_row.get("amount_ma5", 0) or 0)
     if amount <= 0:
         return 0
     ratio = min(max(MAX_OPEN_TRADE_AMOUNT_RATIO, 0.0), 1.0)
@@ -88,16 +89,26 @@ def _max_buy_fill_shares(exec_row: dict, exec_price: float) -> int:
     return int(max_amount / exec_price / LOT_SIZE) * LOT_SIZE
 
 
-def _max_sell_fill_shares(exec_row: dict, exec_price: float, held_shares: float) -> float:
+def _max_sell_fill_shares(capacity_row: dict, exec_price: float, held_shares: float) -> float:
     if exec_price <= 0 or held_shares <= 0:
         return 0.0
-    amount = float(exec_row.get("amount", 0) or 0)
+    amount = float(capacity_row.get("amount_ma5", 0) or 0)
     if amount <= 0:
         return 0.0
     ratio = min(max(MAX_OPEN_TRADE_AMOUNT_RATIO, 0.0), 1.0)
     max_amount = amount * ratio
     cap_shares = max_amount / exec_price
     return max(0.0, min(float(held_shares), float(cap_shares)))
+
+
+def _add_amount_ma5(market_df: pd.DataFrame) -> pd.DataFrame:
+    """按股票计算截至当日可知的最近5日平均成交额。"""
+    result = market_df.sort_values(["code", "date"]).copy()
+    result["amount_ma5"] = (
+        result.groupby("code", sort=False)["amount"]
+        .transform(lambda values: values.rolling(5, min_periods=1).mean())
+    )
+    return result
 
 
 def _is_special_limit_context(prev_close: float, t1_open: float, code: str, is_st: bool) -> bool:
@@ -548,10 +559,10 @@ def _prefix_before_date(path: str, last_exec_date: pd.Timestamp) -> pd.DataFrame
 
 def _write_backtest_outputs(daily_df: pd.DataFrame, trade_df: pd.DataFrame, position_df: pd.DataFrame, corp_action_df: pd.DataFrame) -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    daily_df.to_csv(BACKTEST_DAILY_CSV, index=False)
-    trade_df.to_csv(BACKTEST_TRADE_CSV, index=False)
-    position_df.to_csv(BACKTEST_POSITION_CSV, index=False)
-    corp_action_df.to_csv(BACKTEST_CORP_ACTION_CSV, index=False)
+    daily_df.to_csv(BACKTEST_DAILY_CSV, index=False, encoding='utf-8-sig')
+    trade_df.to_csv(BACKTEST_TRADE_CSV, index=False, encoding='utf-8-sig')
+    position_df.to_csv(BACKTEST_POSITION_CSV, index=False, encoding='utf-8-sig')
+    corp_action_df.to_csv(BACKTEST_CORP_ACTION_CSV, index=False, encoding='utf-8-sig')
 
 
 def run_backtest_range(
@@ -565,7 +576,7 @@ def run_backtest_range(
     all_dates = sorted(merged["date"].unique())
     print(f"回测期间: {all_dates[0].date()} ~ {all_dates[-1].date()}, 共 {len(all_dates)} 个交易日")
 
-    market_df = _prepare_market_for_backtest(market_df, all_dates)
+    market_df = _add_amount_ma5(_prepare_market_for_backtest(market_df, all_dates))
     print(f"市场状态裁剪后: {len(market_df):,} 行, {market_df['date'].nunique()} 个交易日")
 
     date_grouped = merged.groupby("date")
@@ -580,7 +591,9 @@ def run_backtest_range(
     }
     print("预处理市场状态...")
     market_cache = {
-        date: group.set_index("code")[["open", "close", "preclose", "isTrading", "isST", "amount"]].to_dict("index")
+        date: group.set_index("code")[
+            ["open", "close", "preclose", "isTrading", "isST", "amount", "amount_ma5"]
+        ].to_dict("index")
         for date, group in market_df.groupby("date", sort=False)
     }
 
@@ -636,6 +649,7 @@ def run_backtest_range(
         n_trades_today = 0
 
         exec_market = market_cache.get(exec_date, {})
+        decision_market = market_cache.get(decision_date, {})
         decision_prices = price_cache.get(decision_date, {})
         cash = _apply_corporate_actions(exec_date, positions, exec_market, decision_prices, action_lookup, corp_action_log, cash)
 
@@ -708,9 +722,9 @@ def run_backtest_range(
                     )
                     continue
 
-                exec_row = exec_market.get(code, {})
+                capacity_row = decision_market.get(code, {})
                 exec_price = float(t1_open or 0)
-                max_fill_shares = _max_sell_fill_shares(exec_row, exec_price, pos["shares"])
+                max_fill_shares = _max_sell_fill_shares(capacity_row, exec_price, pos["shares"])
                 if max_fill_shares <= 0:
                     trade_log.append(
                         {
@@ -820,10 +834,10 @@ def run_backtest_range(
                             continue
 
                         allocated_cash = float(allocation[code])
-                        exec_row = exec_market.get(code, {})
+                        capacity_row = decision_market.get(code, {})
                         exec_price = float(t1_open or 0)
                         max_shares_cash = int(allocated_cash / exec_price / LOT_SIZE) * LOT_SIZE
-                        max_shares_capacity = _max_buy_fill_shares(exec_row, exec_price)
+                        max_shares_capacity = _max_buy_fill_shares(capacity_row, exec_price)
                         shares = min(max_shares_cash, max_shares_capacity)
                         if shares < LOT_SIZE:
                             trade_log.append(
@@ -1045,6 +1059,64 @@ def compute_trade_metrics(trade_df: pd.DataFrame) -> dict:
     return result
 
 
+def _send_backtest_notification(
+    daily_df: pd.DataFrame,
+    metrics: dict,
+    trade_metrics: dict,
+    final_positions: dict,
+    position_df: pd.DataFrame,
+) -> None:
+    if daily_df.empty:
+        return
+
+    start_date = pd.Timestamp(daily_df.iloc[0]["date"]).date()
+    end_date = pd.Timestamp(daily_df.iloc[-1]["date"]).date()
+    lines = [
+        "【回测简报】",
+        "",
+        "一、背景信息",
+        f"回测时期：{start_date} 至 {end_date}",
+        f"初始资金：¥{INITIAL_CAPITAL:,.2f}",
+        f"总收益率：{metrics.get('总回报率', 'N/A')}",
+        f"年化收益率：{metrics.get('年化收益率', 'N/A')}",
+        f"最大回撤：{metrics.get('最大回撤', 'N/A')}",
+        f"胜率：{trade_metrics.get('胜率', 'N/A')}",
+        f"盈亏比：{trade_metrics.get('盈亏比', 'N/A')}",
+        "",
+        "二、最终持仓",
+    ]
+
+    name_by_code = {}
+    if not position_df.empty and {"code", "name"}.issubset(position_df.columns):
+        latest_names = position_df.dropna(subset=["code"]).drop_duplicates("code", keep="last")
+        name_by_code = latest_names.set_index("code")["name"].fillna("").to_dict()
+
+    if not final_positions:
+        lines.append("最终无持仓")
+    else:
+        for code, pos in final_positions.items():
+            name = name_by_code.get(code) or "N/A"
+            shares = float(pos["shares"])
+            buy_price = float(pos["buy_price"])
+            current_price = float(pos.get("current_price", buy_price))
+            dividend_cash = float(pos.get("cash_dividends_received", 0.0))
+            market_value = shares * current_price + dividend_cash
+            total_cost = _position_cost_total(pos)
+            profit_pct = (market_value - total_cost) / total_cost if total_cost > 0 else 0.0
+            lines.extend(
+                [
+                    f"{name}（{code}）",
+                    f"买入股价：¥{buy_price:.2f}",
+                    f"持仓股数：{shares:,.0f}",
+                    f"市值：¥{market_value:,.2f}",
+                    f"盈亏情况：{profit_pct:.2%}",
+                    "",
+                ]
+            )
+
+    send_feishu_message("\n".join(lines))
+
+
 def _assert_prediction_prefix_stable(pred_df: pd.DataFrame) -> None:
     trade_log_path = os.path.join(OUTPUT_DIR, "trade_log.csv")
     if not os.path.exists(PREDICT_PKL) or not os.path.exists(trade_log_path):
@@ -1097,12 +1169,25 @@ def run_pipeline(scoring_method="confidence_weighted"):
     resume_state, resume_idx, resume_date = _prepare_resume_state(merged)
     if resume_state is not None and resume_idx >= len(sorted(merged["date"].unique())):
         print("历史回测已覆盖到最新交易日，无需增量回测")
+        daily_df = _read_backtest_csv(BACKTEST_DAILY_CSV)
+        trade_df = _read_backtest_csv(BACKTEST_TRADE_CSV)
+        position_df = _read_backtest_csv(BACKTEST_POSITION_CSV)
+        corp_action_df = _read_backtest_csv(BACKTEST_CORP_ACTION_CSV)
+        metrics = compute_metrics(daily_df)
+        trade_metrics = compute_trade_metrics(trade_df)
+        _send_backtest_notification(
+            daily_df,
+            metrics,
+            trade_metrics,
+            resume_state.get("positions", {}),
+            position_df,
+        )
         return {
-            "daily": _read_backtest_csv(BACKTEST_DAILY_CSV),
-            "trades": _read_backtest_csv(BACKTEST_TRADE_CSV),
-            "positions_log": _read_backtest_csv(BACKTEST_POSITION_CSV),
-            "corp_actions": _read_backtest_csv(BACKTEST_CORP_ACTION_CSV),
-        }, compute_metrics(_read_backtest_csv(BACKTEST_DAILY_CSV)), compute_trade_metrics(_read_backtest_csv(BACKTEST_TRADE_CSV))
+            "daily": daily_df,
+            "trades": trade_df,
+            "positions_log": position_df,
+            "corp_actions": corp_action_df,
+        }, metrics, trade_metrics
 
     if resume_state is not None and resume_date is not None:
         print(f"检测到历史持仓状态，已覆盖至 {resume_date.date()}，将继续增量回测")
@@ -1192,6 +1277,13 @@ def run_pipeline(scoring_method="confidence_weighted"):
             "corp_action_count": int(len(corp_action_df)),
             "output_dir": OUTPUT_DIR,
         },
+    )
+    _send_backtest_notification(
+        daily_df,
+        metrics,
+        trade_metrics,
+        results["state"].get("positions", {}),
+        position_df,
     )
 
     return {

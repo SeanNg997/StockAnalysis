@@ -430,10 +430,37 @@ button:disabled {
 
 .portfolio-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
-.portfolio-actions .ghost-btn {
+.portfolio-extract-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 10px;
+}
+
+.portfolio-cash-row {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 10px;
+  font-size: 11px;
+  color: rgba(237,245,242,0.58);
+}
+
+.portfolio-cash-row input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.08);
+  color: #edf5f2;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.portfolio-actions .ghost-btn,
+.portfolio-extract-row .ghost-btn {
   padding: 3px 10px;
   font-size: 12px;
   border-radius: 8px;
@@ -444,11 +471,13 @@ button:disabled {
   transition: all 0.2s;
 }
 
-.portfolio-actions .ghost-btn:hover {
+.portfolio-actions .ghost-btn:hover,
+.portfolio-extract-row .ghost-btn:hover {
   background: rgba(255,255,255,0.2);
 }
 
-.portfolio-actions .ghost-btn.has-changes {
+.portfolio-actions .ghost-btn.has-changes,
+.portfolio-extract-row .ghost-btn.has-changes {
   background: rgba(32,136,90,0.4);
   border-color: rgba(32,136,90,0.6);
   color: #a8f0cc;

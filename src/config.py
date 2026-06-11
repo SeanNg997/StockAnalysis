@@ -96,7 +96,7 @@ CONFIG = {
         'MAX_DAILY_BUY': 5,
         'MARKET_REGIME_LOOKBACK': 10,
         'MIN_EXEC_AMOUNT': 100e4,  # 执行日最低成交额(100万)
-        'MAX_OPEN_TRADE_AMOUNT_RATIO': 0.02,  # 单票单日最多按成交额的2%成交（容量约束）
+        'MAX_OPEN_TRADE_AMOUNT_RATIO': 0.02,  # 单票最多按最近5日平均成交额的2%成交
         'ALLOW_ST_BUY': True,                 # 是否允许买入 ST（实盘可按券商权限改为 False）
         'SPECIAL_LIMIT_GAP_TOL': 0.03,        # 开盘涨跌幅超过常规涨跌停+容差，视为特殊规则日（IPO/复牌等）
         'CORP_ACTION_TOL': 0.005,             # preclose 与前收偏离阈值，fallback 只在明显除权缺口时触发

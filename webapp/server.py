@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import signal
 import subprocess
@@ -25,7 +26,9 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 STATIC_DIR = BASE_DIR / "webapp" / "static"
 RUN_OUTPUT_DIR = BASE_DIR / "output" / "web_console"
 BACKTEST_DAILY_CSV = BASE_DIR / "output" / "backtest" / "backtest_daily.csv"
+BACKTEST_STATE_JSON = BASE_DIR / "output" / "backtest" / "backtest_state.json"
 PORTFOLIO_JSON = BASE_DIR / "output" / "portfolio.json"
+PORTFOLIO_META_JSON = BASE_DIR / "output" / "portfolio_meta.json"
 
 
 @dataclass(frozen=True)
@@ -487,12 +490,90 @@ def get_portfolio() -> list:
     return []
 
 
+def _parse_available_cash(value: Any) -> float | None:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(amount) or amount <= 0:
+        return None
+    return amount
+
+
+def _load_portfolio_meta() -> dict[str, Any]:
+    if not PORTFOLIO_META_JSON.exists():
+        return {"available_cash": None}
+    try:
+        payload = json.loads(PORTFOLIO_META_JSON.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"available_cash": None}
+    if not isinstance(payload, dict):
+        return {"available_cash": None}
+    return {"available_cash": _parse_available_cash(payload.get("available_cash"))}
+
+
+@app.get("/api/portfolio/meta")
+def get_portfolio_meta() -> dict[str, Any]:
+    return _load_portfolio_meta()
+
+
 @app.post("/api/portfolio")
 async def save_portfolio(request: Request) -> dict[str, Any]:
     positions = await request.json()
     PORTFOLIO_JSON.parent.mkdir(parents=True, exist_ok=True)
     PORTFOLIO_JSON.write_text(json.dumps(positions, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"ok": True, "count": len(positions)}
+
+
+@app.post("/api/portfolio/meta")
+async def save_portfolio_meta(request: Request) -> dict[str, Any]:
+    payload = await request.json()
+    available_cash = _parse_available_cash(payload.get("available_cash") if isinstance(payload, dict) else None)
+    PORTFOLIO_META_JSON.parent.mkdir(parents=True, exist_ok=True)
+    PORTFOLIO_META_JSON.write_text(
+        json.dumps({"available_cash": available_cash} if available_cash is not None else {}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {"ok": True, "available_cash": available_cash}
+
+
+@app.post("/api/portfolio/extract-backtest")
+def extract_backtest_positions() -> dict[str, Any]:
+    """从回测状态文件提取最新持仓，覆盖写入 portfolio.json"""
+    if not BACKTEST_STATE_JSON.exists():
+        raise HTTPException(status_code=404, detail="回测状态文件不存在，请先运行回测")
+
+    try:
+        with open(BACKTEST_STATE_JSON, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        raise HTTPException(status_code=500, detail=f"读取回测状态失败: {exc}")
+
+    raw_positions = state.get("positions", {})
+    if not raw_positions:
+        return {"ok": True, "count": 0, "message": "回测状态中无持仓"}
+
+    result = []
+    for code, pos in raw_positions.items():
+        short_code = code.split(".")[1] if "." in code else code
+        buy_date = pos.get("buy_date", "")
+        if buy_date:
+            buy_date = pd.Timestamp(buy_date).strftime("%Y-%m-%d")
+        result.append({
+            "code": short_code,
+            "buy_price": float(pos.get("buy_price", 0)),
+            "buy_date": buy_date,
+            "shares": int(float(pos.get("shares", 0))),
+            "basis_amount": float(pos.get("basis_amount", 0)),
+            "buy_cost": float(pos.get("buy_cost", 0)),
+            "cash_dividends_received": float(pos.get("cash_dividends_received", 0)),
+            "max_profit_pct": float(pos.get("max_profit_pct", 0)),
+            "current_price": float(pos.get("current_price", 0)),
+        })
+
+    PORTFOLIO_JSON.parent.mkdir(parents=True, exist_ok=True)
+    PORTFOLIO_JSON.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "count": len(result)}
 
 
 @app.post("/api/tasks/{task_id}/run")

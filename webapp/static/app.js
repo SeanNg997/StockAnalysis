@@ -31,6 +31,8 @@ const dom = {
   portfolioTable: document.getElementById("portfolio-table"),
   portfolioAddBtn: document.getElementById("portfolio-add-btn"),
   portfolioSaveBtn: document.getElementById("portfolio-save-btn"),
+  portfolioExtractBtn: document.getElementById("portfolio-extract-btn"),
+  portfolioCashInput: document.getElementById("portfolio-cash-input"),
 };
 
 function setText(element, value) {
@@ -607,10 +609,43 @@ function mergeCurvePoints(existing, incoming) {
 /* ── 持仓管理 ── */
 
 let portfolioData = [];
-let savedSnapshot = "[]";
+let portfolioAvailableCash = null;
+let savedSnapshot = JSON.stringify({ positions: [], available_cash: null });
+
+function normalizeAvailableCash(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  const amount = Number(text);
+  return Number.isFinite(amount) && amount > 0 ? amount : null;
+}
+
+function getAvailableCashFromDOM() {
+  if (!dom.portfolioCashInput) return null;
+  return normalizeAvailableCash(dom.portfolioCashInput.value);
+}
+
+function getSavedPortfolioState() {
+  try {
+    const saved = JSON.parse(savedSnapshot);
+    if (Array.isArray(saved)) return { positions: saved, available_cash: null };
+    return {
+      positions: Array.isArray(saved.positions) ? saved.positions : [],
+      available_cash: normalizeAvailableCash(saved.available_cash),
+    };
+  } catch {
+    return { positions: [], available_cash: null };
+  }
+}
+
+function buildPortfolioSnapshot(positions, availableCash) {
+  return JSON.stringify({
+    positions,
+    available_cash: normalizeAvailableCash(availableCash),
+  });
+}
 
 function isPortfolioDirty() {
-  return JSON.stringify(collectPortfolioFromDOM()) !== savedSnapshot;
+  return buildPortfolioSnapshot(collectPortfolioFromDOM(), getAvailableCashFromDOM()) !== savedSnapshot;
 }
 
 function renderPortfolioTable() {
@@ -621,7 +656,7 @@ function renderPortfolioTable() {
     return;
   }
   const today = new Date().toISOString().slice(0, 10);
-  const savedList = JSON.parse(savedSnapshot);
+  const savedList = getSavedPortfolioState().positions;
   let html = "";
   portfolioData.forEach((pos, idx) => {
     const saved = savedList[idx];
@@ -664,7 +699,7 @@ function renderPortfolioTable() {
 
 function updateCardDirtyState() {
   if (!dom.portfolioTable) return;
-  const savedList = JSON.parse(savedSnapshot);
+  const savedList = getSavedPortfolioState().positions;
   dom.portfolioTable.querySelectorAll(".portfolio-card").forEach((card) => {
     const idx = Number(card.dataset.idx);
     const saved = savedList[idx];
@@ -707,12 +742,24 @@ async function loadPortfolio() {
   } catch {
     portfolioData = [];
   }
-  savedSnapshot = JSON.stringify(portfolioData);
+  try {
+    const metaRes = await fetch("/api/portfolio/meta");
+    const meta = await metaRes.json();
+    portfolioAvailableCash = normalizeAvailableCash(meta.available_cash);
+  } catch {
+    portfolioAvailableCash = null;
+  }
+  if (dom.portfolioCashInput) {
+    dom.portfolioCashInput.value = portfolioAvailableCash === null ? "" : String(portfolioAvailableCash);
+  }
+  savedSnapshot = buildPortfolioSnapshot(portfolioData, portfolioAvailableCash);
   renderPortfolioTable();
+  updateSaveBtn();
 }
 
 async function savePortfolio() {
   portfolioData = collectPortfolioFromDOM();
+  const availableCash = getAvailableCashFromDOM();
   try {
     const res = await fetch("/api/portfolio", {
       method: "POST",
@@ -720,8 +767,18 @@ async function savePortfolio() {
       body: JSON.stringify(portfolioData),
     });
     const data = await res.json();
-    if (data.ok) {
-      savedSnapshot = JSON.stringify(portfolioData);
+    const metaRes = await fetch("/api/portfolio/meta", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ available_cash: availableCash }),
+    });
+    const metaData = await metaRes.json();
+    if (data.ok && metaData.ok) {
+      portfolioAvailableCash = normalizeAvailableCash(metaData.available_cash);
+      if (dom.portfolioCashInput) {
+        dom.portfolioCashInput.value = portfolioAvailableCash === null ? "" : String(portfolioAvailableCash);
+      }
+      savedSnapshot = buildPortfolioSnapshot(portfolioData, portfolioAvailableCash);
       renderPortfolioTable();
     }
   } catch (err) {
@@ -738,6 +795,34 @@ if (dom.portfolioAddBtn) {
 }
 if (dom.portfolioSaveBtn) {
   dom.portfolioSaveBtn.addEventListener("click", savePortfolio);
+}
+if (dom.portfolioCashInput) {
+  dom.portfolioCashInput.addEventListener("input", updateSaveBtn);
+}
+
+async function handleExtractClick() {
+  const btn = document.getElementById("portfolio-extract-btn");
+  if (!btn) return;
+  if (btn.disabled) return;
+  btn.disabled = true;
+  try {
+    const res = await fetch("/api/portfolio/extract-backtest", { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.detail || "提取持仓失败");
+      return;
+    }
+    await loadPortfolio();
+    await savePortfolio();
+  } catch (err) {
+    alert("提取失败: " + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+if (dom.portfolioExtractBtn) {
+  dom.portfolioExtractBtn.addEventListener("click", handleExtractClick);
 }
 
 window.addEventListener("resize", () => renderChart());

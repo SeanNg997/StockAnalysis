@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>StockAnalysis 控制台</title>
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/app.css?v=2">
 </head>
 <body>
   <div class="backdrop backdrop-one"></div>
@@ -106,11 +106,18 @@
             <button id="portfolio-save-btn" class="ghost-btn" type="button">保存</button>
           </div>
         </div>
+        <div class="portfolio-extract-row">
+          <button id="portfolio-extract-btn" class="ghost-btn" type="button">一键添加最新持仓</button>
+        </div>
+        <label class="portfolio-cash-row" for="portfolio-cash-input">
+          <span>可用金额</span>
+          <input id="portfolio-cash-input" type="number" min="0" step="0.01" placeholder="留空则不生成买入金额">
+        </label>
         <div id="portfolio-table" class="portfolio-table"></div>
       </div>
     </aside>
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=2"></script>
 </body>
 </html>
