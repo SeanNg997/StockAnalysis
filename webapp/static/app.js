@@ -515,7 +515,10 @@ async function fetchLatestBacktest() {
   const response = await fetch("/api/backtest/latest");
   if (!response.ok) throw new Error("无法刷新历史回测");
   state.latestBacktest = await response.json();
-  if (!state.liveCurve.length) renderAll();
+  if (!isTaskRunning()) {
+    state.liveCurve = [];
+  }
+  renderAll();
 }
 
 async function runTask(taskId) {
@@ -567,6 +570,7 @@ function connectWebSocket() {
     if (message.type === "run_meta") {
       state.currentRun = message.run;
       if (!isTaskRunning() && state.currentRun?.status === "success") {
+        state.liveCurve = [];
         fetchLatestBacktest().catch(() => {});
       }
       renderAll();
@@ -579,6 +583,9 @@ function connectWebSocket() {
     }
 
     if (message.type === "curve") {
+      if (!isTaskRunning() || message.run_id !== state.currentRun?.id) {
+        return;
+      }
       state.liveCurve = mergeCurvePoints(state.liveCurve, message.items || []);
       renderChart();
       return;

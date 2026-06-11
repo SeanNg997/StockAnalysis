@@ -628,10 +628,11 @@ async def websocket_updates(websocket: WebSocket) -> None:
                 last_log_seq = log_items[-1]["seq"]
                 await websocket.send_json({"type": "logs", "run_id": run.id, "items": log_items})
 
-            curve_items = run.curve_since(last_curve_seq)
-            if curve_items:
-                last_curve_seq += len(curve_items)
-                await websocket.send_json({"type": "curve", "run_id": run.id, "items": curve_items})
+            if snapshot["status"] in {"queued", "running"}:
+                curve_items = run.curve_since(last_curve_seq)
+                if curve_items:
+                    last_curve_seq += len(curve_items)
+                    await websocket.send_json({"type": "curve", "run_id": run.id, "items": curve_items})
 
             await asyncio.sleep(0.25)
     except WebSocketDisconnect:
